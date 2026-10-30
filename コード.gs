@@ -169,7 +169,6 @@ function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
     return;
   }
 
-  // G列・H列のヘッダーを自動追加
   if (!kbSheet.getRange(1, 7).getValue()) kbSheet.getRange(1, 7).setValue('日時');
   if (!kbSheet.getRange(1, 8).getValue()) kbSheet.getRange(1, 8).setValue('NG候補・種別フラグ');
 
@@ -186,9 +185,8 @@ function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
     ? Number(kbSheet.getRange(lastKbRow, 1).getValue())
     : 0;
 
-  const MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7日以内
+  const MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
-  // スタッフからのシフト打診メールか判定
   const isShiftPitch = (text) => {
     return /ご相談|ご変更いただくことは可能でしょうか|延長していただくことは可能でしょうか|前倒ししていただくことは可能でしょうか|医師不在となる可能性/.test(String(text || ''));
   };
@@ -297,7 +295,7 @@ function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
       questionSheet.getRange(i + 2, 7).setValue('処理済み');
       answerSheet.getRange(bestMatchIndex + 2, 8).setValue('処理済み');
       questions[i][6] = '処理済み';
-      answers[bestMatchIndexIndex = bestMatchIndex][7] = '処理済み';
+      answers[bestMatchIndex][7] = '処理済み';
       matchCount++;
     }
   }

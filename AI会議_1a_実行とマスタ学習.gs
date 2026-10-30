@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 1a_AI会議_実行とマスタ学習.gs
- * （メイン実行・トリガー管理・ナレッジAI学習・『交渉注意医師』プルダウン完全準拠＆自動修復版）
+ * （メイン実行・トリガー管理・ナレッジ末尾30行高速AI学習・『交渉注意医師』プルダウン準拠版）
  * ============================================================================
  */
 
@@ -94,22 +94,23 @@ function installWeeklyMtgDocTrigger() {
 }
 
 /**
- * ナレッジシートの最新返信をAI判定し、『交渉注意医師』『交渉しやすい医師』の列構造・プルダウン通りに反映する
+ * ナレッジシートの最新返信（末尾30行のみ高速取得）をAI判定し、『交渉注意医師』『交渉しやすい医師』に反映する
  */
 function syncNewKnowledgeToAiMemo_(ss) {
   try {
-    // まず『交渉注意医師』シートに既存の列ズレ行（13・14行目など）があれば自動修復・統合する
-    repairCautionSheetRowsNow(ss);
-
     const kbSheet = ss.getSheetByName('ナレッジシート');
-    if (!kbSheet || kbSheet.getLastRow() < 2) return;
+    if (!kbSheet) return;
+    const lastRow = kbSheet.getLastRow();
+    if (lastRow < 2) return;
 
-    const kbData = kbSheet.getDataRange().getDisplayValues();
+    const startRow = Math.max(2, lastRow - 29);
+    const numRows = lastRow - startRow + 1;
+    const kbData = kbSheet.getRange(startRow, 1, numRows, 8).getDisplayValues();
     const targetItems = [];
 
-    const startIdx = Math.max(1, kbData.length - 30);
-    for (let i = startIdx; i < kbData.length; i++) {
+    for (let i = 0; i < kbData.length; i++) {
       const r = kbData[i];
+      const actualRowNumber = startRow + i;
       const docName = String(r[1] || '').trim();
       const bodyText = String(r[2] || '').trim();
       const flagText = String(r[7] || '').trim();
@@ -117,12 +118,11 @@ function syncNewKnowledgeToAiMemo_(ss) {
       if (!docName || !bodyText) continue;
       if (flagText.includes('AIメモ反映済') || flagText.includes('自動判定済')) continue;
 
-      // A列(r[0])が行番号(13950等)の場合は医籍番号として扱わない
       const rawColA = String(r[0] || '').trim();
       const validLic = (/^\d{5,7}$/.test(rawColA) && Number(rawColA) >= 100000) ? rawColA : '';
 
       targetItems.push({
-        rowNumber: i + 1,
+        rowNumber: actualRowNumber,
         licenseNo: validLic,
         doctor: docName,
         replyText: bodyText.slice(0, 300),
@@ -213,8 +213,7 @@ function syncNewKnowledgeToAiMemo_(ss) {
 }
 
 /**
- * 『交渉注意医師』シートで列ズレ・プルダウン違反になっている行（例: 13・14行目）を検出して自動修復・統合する関数
- * （※手動で単体実行することも可能です）
+ * 『交渉注意医師』シートで列ズレ・プルダウン違反になっている行を検出して自動修復・統合する関数（手動実行用）
  */
 function repairCautionSheetRowsNow(ssOpt) {
   const ss = ssOpt || SpreadsheetApp.getActiveSpreadsheet();
@@ -236,7 +235,6 @@ function repairCautionSheetRowsNow(ssOpt) {
     const colC = String(row[2] || '').trim();
     const colE = String(row[4] || '').trim();
 
-    // A列が数字(13950等)またはC列に「部分不可（AI自動抽出）」が入っている列ズレ行を検出
     if ((/^\d+$/.test(colA) && colB) || colC.includes('AI自動抽出')) {
       brokenEntries.push({
         doctorName: colB || colA,
@@ -268,11 +266,6 @@ function repairCautionSheetRowsNow(ssOpt) {
   Logger.log(`✅ 『交渉注意医師』シートの列ズレ行を自動修復・統合しました（${brokenEntries.length}件）`);
 }
 
-/**
- * 『交渉注意医師』シートのA〜P列構造・プルダウン（データの入力規則）を厳守して追加・更新する関数
- * A(1):医師名, B(2):医籍番号, C(3):診療科目, D(4):交渉条件(部分不可/絶対不可), E(5):NGエリア,
- * F〜J(6〜10):NG拠点, K(11):注意事項, L〜N(12〜14):NG曜日1〜3, O(15):勤務不可時間, P(16):詳細メモ
- */
 function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
   const docKey = normKeyForDoc_(info.doctorName);
   if (!docKey) return;
@@ -301,7 +294,6 @@ function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
     detectedClinic = knownClinics.find(c => info.memoText.includes(c)) || '';
   }
 
-  // 既にシートに存在する医師（例: 12行目の「吉田 和司」先生）なら、新規行は作らずP列（メモ）へ統合追記
   if (existingMap.has(docKey)) {
     const targetRow = existingMap.get(docKey);
     const currentP = String(sheet.getRange(targetRow, 16).getDisplayValue() || '').trim();
@@ -318,7 +310,6 @@ function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
     return;
   }
 
-  // 新規行の場合：上の行（5行目等）からプルダウン（入力規則）と書式をコピーしてからA〜P列に書き込む
   const newRowIdx = sheet.getLastRow() + 1;
   const templateRowIdx = Math.min(5, Math.max(2, sheet.getLastRow()));
 
@@ -335,31 +326,28 @@ function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
   const cleanLic = (info.licenseNo && /^\d{5,7}$/.test(String(info.licenseNo).trim())) ? String(info.licenseNo).trim() : '';
 
   const rowValues = [
-    info.doctorName, // A(1): 医師名
-    cleanLic,        // B(2): 医籍番号
-    validDept,       // C(3): 診療科目（プルダウン）
-    validCond,       // D(4): 交渉条件（プルダウン：部分不可 / 絶対不可）
-    validArea,       // E(5): NGエリア（プルダウン：関東 / 関西）
-    detectedClinic,  // F(6): NG拠点1
-    '',              // G(7): NG拠点2
-    '',              // H(8): NG拠点3
-    '',              // I(9): NG拠点4
-    '',              // J(10): NG拠点5
-    '',              // K(11): 注意事項
-    '',              // L(12): NG曜日1
-    '',              // M(13): NG曜日2
-    '',              // N(14): NG曜日3
-    '',              // O(15): 勤務不可時間
-    info.memoText || '' // P(16): 詳細メモ
+    info.doctorName,
+    cleanLic,
+    validDept,
+    validCond,
+    validArea,
+    detectedClinic,
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    '',
+    info.memoText || ''
   ];
 
   sheet.getRange(newRowIdx, 1, 1, 16).setValues([rowValues]);
   existingMap.set(docKey, newRowIdx);
 }
 
-/**
- * 『交渉しやすい医師』シートへの追記関数（A列:医師名, B列:医籍番号, C列:紹介経路, D列:人間メモ, E列:AIメモ）
- */
 function upsertNegotiableSheetRow_(ss, doctorName, licenseNo, entryText) {
   const sh = ss.getSheetByName('交渉しやすい医師');
   if (!sh) return;

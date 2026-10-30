@@ -13,13 +13,13 @@ const BRIDGE_DECRYPT_CONFIG = {
 };
 
 /**
- * 異体字・旧字体（髙/高、﨑/崎、齋/齊/斉、邉/邊/辺、栁/柳、濵/濱/浜、櫻/桜、眞/真 など）を
- * すべて共通の標準漢字に揃えて比較用キーを作る関数
+ * 異体字・旧字体をすべて共通の標準漢字に揃えて比較用キーを作る関数
  */
 function toStandardKanjiForCaps_(str) {
   return String(str || '')
     .normalize('NFKC')
-    .replace(/[\(（\[].*?[\)）\]]/g, '')
+    .replace(/[\(（\[【].*$/g, '')
+    .replace(/[\)）\]】★⚠️📩・]/g, '')
     .replace(/先生$/g, '')
     .replace(/[\s\u3000]+/g, '')
     .replace(/[﨑嵜]/g, '崎')
@@ -45,17 +45,17 @@ function buildCapsDoctorAndStaffResolver_(ss) {
 
   const registerDoctor = (rawName, licenseNo, dateStr, clinicName) => {
     const cleanName = String(rawName || '')
-      .replace(/[\(（\[].*?[\)）\]]/g, '')
+      .replace(/[\(（\[【].*$/g, '')
       .replace(/[:：].*$/, '')
+      .replace(/[\)）\]】★⚠️📩・]/g, '')
       .replace(/先生$/g, '')
       .replace(/[\s\u3000]+/g, '')
       .trim();
-    if (!cleanName || cleanName === 'なし' || cleanName === '未充足') return;
+    if (!cleanName || cleanName === 'なし' || cleanName === '未充足' || /^\d+$/.test(cleanName)) return;
 
     const norm = toStandardKanjiForCaps_(cleanName);
     if (!norm) return;
 
-    // 医籍番号として有効な文字列（ハイフンや順位の1〜10等を除外し、3桁以上の番号または英数字）を判定
     const rawLic = String(licenseNo || '').trim();
     const lic = (rawLic && rawLic !== '-' && rawLic.length >= 3) ? rawLic : '';
 
@@ -84,7 +84,6 @@ function buildCapsDoctorAndStaffResolver_(ss) {
     const vals = sh.getDataRange().getDisplayValues();
     const headers = vals[0].map(h => String(h || '').trim());
 
-    // ヘッダーに「医籍」が含まれる列があれば自動的にそこを医籍番号列として優先利用
     let resolvedLicCol = licColIdx;
     if (resolvedLicCol < 0) {
       const foundLicIdx = headers.findIndex(h => h.includes('医籍') || h.includes('ID'));
@@ -104,11 +103,25 @@ function buildCapsDoctorAndStaffResolver_(ss) {
 
   collectFromSheet('最新_個別打診候補', 5, 6, 0, 2);
   collectFromSheet('最新_おまとめ打診候補', 0, 1, -1, -1);
+  collectFromSheet('最新_応募シフト', 2, 1, 0, 4);
   collectFromSheet('最新_連勤注意リスト', 1, 0, -1, -1);
-  collectFromSheet('交渉しやすい医師', 1, 0, -1, -1);
-  collectFromSheet('交渉注意医師', 1, 0, -1, -1);
-  collectFromSheet('常勤依頼手当', 0, -1, -1, -1);
-  collectFromSheet('ナレッジシート', 1, 0, -1, -1);
+  collectFromSheet('交渉しやすい医師', 0, 1, -1, -1); // A列(0):医師名, B列(1):医籍番号
+  collectFromSheet('交渉注意医師', 0, 1, -1, -1);     // A列(0):医師名, B列(1):医籍番号
+  collectFromSheet('常勤依頼手当', 0, 1, -1, -1);     // A列(0):医師名, B列(1):医籍番号
+  collectFromSheet('SBU', 0, 1, -1, -1);              // A列(0):医師名, B列(1):医籍番号
+
+  // ナレッジシートは末尾500行のみを高速スキャン（A列が管理番号の場合は医籍番号から除外）
+  const kbSh = ss.getSheetByName('ナレッジシート');
+  if (kbSh && kbSh.getLastRow() >= 2) {
+    const lastR = kbSh.getLastRow();
+    const startR = Math.max(2, lastR - 499);
+    const kbVals = kbSh.getRange(startR, 1, lastR - startR + 1, 2).getDisplayValues();
+    for (let i = 0; i < kbVals.length; i++) {
+      const rawA = String(kbVals[i][0] || '').trim();
+      const validLic = (/^\d{5,7}$/.test(rawA) && Number(rawA) >= 100000) ? rawA : '';
+      registerDoctor(kbVals[i][1], validLic, '', '');
+    }
+  }
 
   const shiftSh = ss.getSheetByName('最新_当日シフト');
   if (shiftSh && shiftSh.getLastRow() >= 2) {
@@ -131,12 +144,11 @@ function buildCapsDoctorAndStaffResolver_(ss) {
     }
   } catch (e) {}
 
-  // 3. 担当者マスタの読み込み
+  // 3. 担当者マスタの読み込み（DSナレッジシート内優先）
   const staffMap = new Map();
-  try {
-    const staffSs = SpreadsheetApp.openById(BRIDGE_DECRYPT_CONFIG.STAFF_SS_ID);
-    const staffSh = staffSs.getSheetByName(BRIDGE_DECRYPT_CONFIG.STAFF_SHEET_NAME) || staffSs.getSheets()[0];
-    const stVals = staffSh.getDataRange().getDisplayValues();
+  const loadStaffRows = (sh) => {
+    if (!sh || sh.getLastRow() < 2) return;
+    const stVals = sh.getDataRange().getDisplayValues();
     for (let r = 1; r < stVals.length; r++) {
       const [colA, colB, colC, colD] = stVals[r].map(v => String(v || '').trim());
       const surname = colD || colA.split(/[\s\u3000]+/)[0];
@@ -145,7 +157,15 @@ function buildCapsDoctorAndStaffResolver_(ss) {
         staffMap.set(alias.replace(/[\s\u3000]+/g, ''), surname);
       });
     }
-  } catch (e) {}
+  };
+
+  loadStaffRows(ss.getSheetByName(BRIDGE_DECRYPT_CONFIG.STAFF_SHEET_NAME));
+  if (staffMap.size === 0) {
+    try {
+      const staffSs = SpreadsheetApp.openById(BRIDGE_DECRYPT_CONFIG.STAFF_SS_ID);
+      loadStaffRows(staffSs.getSheetByName(BRIDGE_DECRYPT_CONFIG.STAFF_SHEET_NAME) || staffSs.getSheets()[0]);
+    } catch (e) {}
+  }
 
   return {
     resolveDoctor: (rawInputName, dateStr, preferredClinic) => {

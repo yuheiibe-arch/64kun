@@ -1,7 +1,7 @@
 /**
  * ============================================================================
- * 4_AI会議_ドキュメント提出.gs
- * （人間が編集したGoogleドキュメントを読み取り、1診併行募集はスキップし、有効な打診のみmnysへ送信）
+ * AI会議_4_ドキュメント提出.gs
+ * （『編集くん 64』のカスタム医師・医籍番号データと完全連携して mnys へ送信する版）
  * ============================================================================
  */
 
@@ -15,6 +15,11 @@ function submitEditedDocToMnys() {
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const resolver = buildCapsDoctorAndStaffResolver_(ss);
+
+  // ★『編集くん 64』で一時保存・確定されたカスタム医師（医籍番号）データを読み込む
+  const draftMap = (typeof loadLatestDraft64_ === 'function')
+    ? loadLatestDraft64_(ss, docId)
+    : { slots: {}, bundles: {} };
 
   const doc = DocumentApp.openById(docId);
   const body = doc.getBody();
@@ -54,13 +59,19 @@ function submitEditedDocToMnys() {
         for (let r = 1; r < table.getNumRows(); r++) {
           const row = table.getRow(r);
           if (row.getNumCells() < 4) continue;
+
+          const slotKey = `${i}_${r}`;
+          const slotDraft = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
+          const customDocs = (slotDraft && Array.isArray(slotDraft.customDocs)) ? slotDraft.customDocs : [];
+
           const items = parseEditedDocTableRow_(
             currentDate,
             row.getCell(0).getText().trim(),
             row.getCell(1).getText().trim(),
             row.getCell(2).getText().trim(),
             row.getCell(3).getText().trim(),
-            resolver
+            resolver,
+            customDocs
           );
           items.forEach(addUniqueItem);
         }
@@ -101,6 +112,7 @@ function submitEditedDocToMnys() {
     it.target_doctor, it.license_no || '', it.from_clinic, it.is_special_wage ? '特別時給' : '通常時給',
     it.assignee, it.evidence, idx === 0 ? JSON.stringify(extractedItems, null, 2) : ''
   ]);
+  outSheet.getRange(2, 2 + 5, rowsForSheet.length, 1).setNumberFormat('@');
   outSheet.getRange(2, 1, rowsForSheet.length, 12).setValues(rowsForSheet);
 
   const targetEmail = props.getProperty('MNYS_RECEIVER_EMAIL');
@@ -118,26 +130,64 @@ function submitEditedDocToMnys() {
         JSON.stringify(slice, null, 2)
       );
     }
-    SpreadsheetApp.getUi().alert(`✅ 全 ${extractedItems.length} 件（医師名補正済・1診併行募集は除外）を ${targetEmail} へ送信しました！`);
+    SpreadsheetApp.getUi().alert(`✅ 全 ${extractedItems.length} 件（カスタム医師の医籍番号連携済・1診併行募集は除外）を ${targetEmail} へ送信しました！`);
   } else {
     SpreadsheetApp.getUi().alert(
-      `✅ 全 ${extractedItems.length} 件（医師名補正済・1診併行募集は除外）を『ドキュメント確定出力JSON』シートに出力しました！\n（※スクリプトプロパティに MNYS_RECEIVER_EMAIL を設定すると mnys.jp へ自動メール送信されます）`
+      `✅ 全 ${extractedItems.length} 件を『ドキュメント確定出力JSON』シートに出力しました！\n（※スクリプトプロパティに MNYS_RECEIVER_EMAIL を設定すると mnys.jp へ自動メール送信されます）`
     );
   }
 }
 
-function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assigneeText, resolver) {
+function mapCustomActionToApproachType_(actionTypeStr, fullText) {
+  const s = String(actionTypeStr || '') + ' ' + String(fullText || '');
+  if (s.includes('移動') || s.includes('2診目崩し')) return '勤務地変更相談';
+  if (s.includes('延長')) return '延長相談';
+  if (s.includes('早出') || s.includes('前倒')) return '早出相談';
+  return '個別アプローチ';
+}
+
+function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assigneeText, resolver, customDocs) {
   const dec = String(decisionText || '').trim();
   if (!dec || /^(ステイ|見送り|なし|不要|ー|\-|保留|要検討|併行募集)$/.test(dec)) return [];
 
-  const clinicMatch = col1Text.match(/【([^（\(]+)[（\(](小児科|内科)[）\)]】/);
-  const clinicName = clinicMatch ? clinicMatch[1].trim() : col1Text.split('\n')[0].replace(/[【】]/g, '').trim();
-  const dept = clinicMatch ? clinicMatch[2].trim() : (col1Text.includes('内科') ? '内科' : '小児科');
+  const firstLine = col1Text.split('\n')[0].trim();
+  const clinicMatch = firstLine.match(/【([^（\(]+)(?:[（\(](小児科|内科)[）\)])?】/);
+  const clinicName = clinicMatch ? clinicMatch[1].trim() : firstLine.replace(/[【】]/g, '').replace(/[（\(].*?[）\)]/g, '').trim();
+  const dept = (clinicMatch && clinicMatch[2]) ? clinicMatch[2].trim() : (firstLine.includes('内科') ? '内科' : '小児科');
   const timeMatch = col1Text.match(/(\d{1,2}:\d{2}-\d{1,2}:\d{2})/);
   const targetTime = timeMatch ? timeMatch[1] : '';
   const isSpecialWage = col1Text.includes('特別時給');
   const cleanAssignee = resolver.resolveStaff(assigneeText);
 
+  // ★1. 『編集くん 64』のカスタム入力で医師が特定（customDocs保持）されている場合は、その医籍番号と氏名を100%優先使用する
+  const isPresetDec = /^(案[123１２３]|全案)/.test(dec);
+  if (!isPresetDec && Array.isArray(customDocs) && customDocs.length > 0) {
+    return customDocs.map(cd => {
+      const appType = mapCustomActionToApproachType_(cd.actionType, dec);
+      const resolved = resolver.resolveDoctor(cd.name, dateStr, clinicName);
+      const finalLic = cd.licenseNo || resolved.licenseNo || '';
+      const fromClinic = (appType === '勤務地変更相談' && resolved.dayClinic && resolved.dayClinic !== clinicName)
+        ? resolved.dayClinic
+        : '';
+      return {
+        date: dateStr,
+        clinic_name: clinicName,
+        raw_clinic_name: clinicName,
+        department: dept,
+        target_time: targetTime,
+        time_category: '',
+        approach_type: appType,
+        target_doctor: cd.name || resolved.name,
+        license_no: finalLic,
+        from_clinic: fromClinic,
+        is_special_wage: isSpecialWage,
+        assignee: cleanAssignee,
+        evidence: `[編集くんカスタム確定] ${dec}`
+      };
+    });
+  }
+
+  // 2. 案1〜3 または通常のテキスト解析
   const planMap = {};
   col2Text.split('\n').forEach(line => {
     const m = line.match(/^【案([123１２３])】(.*)$/);
@@ -246,14 +296,10 @@ function parseBundleTableRow_(defaultYear, docColText, slotsColText, decColText,
   return items;
 }
 
-/**
- * ★修正：「1診・併行募集」（まだ移動依頼をしない案）はスプレッドシート書き出し不要のため空配列 [] を返してスキップ
- */
 function parseSingleActionTextToItems_(text, dateStr, targetClinic, resolver) {
   const s = String(text || '').trim();
   if (!s) return [];
 
-  // 1診・併行募集は移動打診をまだ行わないため書き出し対象外
   if (s.includes('1診・併行募集') || s.includes('併行募集') || s.includes('埋まり次第')) {
     return [];
   }

@@ -1,8 +1,7 @@
 /**
  * ============================================================================
  * 3_AI会議_ドキュメント描画と通知.gs
- * （指定フォルダ保存・同日1ファイル上書き更新・曜日付与・新4列レイアウト版）
- * ※ onOpen() は AI連携_復号受信.gs 側に統合済み
+ * （指定フォルダ保存・同日1ファイル上書き更新・亀有/北葛西以外の(小児科)省略・J列担当者引継版）
  * ============================================================================
  */
 
@@ -19,10 +18,6 @@ function formatDateWithDow_(dateStr) {
   return `${m[1]}/${('0' + m[2]).slice(-2)}/${('0' + m[3]).slice(-2)}（${dows[d.getDay()]}）`;
 }
 
-/**
- * 指定フォルダ（DOC_OUTPUT_FOLDER_ID）内に、同じ日（todayStr）のファイルがあればそれを上書き利用し、
- * なければ新規作成して指定フォルダへ格納する（同日内の重複ファイルは自動でゴミ箱へ整理）
- */
 function getOrResetDailyMeetingDocInFolder_(title) {
   const props = PropertiesService.getScriptProperties();
   const propKey = 'SINGLE_MTG_DOC_ID';
@@ -39,7 +34,6 @@ function getOrResetDailyMeetingDocInFolder_(title) {
   let targetDocId = '';
   const sameDayFiles = [];
 
-  // 1. 指定フォルダ内から「今日の日付（超募集対策MTG_YYYY/MM/DD）」を含むドキュメントを探す
   if (folder) {
     const files = folder.getFilesByType(MimeType.GOOGLE_DOCS);
     while (files.hasNext()) {
@@ -52,7 +46,6 @@ function getOrResetDailyMeetingDocInFolder_(title) {
     }
   }
 
-  // 更新日時が新しい順にソートし、先頭1つを残して同日の余分なファイルはゴミ箱へ整理
   if (sameDayFiles.length > 0) {
     sameDayFiles.sort((a, b) => b.getLastUpdated().getTime() - a.getLastUpdated().getTime());
     const keepFile = sameDayFiles[0];
@@ -65,7 +58,6 @@ function getOrResetDailyMeetingDocInFolder_(title) {
     }
   }
 
-  // 2. フォルダ内に今日のファイルがまだ無い場合、SINGLE_MTG_DOC_ID が今日作られたものか確認
   if (!targetDoc) {
     const savedId = props.getProperty(propKey);
     if (savedId) {
@@ -81,7 +73,6 @@ function getOrResetDailyMeetingDocInFolder_(title) {
     }
   }
 
-  // 3. 今日のドキュメントがどこにも無ければ新規作成して指定フォルダへ移動
   if (!targetDoc) {
     targetDoc = DocumentApp.create(title);
     targetDocId = targetDoc.getId();
@@ -91,7 +82,6 @@ function getOrResetDailyMeetingDocInFolder_(title) {
     }
   }
 
-  // 最新のドキュメントIDを記憶（提出スクリプト submitEditedDocToMnys がこのIDを参照します）
   props.setProperty(propKey, targetDocId);
   return targetDoc;
 }
@@ -151,7 +141,12 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
     ];
 
     plansByDate[dateLabel].forEach(p => {
-      const cleanClinic = String(p.clinicAndDept || '').replace(' (小児科)（小児科）', '（小児科）').replace(' (内科)（内科）', '（内科）');
+      let cleanClinic = String(p.clinicAndDept || '')
+        .replace(' (小児科)（小児科）', '（小児科）')
+        .replace(' (内科)（内科）', '（内科）');
+      if (!cleanClinic.includes('亀有') && !cleanClinic.includes('北葛西')) {
+        cleanClinic = cleanClinic.replace(/[（\(]小児科[）\)]/g, '').trim();
+      }
       const col1 = cleanClinic + '\n' + (p.absenceTime || '');
 
       const col2Lines = [];
@@ -162,7 +157,6 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
 
       const col2 = col2Lines.join('\n') || '要個別検討';
 
-      // 案1が「1診・併行募集」の場合は即打診可能な案2（なければステイ）を初期値にする
       let defaultDec = '要検討';
       if (p.plan1 && !p.plan1.includes('1診・併行募集')) {
         defaultDec = '案1';
@@ -174,7 +168,7 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
         defaultDec = 'ステイ';
       }
 
-      tableRows.push([col1, col2, defaultDec, '']);
+      tableRows.push([col1, col2, defaultDec, p.assignee || '']);
     });
 
     const table = body.appendTable(tableRows);

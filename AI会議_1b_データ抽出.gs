@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 1b_AI会議_データ抽出.gs
- * （不在枠・当日シフト・常勤依頼手当・『交渉注意医師』A〜P列の正確な抽出ロジック）
+ * （不在枠・当日シフト・常勤依頼手当・『交渉注意医師』抽出・ナレッジ末尾50行高速取得版）
  * ============================================================================
  */
 
@@ -72,10 +72,21 @@ function collectCompactContextForAi_(ss) {
     return (sh && sh.getLastRow() >= 2) ? sh.getDataRange().getDisplayValues().slice(1) : [];
   };
 
+  // ★巨大シート（ナレッジシート）の末尾N行のみをピンポイント取得する高速ヘルパー
+  const getRecentRows = (name, maxCount) => {
+    const sh = ss.getSheetByName(name);
+    if (!sh) return [];
+    const lastR = sh.getLastRow();
+    if (lastR < 2) return [];
+    const startR = Math.max(2, lastR - maxCount + 1);
+    const numCols = Math.min(8, sh.getLastColumn());
+    return sh.getRange(startR, 1, lastR - startR + 1, numCols).getDisplayValues();
+  };
+
   const docMemoLookup = new Map();
   const absoluteNgDocSet = new Set();
 
-  // 1. 『交渉注意医師』シート（A列:医師名, D列:交渉条件, F〜J列:NG拠点, K列:注意事項, L〜N列:NG曜日, O列:不可時間, P列:詳細メモ）
+  // 1. 『交渉注意医師』シート
   getRows('交渉注意医師').forEach(r => {
     const k = normKeyForDoc_(r[0]);
     if (!k) return;
@@ -101,7 +112,7 @@ function collectCompactContextForAi_(ss) {
     }
   });
 
-  // 2. 『交渉しやすい医師』シート（A列:医師名, D列:人間メモ, E列:AIメモ）
+  // 2. 『交渉しやすい医師』シート
   getRows('交渉しやすい医師').forEach(r => {
     const k = normKeyForDoc_(r[0]) || normKeyForDoc_(r[1]);
     if (!k) return;
@@ -174,7 +185,7 @@ function collectCompactContextForAi_(ss) {
   const streakWarnings = getRows('最新_連勤注意リスト');
   const spotCandidates = getRows('最新_個別打診候補');
   const bundledCandidates = getRows('最新_おまとめ打診候補');
-  const kbRows = getRows('ナレッジシート');
+  const kbRows = getRecentRows('ナレッジシート', 50);
 
   const streakNgMap = new Map();
   streakWarnings.forEach(w => {
@@ -299,7 +310,7 @@ function collectCompactContextForAi_(ss) {
       absenceTime: absTime,
       listedWage: u[3] || '13,000円',
       specialWage: u[11] || '',
-      assignee: String(u[9] || '').trim(), // ★『最新_不在枠』J列の担当を引き継ぐ
+      assignee: String(u[9] || '').trim(),
       prevDocs: prevChecked.docs,
       prevExtStatus: prevChecked.status,
       nextDocs: nextChecked.docs,

@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_2_AI分析.gs
- * （スポット/紹介会社表記カット・常勤延長不可の不要メモカット・時給表記修正版）
+ * （亀有・北葛西以外の(小児科)省略・スポット/紹介会社カット・不要メモカット・時給表記修正版）
  * ============================================================================
  */
 
@@ -84,7 +84,6 @@ function cleanAuditNoteFormatting_(noteText) {
     .trim();
   if (!raw || raw === '-' || raw === 'なし' || raw === '特になし') return '';
 
-  // 句点「。」やスラッシュ「/」で分割し、自明な文（「通常常勤のため延長不可」「調整余地なし」等）を除外
   const sentences = raw.split(/[。\/／\n]+/).map(s => s.trim()).filter(Boolean);
   const meaningful = sentences.filter(s => {
     if (/(通常常勤|通常勤務).*?(延長不可|早出不可|移動不可|打診不可|不可)/.test(s)) return false;
@@ -184,7 +183,9 @@ function callGeminiAgentInBatches_(rawContext, customRulesText) {
     const baseClinicName = String(origSlot.clinic || '')
       .replace(/[\(（]小児科[\)）]|[\(（]内科[\)）]|小児科|内科/g, '')
       .trim();
-    const exactClinicAndDept = `【${baseClinicName}（${origSlot.dept}）】`;
+    // ★亀有・北葛西（および内科）以外は「（小児科）」を省いて拠点名のみにする
+    const showDept = (baseClinicName.includes('亀有') || baseClinicName.includes('北葛西') || origSlot.dept === '内科');
+    const exactClinicAndDept = showDept ? `【${baseClinicName}（${origSlot.dept}）】` : `【${baseClinicName}】`;
 
     const wageLabel = formatCleanWageLabel_(origSlot.specialWage, origSlot.listedWage);
     const exactAbsenceTime = `${origSlot.absenceTime}（${wageLabel}）`;
