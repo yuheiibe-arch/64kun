@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * AI連携_復号受信.gs（caps365.jp 側：マスタ動的参照 ＋ 勤務くん個別/おまとめ候補対応版）
+ * AI連携_復号受信.gs（caps365.jp 側：マスタ動的参照 ＋ 編集くん64メニュー統合版）
  * ============================================================================
  */
 
@@ -26,7 +26,7 @@ const AI_RECEIVER_CONFIG = {
 };
 
 /**
- * ★修正：onOpen をこのファイル1箇所に統合（サイドバー起動メニューを追加）
+ * スプレッドシート起動時のメニュー登録（『🎮 編集くん 64』起動メニューを統合）
  */
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
@@ -41,7 +41,7 @@ function onOpen() {
     .addItem('① AI事前会議ドキュメントを生成（本番・通知あり）', 'runDemoAndSubmitMeetingDoc')
     .addItem('② AI事前会議ドキュメントを生成（プレビューのみ）', 'runPreviewMeetingDocOnly')
     .addSeparator()
-    .addItem('📋 確定案・担当者選択サイドバーを開く（プルダウン編集）', 'showMeetingDocEditorSidebar')
+    .addItem('🎮 編集くん 64 を開く（大画面・エリア別一括・同時編集）', 'openHenshukunModal')
     .addItem('🚀 ③ 確定したドキュメントを読み取ってmnysへ提出（文案生成）', 'submitEditedDocToMnys')
     .addToUi();
 }
@@ -143,17 +143,20 @@ function loadDoctorRoleMastersFromSheets_(ss) {
   }
 
   const kbSheet = ss.getSheetByName(AI_RECEIVER_CONFIG.SHEET_KNOWLEDGE_HISTORY);
-  if (kbSheet && kbSheet.getLastRow() >= 2) {
-    const vals = kbSheet.getDataRange().getDisplayValues();
-    const startIdx = Math.max(1, vals.length - 200);
-    for (let r = startIdx; r < vals.length; r++) {
-      const nameKey = normalizeDocKeyReceive_(vals[r][1]);
-      if (!nameKey) continue;
-      const reply = String(vals[r][2] || '').replace(/\n+/g, ' ').slice(0, 40);
-      const dt = String(vals[r][6] || '').slice(5, 10);
-      const flag = String(vals[r][7] || '').trim();
-      if (flag.includes('シフト調整') || flag) {
-        recentKbMap.set(nameKey, `直近${dt || '履歴'}打診(${flag}:${reply})`);
+  if (kbSheet) {
+    const kbLast = kbSheet.getLastRow();
+    if (kbLast >= 2) {
+      const startRow = Math.max(2, kbLast - 199);
+      const vals = kbSheet.getRange(startRow, 1, kbLast - startRow + 1, 8).getDisplayValues();
+      for (let r = 0; r < vals.length; r++) {
+        const nameKey = normalizeDocKeyReceive_(vals[r][1]);
+        if (!nameKey) continue;
+        const reply = String(vals[r][2] || '').replace(/\n+/g, ' ').slice(0, 40);
+        const dt = String(vals[r][6] || '').slice(5, 10);
+        const flag = String(vals[r][7] || '').trim();
+        if (flag.includes('シフト調整') || flag) {
+          recentKbMap.set(nameKey, `直近${dt || '履歴'}打診(${flag}:${reply})`);
+        }
       }
     }
   }
@@ -257,7 +260,6 @@ function importLatestEncryptedShiftContext_(isForceManual) {
   writeOuboShiftsSheet_(ss, payloadObj.ouboShiftsByDate || {}, roleMasters);
   writeStreakWarningsSheet_(ss, payloadObj.streakWarnings || [], roleMasters);
 
-  // ★追加：勤務くん連携の2シート（『最新_個別打診候補』『最新_おまとめ打診候補』）を展開
   writeKinmukunCandidateSheets_(ss, payloadObj, roleMasters);
 
   Logger.log(
@@ -539,7 +541,7 @@ function writeKinmukunCandidateSheets_(ss, payload, roleMasters) {
 
     if (spotRaw.length > 1) {
       const bodyRows = spotRaw.slice(1).map(r => [...r, buildMasterNote(r[5])]);
-      sh.getRange(2, 7, bodyRows.length, 1).setNumberFormat('@'); // 医籍番号列を文字列固定
+      sh.getRange(2, 7, bodyRows.length, 1).setNumberFormat('@');
       sh.getRange(2, 1, bodyRows.length, headers.length).setValues(bodyRows);
       applyLeftAlignToSheet_(sh, bodyRows.length + 1, headers.length);
     } else {
@@ -560,7 +562,7 @@ function writeKinmukunCandidateSheets_(ss, payload, roleMasters) {
 
     if (bundleRaw.length > 1) {
       const bodyRows = bundleRaw.slice(1).map(r => [...r, buildMasterNote(r[0])]);
-      sh.getRange(2, 2, bodyRows.length, 1).setNumberFormat('@'); // 医籍番号列を文字列固定
+      sh.getRange(2, 2, bodyRows.length, 1).setNumberFormat('@');
       sh.getRange(2, 1, bodyRows.length, headers.length).setValues(bodyRows);
       applyLeftAlignToSheet_(sh, bodyRows.length + 1, headers.length);
     } else {
