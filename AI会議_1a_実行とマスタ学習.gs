@@ -1,7 +1,7 @@
 /**
  * ============================================================================
- * 1a_AI会議_実行とマスタ学習.gs
- * （メイン実行・トリガー管理・ナレッジ末尾30行高速AI学習・『交渉注意医師』プルダウン準拠版）
+ * AI会議_1a_実行とマスタ学習.gs
+ * （『交渉しやすい医師』無断行追加禁止・列ズレ自動修復・『交渉注意医師』統合版）
  * ============================================================================
  */
 
@@ -28,24 +28,31 @@ function runPreviewMeetingDocOnly() {
   const t0 = Date.now();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
+  // 先にデバッグ用シートが残っていれば自動削除
+  const oldDbg = ss.getSheetByName('デバッグ_不在枠解析');
+  if (oldDbg) {
+    try { ss.deleteSheet(oldDbg); } catch (e) {}
+  }
+
   const customRulesText = loadOrInitCustomRuleSheet_(ss);
 
-  Logger.log('🧠 0/3: ナレッジシートの新しい医師返答を確認し、マスタへ自動反映中...');
+  Logger.log('🧠 0/3: マスタの列ズレ修復 ＆ ナレッジシートの新しい医師返答を確認中...');
+  repairNegotiableAndCautionSheetsNow(ss);
   syncNewKnowledgeToAiMemo_(ss);
 
   Logger.log('🤖 1/3: シートから対象データを抽出し、AIエージェント用のコンテキストを構築中...');
   const rawContext = collectCompactContextForAi_(ss);
-  Logger.log(`📌 対象不在枠: ${rawContext.unfilledCount}件（${rawContext.periodStart}〜${rawContext.periodEnd}）`);
+  Logger.log('📌 対象不在枠: ' + rawContext.unfilledCount + '件（' + rawContext.periodStart + '〜' + rawContext.periodEnd + '）');
 
   Logger.log('🤖 2/3: AIエージェントが高速会議・厳選中...');
   const aiStructuredResult = callGeminiAgentInBatches_(rawContext, customRulesText);
 
   Logger.log('📄 3/3: Googleドキュメントに日付別テーブル形式で描画中...');
   const todayStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd');
-  const docTitle = `【プレビュー確認用】超募集対策MTG_${todayStr}（対象：${rawContext.periodStart}〜${rawContext.periodEnd}）`;
+  const docTitle = '【プレビュー確認用】超募集対策MTG_' + todayStr + '（対象：' + rawContext.periodStart + '〜' + rawContext.periodEnd + '）';
   const docFile = renderStructuredMeetingDoc_(docTitle, rawContext, aiStructuredResult);
 
-  Logger.log(`✅ 成果物ドキュメント作成完了！（所要時間: ${((Date.now() - t0) / 1000).toFixed(1)}秒）`);
+  Logger.log('✅ 成果物ドキュメント作成完了！（所要時間: ' + ((Date.now() - t0) / 1000).toFixed(1) + '秒）');
   Logger.log(docFile.getUrl());
 }
 
@@ -56,14 +63,20 @@ function runDemoAndSubmitMeetingDoc() {
   const t0 = Date.now();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
+  const oldDbg = ss.getSheetByName('デバッグ_不在枠解析');
+  if (oldDbg) {
+    try { ss.deleteSheet(oldDbg); } catch (e) {}
+  }
+
   const customRulesText = loadOrInitCustomRuleSheet_(ss);
+  repairNegotiableAndCautionSheetsNow(ss);
   syncNewKnowledgeToAiMemo_(ss);
 
   const rawContext = collectCompactContextForAi_(ss);
   const aiStructuredResult = callGeminiAgentInBatches_(rawContext, customRulesText);
 
   const todayStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd');
-  const docTitle = `【AI事前会議】超募集対策MTG_${todayStr}（対象：${rawContext.periodStart}〜${rawContext.periodEnd}）`;
+  const docTitle = '【AI事前会議】超募集対策MTG_' + todayStr + '（対象：' + rawContext.periodStart + '〜' + rawContext.periodEnd + '）';
   const docFile = renderStructuredMeetingDoc_(docTitle, rawContext, aiStructuredResult);
 
   const eventUrl = attachDocToMtgCalendar_(docFile);
@@ -76,7 +89,7 @@ function runDemoAndSubmitMeetingDoc() {
     eventUrl: eventUrl
   });
 
-  Logger.log(`✅ 会議ドキュメント生成＆Slack/カレンダー提出完了！（所要時間: ${((Date.now() - t0) / 1000).toFixed(1)}秒）`);
+  Logger.log('✅ 会議ドキュメント生成＆Slack/カレンダー提出完了！（所要時間: ' + ((Date.now() - t0) / 1000).toFixed(1) + '秒）');
   Logger.log(docFile.getUrl());
 }
 
@@ -85,7 +98,7 @@ function runDemoAndSubmitMeetingDoc() {
  */
 function installWeeklyMtgDocTrigger() {
   const funcName = 'runDemoAndSubmitMeetingDoc';
-  ScriptApp.getProjectTriggers().forEach(t => {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
     if (t.getHandlerFunction() === funcName) ScriptApp.deleteTrigger(t);
   });
   ScriptApp.newTrigger(funcName).timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(10).nearMinute(0).create();
@@ -94,7 +107,7 @@ function installWeeklyMtgDocTrigger() {
 }
 
 /**
- * ナレッジシートの最新返信（末尾30行のみ高速取得）をAI判定し、『交渉注意医師』『交渉しやすい医師』に反映する
+ * ナレッジシートの最新返信（末尾30行のみ高速取得）をAI判定し、『交渉注意医師』および既存の『交渉しやすい医師』に反映する
  */
 function syncNewKnowledgeToAiMemo_(ss) {
   try {
@@ -138,15 +151,15 @@ function syncNewKnowledgeToAiMemo_(ss) {
 
     const systemPrompt = [
       'あなたはCAPSクリニックの医師マスタ管理AIです。',
-      '医師からの返信メール一覧を読み、今後のシフト打診で継続して覚えておくべき条件（例：「東品川は遠いためNG」「金曜は不可」「埼玉拠点なら移動OK」など）が含まれているものだけを抽出してください。',
-      '単なるその日限りの出欠連絡や、他病院の退職挨拶などは shouldWrite: false にしてください。',
+      '医師からの返信メール一覧を読み、今後の非常勤シフト打診で継続して覚えておくべきNG条件や曜日・時間帯・拠点の制約（例：「東品川は遠いためNG」「火曜・金曜の日中のみ希望」「以降の時間帯は不可」など）が含まれているものだけを抽出してください。',
+      '🚫除外対象：単なるその日限りの出欠連絡、来年度の常勤契約日数の相談、他病院の退職挨拶などはすべて shouldWrite: false にしてください。',
       '以下のJSON形式のみを出力してください:',
       '{',
       '  "decisions": [',
       '    {',
       '      "rowNumber": 10,',
       '      "shouldWrite": true,',
-      '      "targetSheet": "交渉注意医師 または 交渉しやすい医師",',
+      '      "targetSheet": "交渉注意医師",',
       '      "conditionType": "部分不可 または 絶対不可",',
       '      "ngClinic": "特定のNG拠点名があれば記載（例: 東品川）、なければ空文字",',
       '      "aiMemoSummary": "メモ列に追記する35文字以内の簡潔な条件要約"',
@@ -172,21 +185,21 @@ function syncNewKnowledgeToAiMemo_(ss) {
 
     if (!res || res.getResponseCode() !== 200) return;
 
-    const parsed = JSON.parse(JSON.parse(res.getContentText()).candidates[0].content.parts.map(p => p.text || '').join('').trim());
+    const parsed = JSON.parse(JSON.parse(res.getContentText()).candidates[0].content.parts.map(function(p) { return p.text || ''; }).join('').trim());
     const decisions = (parsed && Array.isArray(parsed.decisions)) ? parsed.decisions : [];
-    const itemMap = new Map(targetItems.map(it => [it.rowNumber, it]));
+    const itemMap = new Map(targetItems.map(function(it) { return [it.rowNumber, it]; }));
 
-    decisions.forEach(d => {
+    decisions.forEach(function(d) {
       const orig = itemMap.get(Number(d.rowNumber));
       if (!orig) return;
 
       if (d.shouldWrite && d.aiMemoSummary) {
         const stamp = orig.date ? String(orig.date).slice(5, 10) : Utilities.formatDate(new Date(), 'Asia/Tokyo', 'MM/dd');
-        const entryText = `[${stamp}] ${d.aiMemoSummary}`;
+        const entryText = '[' + stamp + '] ' + d.aiMemoSummary;
 
-        if (d.targetSheet === '交渉しやすい医師') {
-          upsertNegotiableSheetRow_(ss, orig.doctor, orig.licenseNo, entryText);
-        } else {
+        // すでに『交渉しやすい医師』に登録されている医師ならE列に追記、未登録なら必ず『交渉注意医師』へ記録（新規行の無断追加を防止）
+        const updatedInNeg = upsertNegotiableSheetRowIfExist_(ss, orig.doctor, entryText);
+        if (!updatedInNeg) {
           const cSheet = ss.getSheetByName('交渉注意医師');
           if (cSheet) {
             upsertCautionDoctorRowProperly_(cSheet, null, {
@@ -213,8 +226,58 @@ function syncNewKnowledgeToAiMemo_(ss) {
 }
 
 /**
- * 『交渉注意医師』シートで列ズレ・プルダウン違反になっている行を検出して自動修復・統合する関数（手動実行用）
+ * 『交渉しやすい医師』および『交渉注意医師』シートで列ズレ・誤分類になっている行を自動修復・移管する関数
  */
+function repairNegotiableAndCautionSheetsNow(ssOpt) {
+  const ss = ssOpt || SpreadsheetApp.getActiveSpreadsheet();
+  const negSheet = ss.getSheetByName('交渉しやすい医師');
+  const cautionSheet = ss.getSheetByName('交渉注意医師');
+
+  // 1. 『交渉しやすい医師』の列ズレ・AI自動抽出行を検出し、『交渉注意医師』へ移管して削除
+  if (negSheet && negSheet.getLastRow() >= 2) {
+    const negVals = negSheet.getDataRange().getDisplayValues();
+    const negRowsToDelete = [];
+
+    for (let r = 1; r < negVals.length; r++) {
+      const row = negVals[r];
+      const colA = String(row[0] || '').trim();
+      const colB = String(row[1] || '').trim();
+      const colC = String(row[2] || '').trim();
+      const colE = String(row[4] || '').trim();
+
+      // A列が管理番号（数字）でB列が医師名、またはC列が「AI自動抽出」の行を検出
+      if ((/^\d+$/.test(colA) && colB && !/^\d+$/.test(colB)) || colC.includes('AI自動抽出')) {
+        const actualDocName = (/^\d+$/.test(colA) && colB) ? colB : colA;
+        const memoTxt = colE || String(row[3] || '').trim();
+
+        // 来年度の契約日数希望（常勤連絡）以外の有効な条件メモは『交渉注意医師』へ移管
+        if (cautionSheet && actualDocName && memoTxt && !memoTxt.includes('来年度は勤務日数')) {
+          upsertCautionDoctorRowProperly_(cautionSheet, null, {
+            doctorName: actualDocName,
+            licenseNo: '',
+            dept: '小児科',
+            conditionType: '部分不可',
+            ngArea: '関東',
+            ngClinic: '',
+            memoText: memoTxt
+          });
+        }
+        negRowsToDelete.push(r + 1);
+      }
+    }
+
+    negRowsToDelete.sort(function(a, b) { return b - a; }).forEach(function(rNum) {
+      negSheet.deleteRow(rNum);
+    });
+    if (negRowsToDelete.length > 0) {
+      Logger.log('✅ 『交渉しやすい医師』の誤分類・列ズレ行を修復・移管しました（' + negRowsToDelete.length + '件）');
+    }
+  }
+
+  // 2. 『交渉注意医師』自体の列ズレ修復
+  repairCautionSheetRowsNow(ss);
+}
+
 function repairCautionSheetRowsNow(ssOpt) {
   const ss = ssOpt || SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName('交渉注意医師');
@@ -248,7 +311,7 @@ function repairCautionSheetRowsNow(ssOpt) {
 
   if (brokenEntries.length === 0) return;
 
-  brokenEntries.forEach(entry => {
+  brokenEntries.forEach(function(entry) {
     upsertCautionDoctorRowProperly_(sheet, validRowsMap, {
       doctorName: entry.doctorName,
       licenseNo: '',
@@ -259,11 +322,11 @@ function repairCautionSheetRowsNow(ssOpt) {
     });
   });
 
-  rowsToDelete.sort((a, b) => b - a).forEach(rNum => {
+  rowsToDelete.sort(function(a, b) { return b - a; }).forEach(function(rNum) {
     sheet.deleteRow(rNum);
   });
 
-  Logger.log(`✅ 『交渉注意医師』シートの列ズレ行を自動修復・統合しました（${brokenEntries.length}件）`);
+  Logger.log('✅ 『交渉注意医師』シートの列ズレ行を自動修復・統合しました（' + brokenEntries.length + '件）');
 }
 
 function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
@@ -276,7 +339,7 @@ function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
     const lastR = sheet.getLastRow();
     if (lastR >= 2) {
       const aVals = sheet.getRange(2, 1, lastR - 1, 1).getDisplayValues();
-      aVals.forEach((r, idx) => {
+      aVals.forEach(function(r, idx) {
         const k = normKeyForDoc_(r[0]);
         if (k) existingMap.set(k, idx + 2);
       });
@@ -291,14 +354,14 @@ function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
   ];
   let detectedClinic = info.ngClinic || '';
   if (!detectedClinic && info.memoText) {
-    detectedClinic = knownClinics.find(c => info.memoText.includes(c)) || '';
+    detectedClinic = knownClinics.find(function(c) { return info.memoText.includes(c); }) || '';
   }
 
   if (existingMap.has(docKey)) {
     const targetRow = existingMap.get(docKey);
     const currentP = String(sheet.getRange(targetRow, 16).getDisplayValue() || '').trim();
     if (info.memoText && !currentP.includes(info.memoText)) {
-      const newP = currentP ? `${currentP} / ${info.memoText}` : info.memoText;
+      const newP = currentP ? (currentP + ' / ' + info.memoText) : info.memoText;
       sheet.getRange(targetRow, 16).setValue(newP);
     }
     if (detectedClinic) {
@@ -348,27 +411,32 @@ function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
   existingMap.set(docKey, newRowIdx);
 }
 
-function upsertNegotiableSheetRow_(ss, doctorName, licenseNo, entryText) {
+/**
+ * 『交渉しやすい医師』にすでに登録されている医師の場合のみE列（AIメモ）を更新し、新規行追加は一切行わない関数
+ */
+function upsertNegotiableSheetRowIfExist_(ss, doctorName, entryText) {
   const sh = ss.getSheetByName('交渉しやすい医師');
-  if (!sh) return;
+  if (!sh) return false;
   const targetKey = normKeyForDoc_(doctorName);
-  const lastRow = sh.getLastRow();
+  if (!targetKey) return false;
 
+  const lastRow = sh.getLastRow();
   if (lastRow >= 2) {
     const vals = sh.getRange(2, 1, lastRow - 1, 5).getDisplayValues();
     for (let i = 0; i < vals.length; i++) {
-      const k = normKeyForDoc_(vals[i][0]) || normKeyForDoc_(vals[i][1]);
+      const colA = String(vals[i][0] || '').trim();
+      if (/^\d+$/.test(colA)) continue;
+      const k = normKeyForDoc_(colA);
       if (k === targetKey) {
         const curE = String(vals[i][4] || '').trim();
         if (!curE.includes(entryText)) {
-          sh.getRange(i + 2, 5).setValue(curE ? `${curE} / ${entryText}` : entryText);
+          sh.getRange(i + 2, 5).setValue(curE ? (curE + ' / ' + entryText) : entryText);
         }
-        return;
+        return true;
       }
     }
   }
-  const cleanLic = (licenseNo && /^\d{5,7}$/.test(String(licenseNo).trim())) ? String(licenseNo).trim() : '';
-  sh.appendRow([doctorName, cleanLic, '', '', entryText]);
+  return false;
 }
 
 function loadOrInitCustomRuleSheet_(ss) {
@@ -382,7 +450,7 @@ function loadOrInitCustomRuleSheet_(ss) {
       ['手当の支給区分', '常勤勤務依頼手当（1,500円/h）は『常勤依頼手当』シート記載の医師のみ。他拠点からの拠点移動時は一律で「移動依頼手当10,000円」を支給（※SBUのみ0円）。'],
       ['2診目崩しと併行募集の表記', '他拠点からの移動案は、2診体制からの移動なら「【2診目崩し】拠点名（2診目：〇〇先生）」、2人とも移動可能なら「【2診目崩し】拠点名（2診目：①〇〇先生 / ②△△先生）」と両方書く。1診体制からの移動なら「【1診・併行募集】拠点名（1診：〇〇先生）」と明記する。'],
       ['属性表記の省略', '個別打診の候補医師に「（スポット）」「（紹介会社）」という記載は不要。シンプルに「〇〇先生へ個別打診（同曜日同枠〇回実績）」と記載する。'],
-      ['エリア制限', '2診目崩しや併行募集での移動提案は、同一都道府県内または隣接エリア（東京⇔千葉・埼玉・神奈川）のみとし、関西⇔関東などの遠距離移動は絶対に提案しない。']
+      ['エリア制限', '2診目崩しや午前・午後のシフト間移動は、定義書のドミナント優先度（S・A＝60分以内、特例B）に準拠し、関西⇔関東や移動不可領域（NG）の遠距離移動は絶対に提案しない。']
     ];
     sh.getRange(1, 1, defaultRules.length, 2).setValues(defaultRules);
     sh.getRange(1, 1, 1, 2).setBackground('#4a86e8').setFontColor('#ffffff').setFontWeight('bold');
@@ -396,7 +464,7 @@ function loadOrInitCustomRuleSheet_(ss) {
   for (let i = 1; i < vals.length; i++) {
     const cat = String(vals[i][0] || '').trim();
     const rule = String(vals[i][1] || '').trim();
-    if (rule) lines.push(`・【${cat || '追加ルール'}】${rule}`);
+    if (rule) lines.push('・【' + (cat || '追加ルール') + '】' + rule);
   }
   return lines.join('\n');
 }
