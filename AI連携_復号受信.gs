@@ -1,12 +1,13 @@
 /**
  * ============================================================================
- * AI連携_復号受信.gs（caps365.jp 側：マスタ動的参照 ＋ シンプルメニュー統合版）
+ * AI連携_復号受信.gs（caps365.jp 側：スクリプトプロパティ完全分離・セキュア版）
+ * ※スクリプトプロパティに AI_BRIDGE_SECRET_KEY を設定して使用します
  * ============================================================================
  */
 
 const AI_RECEIVER_CONFIG = {
   SUBJECT_QUERY: 'subject:"【AI連携暗号化JSON】医師不在・シフト状況パック"',
-  DEFAULT_SECRET_KEY: 'CAPS_MNYS_AI_AGENT_SECRET_2026_KEY_#9876',
+  SECRET_PROP_KEY: 'AI_BRIDGE_SECRET_KEY',
   LAST_PROCESSED_MSG_KEY: 'AI_BRIDGE_LAST_PROCESSED_MSG_ID',
 
   // マスタ参照シート名（DSナレッジシート内）
@@ -113,11 +114,14 @@ function loadDoctorRoleMastersFromSheets_(ss) {
   if (negSheet && negSheet.getLastRow() >= 2) {
     const vals = negSheet.getDataRange().getDisplayValues();
     for (let r = 1; r < vals.length; r++) {
-      const nameKey = normalizeDocKeyReceive_(vals[r][0]);
+      const rawA = String(vals[r][0] || '').trim();
+      const rawC = String(vals[r][2] || '').trim();
+      if (/^\d+$/.test(rawA) || rawC.includes('AI自動抽出')) continue;
+      const nameKey = normalizeDocKeyReceive_(rawA);
       if (!nameKey) continue;
       negotiableMap.set(nameKey, {
         licenseNo: String(vals[r][1] || '').trim(),
-        route: String(vals[r][2] || '').trim(),
+        route: rawC,
         humanMemo: String(vals[r][3] || '').trim(),
         aiMemo: String(vals[r][4] || '').trim()
       });
@@ -237,7 +241,10 @@ function importLatestEncryptedShiftContext_(isForceManual) {
     return;
   }
 
-  props.setProperty(AI_RECEIVER_CONFIG.LAST_PROCESSED_MSG_KEY, msgId);
+  const secretKey = String(props.getProperty(AI_RECEIVER_CONFIG.SECRET_PROP_KEY) || '').trim();
+  if (!secretKey) {
+    throw new Error('スクリプトプロパティに ' + AI_RECEIVER_CONFIG.SECRET_PROP_KEY + ' が設定されていません。プロジェクトの設定から登録してください。');
+  }
 
   const body = latestMsg.getPlainBody();
   const match = body.match(/---BEGIN_ENCRYPTED_AI_PAYLOAD---\s*([\s\S]*?)\s*---END_ENCRYPTED_AI_PAYLOAD---/);
@@ -245,11 +252,10 @@ function importLatestEncryptedShiftContext_(isForceManual) {
     throw new Error('メール本文から暗号化データを抽出できませんでした。');
   }
 
-  const secretKey = props.getProperty('AI_BRIDGE_SECRET_KEY')
-    || AI_RECEIVER_CONFIG.DEFAULT_SECRET_KEY;
-
   const encryptedPackage = JSON.parse(match[1].trim());
   const payloadObj = verifyAndDecryptPayload_(encryptedPackage, secretKey);
+
+  props.setProperty(AI_RECEIVER_CONFIG.LAST_PROCESSED_MSG_KEY, msgId);
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const roleMasters = loadDoctorRoleMastersFromSheets_(ss);
@@ -296,7 +302,7 @@ function verifyAndDecryptPayload_(pkg, secretKey) {
   const expectedSigBytes = Utilities.computeHmacSha256Signature(pkg.iv + ':' + pkg.data, secretKey);
   const expectedSigBase64 = Utilities.base64Encode(expectedSigBytes);
   if (expectedSigBase64 !== pkg.sig) {
-    throw new Error('署名検証に失敗しました。暗号化キーが一致していません。');
+    throw new Error('署名検証に失敗しました。スクリプトプロパティの暗号化キーが一致していません。');
   }
 
   const cipherBytes = Utilities.base64Decode(pkg.data);
@@ -505,10 +511,6 @@ function writeStreakWarningsSheet_(ss, streakWarnings, roleMasters) {
   applyLeftAlignToSheet_(sheet, rows.length + 1, headers.length);
 }
 
-/**
- * 受信したペイロード内の「勤務くん個別打診候補」と「複数日程おまとめ候補」に
- * 『交渉しやすい医師』『交渉注意医師』『ナレッジシート（直近打診履歴）』の情報を付加して展開する
- */
 function writeKinmukunCandidateSheets_(ss, payload, roleMasters) {
   const negotiableMap = roleMasters.negotiableMap;
   const cautionMap = roleMasters.cautionMap;

@@ -1,7 +1,8 @@
 /**
  * ============================================================================
- * 5_AI会議_氏名補正リゾルバ.gs
+ * AI会議_5_氏名補正リゾルバ.gs
  * （DSナレッジシート・BQシフトパック・担当者マスタから正式な医師名と医籍番号を特定する辞書）
+ * ※スクリプトプロパティに BQ_SECRET_KEY を設定して使用します
  * ============================================================================
  */
 
@@ -9,7 +10,7 @@ const BRIDGE_DECRYPT_CONFIG = {
   STAFF_SS_ID: '1vh9hPfoaAGTZOm-GFtJQoSPgFB3GiABsbJ4ETgMqfbM',
   STAFF_SHEET_NAME: '担当者',
   MAIL_QUERY_BQ: 'subject:"【AI連携暗号化JSON】BQシフト状況パック"',
-  BQ_SECRET_KEY: 'CAPS_AI_BRIDGE_SECRET_2026'
+  BQ_SECRET_PROP_KEY: 'BQ_SECRET_KEY'
 };
 
 /**
@@ -30,11 +31,12 @@ function toStandardKanjiForCaps_(str) {
     .replace(/澤/g, '沢')
     .replace(/廣/g, '広')
     .replace(/國/g, '国')
-    .replace(/嶋/g, '島')
+    .replace(/[嶋嶌]/g, '島')
     .replace(/[栁柳]/g, '柳')
     .replace(/[濵濱]/g, '浜')
     .replace(/櫻/g, '桜')
     .replace(/眞/g, '真')
+    .replace(/惠/g, '恵')
     .replace(/ヶ/g, 'ケ')
     .trim();
 }
@@ -43,7 +45,7 @@ function buildCapsDoctorAndStaffResolver_(ss) {
   const doctorMap = new Map();
   const dayShiftMap = new Map();
 
-  const registerDoctor = (rawName, licenseNo, dateStr, clinicName) => {
+  const registerDoctor = function(rawName, licenseNo, dateStr, clinicName) {
     const cleanName = String(rawName || '')
       .replace(/[\(（\[【].*$/g, '')
       .replace(/[:：].*$/, '')
@@ -70,28 +72,32 @@ function buildCapsDoctorAndStaffResolver_(ss) {
       if (!dayShiftMap.has(dateStr)) dayShiftMap.set(dateStr, []);
       const list = dayShiftMap.get(dateStr);
       const cleanC = String(clinicName || '').replace(/[\(（].*?[\)）]/g, '').trim();
-      if (!list.some(d => d.normName === norm && d.clinic === cleanC)) {
+      if (!list.some(function(d) { return d.normName === norm && d.clinic === cleanC; })) {
         const master = doctorMap.get(norm) || {};
         list.push({ name: master.name || cleanName, normName: norm, licenseNo: master.licenseNo || lic, clinic: cleanC });
       }
     }
   };
 
-  // 1. DSナレッジシート内の各シートから医師名＋医籍番号を収集
-  const collectFromSheet = (sheetName, nameColIdx, licColIdx, dateColIdx, clinicColIdx) => {
+  const collectFromSheet = function(sheetName, nameColIdx, licColIdx, dateColIdx, clinicColIdx) {
     const sh = ss.getSheetByName(sheetName);
     if (!sh || sh.getLastRow() < 2) return;
     const vals = sh.getDataRange().getDisplayValues();
-    const headers = vals[0].map(h => String(h || '').trim());
+    const headers = vals[0].map(function(h) { return String(h || '').trim(); });
 
     let resolvedLicCol = licColIdx;
     if (resolvedLicCol < 0) {
-      const foundLicIdx = headers.findIndex(h => h.includes('医籍') || h.includes('ID'));
+      const foundLicIdx = headers.findIndex(function(h) { return h.includes('医籍') || h.includes('ID'); });
       if (foundLicIdx >= 0) resolvedLicCol = foundLicIdx;
     }
 
     for (let r = 1; r < vals.length; r++) {
       const row = vals[r];
+      if (sheetName === '交渉しやすい医師') {
+        const rawA = String(row[0] || '').trim();
+        const rawC = String(row[2] || '').trim();
+        if (/^\d+$/.test(rawA) || rawC.includes('AI自動抽出')) continue;
+      }
       registerDoctor(
         nameColIdx >= 0 ? row[nameColIdx] : '',
         resolvedLicCol >= 0 ? row[resolvedLicCol] : '',
@@ -105,12 +111,11 @@ function buildCapsDoctorAndStaffResolver_(ss) {
   collectFromSheet('最新_おまとめ打診候補', 0, 1, -1, -1);
   collectFromSheet('最新_応募シフト', 2, 1, 0, 4);
   collectFromSheet('最新_連勤注意リスト', 1, 0, -1, -1);
-  collectFromSheet('交渉しやすい医師', 0, 1, -1, -1); // A列(0):医師名, B列(1):医籍番号
-  collectFromSheet('交渉注意医師', 0, 1, -1, -1);     // A列(0):医師名, B列(1):医籍番号
-  collectFromSheet('常勤依頼手当', 0, 1, -1, -1);     // A列(0):医師名, B列(1):医籍番号
-  collectFromSheet('SBU', 0, 1, -1, -1);              // A列(0):医師名, B列(1):医籍番号
+  collectFromSheet('交渉しやすい医師', 0, 1, -1, -1);
+  collectFromSheet('交渉注意医師', 0, 1, -1, -1);
+  collectFromSheet('常勤依頼手当', 0, 1, -1, -1);
+  collectFromSheet('SBU', 0, 1, -1, -1);
 
-  // ナレッジシートは末尾500行のみを高速スキャン（A列が管理番号の場合は医籍番号から除外）
   const kbSh = ss.getSheetByName('ナレッジシート');
   if (kbSh && kbSh.getLastRow() >= 2) {
     const lastR = kbSh.getLastRow();
@@ -127,33 +132,37 @@ function buildCapsDoctorAndStaffResolver_(ss) {
   if (shiftSh && shiftSh.getLastRow() >= 2) {
     const sVals = shiftSh.getDataRange().getDisplayValues();
     for (let r = 1; r < sVals.length; r++) {
-      [sVals[r][7], sVals[r][8], sVals[r][9]].forEach(cellText => {
-        String(cellText || '').split(/[,、，\/]+/).forEach(tok => registerDoctor(tok, '', sVals[r][0], sVals[r][2]));
+      [sVals[r][7], sVals[r][8], sVals[r][9]].forEach(function(cellText) {
+        const tokens = (typeof splitDoctorTokensSafely_ === 'function')
+          ? splitDoctorTokensSafely_(cellText)
+          : String(cellText || '').split(/[,、，\/]+/);
+        tokens.forEach(function(tok) { registerDoctor(tok, '', sVals[r][0], sVals[r][2]); });
       });
     }
   }
 
-  // 2. BQシフト状況パック（暗号化メール）から2ヶ月分の確定・応募シフト医師を登録
   try {
     const bqData = typeof fetchAndDecryptBqMailFast_ === 'function'
       ? fetchAndDecryptBqMailFast_()
       : fetchAndDecryptBqMailForResolver_();
     if (bqData) {
-      (bqData.kakutei || []).forEach(s => registerDoctor(s.n, s.id || '', s.d, s.c));
-      (bqData.obo || []).forEach(s => registerDoctor(s.n, s.id || '', s.d, s.c));
+      (bqData.kakutei || []).forEach(function(s) { registerDoctor(s.n, s.id || '', s.d, s.c); });
+      (bqData.obo || []).forEach(function(s) { registerDoctor(s.n, s.id || '', s.d, s.c); });
     }
   } catch (e) {}
 
-  // 3. 担当者マスタの読み込み（DSナレッジシート内優先）
   const staffMap = new Map();
-  const loadStaffRows = (sh) => {
+  const loadStaffRows = function(sh) {
     if (!sh || sh.getLastRow() < 2) return;
     const stVals = sh.getDataRange().getDisplayValues();
     for (let r = 1; r < stVals.length; r++) {
-      const [colA, colB, colC, colD] = stVals[r].map(v => String(v || '').trim());
+      const colA = String(stVals[r][0] || '').trim();
+      const colB = String(stVals[r][1] || '').trim();
+      const colC = String(stVals[r][2] || '').trim();
+      const colD = String(stVals[r][3] || '').trim();
       const surname = colD || colA.split(/[\s\u3000]+/)[0];
       if (!surname) continue;
-      [colA, colB, colC, colD, surname].filter(Boolean).forEach(alias => {
+      [colA, colB, colC, colD, surname].filter(Boolean).forEach(function(alias) {
         staffMap.set(alias.replace(/[\s\u3000]+/g, ''), surname);
       });
     }
@@ -168,20 +177,22 @@ function buildCapsDoctorAndStaffResolver_(ss) {
   }
 
   return {
-    resolveDoctor: (rawInputName, dateStr, preferredClinic) => {
+    resolveDoctor: function(rawInputName, dateStr, preferredClinic) {
       const normTarget = toStandardKanjiForCaps_(rawInputName);
       if (!normTarget) return { name: rawInputName, licenseNo: '', dayClinic: '' };
 
       if (dateStr && dayShiftMap.has(dateStr)) {
         const dayDocs = dayShiftMap.get(dateStr);
-        const exactDay = dayDocs.find(d => d.normName === normTarget && (!preferredClinic || d.clinic.includes(preferredClinic)));
+        const exactDay = dayDocs.find(function(d) {
+          return d.normName === normTarget && (!preferredClinic || d.clinic.includes(preferredClinic));
+        });
         if (exactDay) {
           const master = doctorMap.get(exactDay.normName) || exactDay;
           return { name: master.name, licenseNo: master.licenseNo || exactDay.licenseNo, dayClinic: exactDay.clinic };
         }
-        const prefixMatches = dayDocs.filter(d => d.normName.startsWith(normTarget));
+        const prefixMatches = dayDocs.filter(function(d) { return d.normName.startsWith(normTarget); });
         if (prefixMatches.length > 0) {
-          const chosen = (preferredClinic ? prefixMatches.find(d => d.clinic.includes(preferredClinic)) : null) || prefixMatches[0];
+          const chosen = (preferredClinic ? prefixMatches.find(function(d) { return d.clinic.includes(preferredClinic); }) : null) || prefixMatches[0];
           const master = doctorMap.get(chosen.normName) || chosen;
           return { name: master.name, licenseNo: master.licenseNo || chosen.licenseNo, dayClinic: chosen.clinic };
         }
@@ -201,7 +212,7 @@ function buildCapsDoctorAndStaffResolver_(ss) {
       return { name: String(rawInputName || '').replace(/先生$/g, '').trim(), licenseNo: '', dayClinic: '' };
     },
 
-    resolveStaff: (rawStaff) => {
+    resolveStaff: function(rawStaff) {
       const s = String(rawStaff || '').replace(/[\s\u3000]+/g, '').trim();
       if (!s) return '';
       if (staffMap.has(s)) return staffMap.get(s);
@@ -231,9 +242,11 @@ function fetchAndDecryptBqMailForResolver_() {
 
   const m = rawText.match(/ENC_V1:([A-Za-z0-9+\/=_\-\r\n]+)/);
   if (m) {
+    const secretKey = String(PropertiesService.getScriptProperties().getProperty(BRIDGE_DECRYPT_CONFIG.BQ_SECRET_PROP_KEY) || '').trim();
+    if (!secretKey) return null;
     const encBytes = Utilities.base64Decode(m[1].replace(/[\r\n\s]+/g, ''));
-    const keyBytes = Utilities.newBlob(BRIDGE_DECRYPT_CONFIG.BQ_SECRET_KEY).getBytes();
-    const out = encBytes.map((b, i) => b ^ keyBytes[i % keyBytes.length]);
+    const keyBytes = Utilities.newBlob(secretKey).getBytes();
+    const out = encBytes.map(function(b, i) { return b ^ keyBytes[i % keyBytes.length]; });
     return JSON.parse(Utilities.ungzip(Utilities.newBlob(out, 'application/x-gzip')).getDataAsString('UTF-8'));
   }
 

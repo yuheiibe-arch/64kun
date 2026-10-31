@@ -7,8 +7,8 @@
 
 const DOMINANT_DOC_CONFIG = {
   DOC_ID: '1XUx2cLqN2P2RhUakpLEOn4xFzv7XnqQ_Jqm376xw1jU',
-  CACHE_KEY: 'CAPS_DOMINANT_MATRIX_V1',
-  CACHE_TTL_SEC: 21600 // 6時間キャッシュ（ドキュメント変更時はキャッシュクリアまたは自動更新）
+  CACHE_KEY: 'CAPS_DOMINANT_MATRIX_V2',
+  CACHE_TTL_SEC: 21600 // 6時間キャッシュ
 };
 
 function normKeyForDoc_(name) {
@@ -30,6 +30,7 @@ function normKeyForDoc_(name) {
 function cleanClinicBaseName_(raw) {
   return String(raw || '')
     .replace(/^[★☆\s]+/, '')
+    .replace(/※.*$/g, '') // ★「※越谷LTタ5分」等の注記を確実に除去
     .replace(/【|】/g, '')
     .replace(/[\(（].*?[\)）]/g, '')
     .replace(/小児科|内科/g, '')
@@ -65,10 +66,6 @@ function inferAreaForDoc_(clinicName) {
   return '東京';
 }
 
-/**
- * ドキュメント（1XUx2cLqN2P2RhUakpLEOn4xFzv7XnqQ_Jqm376xw1jU）のセクション4・5の表を読み込み、
- * 拠点間の優先度ランク（S/A/B/NG）と実効移動時間（T_eff）のマトリクスを動的に構築する関数
- */
 function loadDominantMatrixFromDoc_() {
   const cache = CacheService.getScriptCache();
   const cached = cache.get(DOMINANT_DOC_CONFIG.CACHE_KEY);
@@ -88,9 +85,7 @@ function loadDominantMatrixFromDoc_() {
       const table = el.asTable();
       if (table.getNumRows() < 2) continue;
 
-      const h1 = table.getRow(0).getCell(1).getText().trim();
       const h2 = table.getRow(0).getCell(2).getText().trim();
-      // セクション4（関西）およびセクション5（関東）の優先度テーブルを検出
       if (!h2.includes('【優先度S】')) continue;
 
       for (let r = 1; r < table.getNumRows(); r++) {
@@ -101,41 +96,36 @@ function loadDominantMatrixFromDoc_() {
         if (!fromClinic) continue;
         if (!matrix[fromClinic]) matrix[fromClinic] = {};
 
-        parsePriorityCellIntoMatrix_(matrix[fromClinic], row.getCell(2).getText(), 'S', 95);
+        parsePriorityCellIntoMatrix_(matrix[fromClinic], row.getCell(2).getText(), 'S', 100);
         parsePriorityCellIntoMatrix_(matrix[fromClinic], row.getCell(3).getText(), 'A', 80);
         parsePriorityCellIntoMatrix_(matrix[fromClinic], row.getCell(4).getText(), 'B', 60);
-        if (row.getNumCells() >= 6) {
-          parsePriorityCellIntoMatrix_(matrix[fromClinic], row.getCell(5).getText(), 'NG', 0);
-        }
       }
     }
 
-    cache.put(DOMINANT_DOC_CONFIG.CACHE_KEY, JSON.stringify(matrix), DOMINANT_DOC_CONFIG.CACHE_TTL_SEC);
+    if (Object.keys(matrix).length > 0) {
+      cache.put(DOMINANT_DOC_CONFIG.CACHE_KEY, JSON.stringify(matrix), DOMINANT_DOC_CONFIG.CACHE_TTL_SEC);
+    }
   } catch (e) {
     Logger.log('⚠️ ドミナント定義書ドキュメントの読み込みエラー: ' + e.message);
   }
   return matrix;
 }
 
-/**
- * セル内の「西葛西(17/18), 北葛西(タ18/19)」のような記述から相手拠点名と最短移動分数を抽出するヘルパー
- */
 function parsePriorityCellIntoMatrix_(targetObj, cellText, rank, baseScore) {
   const s = String(cellText || '').trim();
   if (!s || s.startsWith('なし')) return;
 
-  // 「拠点名(分数...)」のパターンをすべて抽出
   const itemRegex = /([^,、\n\(\uff08]+?)[\(\uff08]([^)\uff09]+)[\)\uff09]/g;
   let m;
   while ((m = itemRegex.exec(s)) !== null) {
     const destName = cleanClinicBaseName_(m[1]);
     if (!destName || destName.includes('全域')) continue;
 
-    const timePart = m[2].replace(/\[.*?\]/g, ''); // [歩45]などの補足は除外してタクシー・電車の標準値を取る
+    const timePart = m[2].replace(/\[.*?\]/g, '');
     const nums = (timePart.match(/\d+/g) || []).map(Number).filter(function(n) { return n > 0 && n < 300; });
     const minMinutes = nums.length > 0 ? Math.min.apply(null, nums) : (rank === 'S' ? 30 : (rank === 'A' ? 50 : 65));
 
-    const calcScore = rank === 'NG' ? 0 : Math.round(baseScore - 0.2 * minMinutes);
+    const calcScore = Math.round(baseScore - 0.2 * minMinutes);
     targetObj[destName] = {
       rank: rank,
       score: calcScore,
@@ -144,16 +134,12 @@ function parsePriorityCellIntoMatrix_(targetObj, cellText, rank, baseScore) {
   }
 }
 
-/**
- * 2拠点間の移動優先度ランク（S / A / B / NG）・スコア・推定移動分数を返す関数
- */
 function evaluateClinicPairMobility_(clinic1, clinic2, matrixOpt) {
   const c1 = cleanClinicBaseName_(clinic1);
   const c2 = cleanClinicBaseName_(clinic2);
   const a1 = inferAreaForDoc_(c1);
   const a2 = inferAreaForDoc_(c2);
 
-  // Rule 0: 関東・関西の絶対分離
   if ((a1 === '関西') !== (a2 === '関西')) {
     return { rank: 'NG', score: -9999, estMinutes: 999 };
   }
@@ -162,26 +148,28 @@ function evaluateClinicPairMobility_(clinic1, clinic2, matrixOpt) {
   }
 
   const matrix = matrixOpt || loadDominantMatrixFromDoc_();
+  const hasMatrixLoaded = matrix && Object.keys(matrix).length > 0;
 
-  // ドキュメントから読み込んだマトリクスに定義があればそれを最優先で返す（双方向チェック）
-  if (matrix[c1] && matrix[c1][c2]) return matrix[c1][c2];
-  if (matrix[c2] && matrix[c2][c1]) return matrix[c2][c1];
+  if (hasMatrixLoaded) {
+    if (matrix[c1] && matrix[c1][c2]) return matrix[c1][c2];
+    if (matrix[c2] && matrix[c2][c1]) return matrix[c2][c1];
 
-  // 部分一致検索（表記ゆれ対策）
-  const findEntry = function(srcMap, destKey) {
-    if (!srcMap) return null;
-    const keys = Object.keys(srcMap);
-    for (let i = 0; i < keys.length; i++) {
-      if (keys[i].includes(destKey) || destKey.includes(keys[i])) return srcMap[keys[i]];
-    }
-    return null;
-  };
-  const hit1 = findEntry(matrix[c1], c2);
-  if (hit1) return hit1;
-  const hit2 = findEntry(matrix[c2], c1);
-  if (hit2) return hit2;
+    const findEntry = function(srcMap, destKey) {
+      if (!srcMap) return null;
+      const keys = Object.keys(srcMap);
+      for (let i = 0; i < keys.length; i++) {
+        if (keys[i].includes(destKey) || destKey.includes(keys[i])) return srcMap[keys[i]];
+      }
+      return null;
+    };
+    const hit1 = findEntry(matrix[c1], c2);
+    if (hit1) return hit1;
+    const hit2 = findEntry(matrix[c2], c1);
+    if (hit2) return hit2;
 
-  // ドキュメント表のNG列（例：「神奈川全域」「千葉全域」など一括表記で省略されている遠隔ペア）のフォールバック判定
+    return { rank: 'NG', score: 0, estMinutes: 100 };
+  }
+
   if (a1 === a2) {
     return { rank: 'A', score: 75, estMinutes: 50 };
   }
