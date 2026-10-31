@@ -1,246 +1,390 @@
 /**
  * ============================================================================
  * 7c3_編集くん64_検索と保存通信.gs
- * （医師サジェスト検索・複数医師追加・一括担当セット・進捗集計・一時保存/提出通信）
+ * （クリア・編集前に戻す・ステイ時の担当者自動クローズ＆グレーアウト対応版）
  * ============================================================================
  */
 
 function getHenshukun64ScriptPart3_() {
-  return `
-    function onSearchDocInput64(slotKey) {
-      const inp = document.getElementById('srch_' + slotKey);
-      const drop = document.getElementById('sug_' + slotKey);
-      if (!inp || !drop) return;
-
-      const q = normalizeSearchClient64(inp.value);
-      if (!q) {
-        drop.style.display = 'none';
-        return;
-      }
-
-      const matches = state.doctorSearchList.filter(d => d.norm.includes(q) || d.name.includes(inp.value.trim())).slice(0, 12);
-      if (matches.length === 0) {
-        drop.innerHTML = '<div style="padding:6px 10px;font-size:12px;color:#64748b;">該当する医師が見つかりません（下の欄に直接手入力も可能です）</div>';
-        drop.style.display = 'block';
-        return;
-      }
-
-      drop.innerHTML = matches.map(d => {
-        const licBadge = d.licenseNo ? '医籍: ' + d.licenseNo : '番号未登録';
-        const tagBadge = d.tag ? ' [' + d.tag + ']' : '';
-        return '<div class="suggest-item" onclick="pickDoctorFromSuggest64(\\'' + slotKey + '\\', \\'' + d.name + '\\', \\'' + (d.licenseNo || '') + '\\')">' +
-          '<span>👨‍⚕️ ' + d.name + ' 先生' + tagBadge + '</span>' +
-          '<span class="suggest-lic">' + licBadge + '</span>' +
-        '</div>';
-      }).join('');
-      drop.style.display = 'block';
-    }
-
-    function pickDoctorFromSuggest64(slotKey, docName, licenseNo) {
-      const row = state.slotRows.find(r => r.slotKey === slotKey);
-      if (!row) return;
-
-      const actSelect = document.getElementById('act_' + slotKey);
-      const actionType = actSelect ? actSelect.value : '勤務打診';
-      const cusInput = document.getElementById('cus_' + slotKey);
-      const srchInput = document.getElementById('srch_' + slotKey);
-      const drop = document.getElementById('sug_' + slotKey);
-
-      if (!Array.isArray(row.customDocs)) row.customDocs = [];
-      const existingIdx = row.customDocs.findIndex(d => d.name === docName);
-      if (existingIdx >= 0) {
-        row.customDocs[existingIdx].actionType = actionType;
-        if (licenseNo) row.customDocs[existingIdx].licenseNo = licenseNo;
-      } else {
-        row.customDocs.push({ name: docName, licenseNo: licenseNo || '', actionType: actionType });
-      }
-
-      const phraseList = row.customDocs.map(d => d.name + '先生へ' + (d.actionType || '勤務打診'));
-      cusInput.value = phraseList.join(' / ');
-
-      if (srchInput) srchInput.value = '';
-      if (drop) drop.style.display = 'none';
-
-      const tagsBox = document.getElementById('tags_' + slotKey);
-      if (tagsBox) tagsBox.innerHTML = buildPickedDocsTagsHtml64(slotKey, row.customDocs);
-
-      onSlotEdit64(slotKey);
-    }
-
-    function removeCustomDoc64(slotKey, idx) {
-      const row = state.slotRows.find(r => r.slotKey === slotKey);
-      if (!row || !Array.isArray(row.customDocs)) return;
-
-      row.customDocs.splice(idx, 1);
-      const cusInput = document.getElementById('cus_' + slotKey);
-      if (cusInput) {
-        cusInput.value = row.customDocs.map(d => d.name + '先生へ' + (d.actionType || '勤務打診')).join(' / ');
-      }
-      const tagsBox = document.getElementById('tags_' + slotKey);
-      if (tagsBox) tagsBox.innerHTML = buildPickedDocsTagsHtml64(slotKey, row.customDocs);
-
-      onSlotEdit64(slotKey);
-    }
-
-    function onSlotEdit64(slotKey) {
-      const row = state.slotRows.find(r => r.slotKey === slotKey);
-      if (!row) return;
-
-      const sel = document.getElementById('sel_' + slotKey).value;
-      const cbox = document.getElementById('cbox_' + slotKey);
-      const cusInput = document.getElementById('cus_' + slotKey);
-      if (cbox) cbox.style.display = (sel === 'カスタム入力') ? 'block' : 'none';
-
-      if (sel !== 'カスタム入力') {
-        row.customDocs = [];
-      }
-
-      const finalDec = (sel === 'カスタム入力') ? (cusInput.value.trim() || '要検討') : sel;
-      const finalStaff = document.getElementById('stf_' + slotKey).value;
-
-      row.curDecision = finalDec;
-      row.curAssignee = finalStaff;
-      state.changedSlots[slotKey] = {
-        decision: finalDec,
-        assignee: finalStaff,
-        customDocs: Array.isArray(row.customDocs) ? row.customDocs : [],
-        dateLabel: row.dateLabel,
-        clinicTitle: row.clinicTitle
-      };
-
-      const isEdited = (row.curDecision !== row.origDecision) || (row.curAssignee !== row.origAssignee);
-      const tr = document.getElementById('tr_' + slotKey);
-      if (tr) {
-        tr.classList.toggle('is-edited', isEdited);
-        tr.classList.toggle('is-stay', finalDec === 'ステイ');
-      }
-      const afterEl = document.getElementById('after_' + slotKey);
-      if (afterEl) {
-        afterEl.className = 'diff-after' + (isEdited ? ' changed' : '');
-        afterEl.innerHTML = buildAfterDiffHtml64(row);
-      }
-      renderDateTabs();
-      updateEditCounter();
-    }
-
-    function applyBulkStaff64(overwriteAll) {
-      const staff = document.getElementById('bulkStaffSelect').value;
-      if (!staff) {
-        alert('一括セットする担当者名を選択してください！');
-        return;
-      }
-      const lockedByOthers = getLockedStaffSetByOthers();
-      if (lockedByOthers.has(staff)) {
-        alert('🔒 「' + staff + '」さんは他の方が現在作業中のため一括セットできません。');
-        return;
-      }
-
-      const scope = document.getElementById('bulkTargetScope').value;
-      let count = 0;
-
-      state.slotRows.forEach(row => {
-        if (!isRowMatchRegionFilter(row)) return;
-        if (scope === 'VISIBLE_DATE' && row.dateLabel !== state.activeDateTab) return;
-        if (!overwriteAll && row.curAssignee) return;
-
-        row.curAssignee = staff;
-        state.changedSlots[row.slotKey] = {
-          decision: row.curDecision,
-          assignee: row.curAssignee,
-          customDocs: Array.isArray(row.customDocs) ? row.customDocs : [],
-          dateLabel: row.dateLabel,
-          clinicTitle: row.clinicTitle
-        };
-        count++;
-      });
-
-      renderDateTabs();
-      renderStageTable();
-      updateEditCounter();
-      setStatus('⚡ ' + count + ' 枠に担当者「' + staff + '」を一括セットしました！', '#ffc72c');
-    }
-
-    function onBundleEdit64(bKey, val) {
-      const item = state.bundleRows.find(b => b.bundleKey === bKey);
-      if (!item) return;
-      item.curVal = val.trim();
-      state.changedBundles[bKey] = item.curVal;
-      const el = document.getElementById('bafter_' + bKey);
-      if (el) {
-        const isEd = (item.curVal !== item.origVal);
-        el.className = 'diff-after' + (isEd ? ' changed' : '');
-        el.innerText = '【編集後】' + item.curVal;
-      }
-      updateEditCounter();
-    }
-
-    function updateEditCounter() {
-      const totalChanges = Object.keys(state.changedSlots).length + Object.keys(state.changedBundles).length;
-      document.getElementById('editCounterBadge').innerText = '未保存の変更: ' + totalChanges + '件';
-
-      const targetRows = state.slotRows.filter(isRowMatchRegionFilter);
-      const totalSlots = targetRows.length;
-      const decidedSlots = targetRows.filter(isSlotDecided64).length;
-      const remainSlots = totalSlots - decidedSlots;
-
-      document.getElementById('progressMainText').innerHTML =
-        '📊 決定済み: <span>' + decidedSlots + '</span> / ' + totalSlots + ' 枠';
-
-      const remBadge = document.getElementById('progressRemainBadge');
-      if (remainSlots === 0 && totalSlots > 0) {
-        remBadge.className = 'prog-remain all-done';
-        remBadge.innerText = '🎉 すべて決定済み！';
-      } else {
-        remBadge.className = 'prog-remain';
-        remBadge.innerText = '残り対応(未定): ' + remainSlots + '枠';
-      }
-    }
-
-    function setStatus(msg, color) {
-      const el = document.getElementById('statusBanner');
-      el.style.color = color || '#ffc72c';
-      el.innerText = msg;
-    }
-
-    function saveDraftOnly64() {
-      setStatus('💾 『編集くん_一時保存』シートにJSON＆一覧で一時保存しています...', '#ffc72c');
-      google.script.run
-        .withSuccessHandler(res => {
-          setStatus('✅ 一時保存完了 (' + res.savedAt + ')！特定した医籍番号もシートにJSON保存されました。', '#69f0ae');
-        })
-        .withFailureHandler(err => setStatus('❌ 一時保存エラー: ' + err.message, '#ff5252'))
-        .saveHenshukunDraft({
-          playerStaff: state.myStaff,
-          changedSlots: state.changedSlots,
-          changedBundles: state.changedBundles
-        });
-    }
-
-    function commitToDoc64(andSubmit) {
-      setStatus(andSubmit ? '🚀 ドキュメントを更新して mnys へ提出中...' : '📄 Googleドキュメント本体へ反映中...', '#ffc72c');
-      google.script.run
-        .withSuccessHandler(res => {
-          state.changedSlots = {};
-          state.changedBundles = {};
-          state.slotRows.forEach(r => { r.origDecision = r.curDecision; r.origAssignee = r.curAssignee; });
-          state.bundleRows.forEach(b => { b.origVal = b.curVal; });
-          renderDateTabs();
-          renderStageTable();
-          renderBundlesTable();
-          updateEditCounter();
-          setStatus(
-            andSubmit
-              ? '🎉 ドキュメント反映 ＆ mnys（超募集くん）への提出が完了しました！(' + res.committedAt + ')'
-              : '✅ Googleドキュメント本体への反映が完了しました！(' + res.committedAt + ')',
-            '#69f0ae'
-          );
-        })
-        .withFailureHandler(err => setStatus('❌ 反映エラー: ' + err.message, '#ff5252'))
-        .commitHenshukunToDocAndSubmit({
-          playerStaff: state.myStaff,
-          changedSlots: state.changedSlots,
-          changedBundles: state.changedBundles
-        }, andSubmit);
-    }
-  `;
+  return [
+    'function onSearchDocInput64(slotKey) {',
+    '  const inp = document.getElementById("srch_" + slotKey);',
+    '  const drop = document.getElementById("sug_" + slotKey);',
+    '  if (!inp || !drop) return;',
+    '',
+    '  const rawQ = inp.value.trim();',
+    '  const q = normalizeSearchClient64(rawQ);',
+    '  if (!q) {',
+    '    drop.style.display = "none";',
+    '    return;',
+    '  }',
+    '',
+    '  let matches = state.doctorSearchList.filter(function(d) {',
+    '    return d.norm.includes(q) || d.name.includes(rawQ);',
+    '  });',
+    '',
+    '  if (q.length >= 2) {',
+    '    const surname2 = q.slice(0, 2);',
+    '    const surnameMatches = state.doctorSearchList.filter(function(d) {',
+    '      return d.norm.slice(0, 2) === surname2 && !matches.some(function(m) { return m.name === d.name && m.licenseNo === d.licenseNo; });',
+    '    });',
+    '    matches = matches.concat(surnameMatches);',
+    '  }',
+    '',
+    '  matches.sort(function(a, b) {',
+    '    const aHas = a.licenseNo ? 1 : 0;',
+    '    const bHas = b.licenseNo ? 1 : 0;',
+    '    if (aHas !== bHas) return bHas - aHas;',
+    '    return a.name.localeCompare(b.name, "ja");',
+    '  });',
+    '  matches = matches.slice(0, 15);',
+    '',
+    '  if (matches.length === 0) {',
+    '    drop.innerHTML = "<div style=\\"padding:6px 10px;font-size:12px;color:#64748b;\\">該当する医師が見つかりません（下の欄に直接手入力も可能です）</div>";',
+    '    drop.style.display = "block";',
+    '    return;',
+    '  }',
+    '',
+    '  drop.innerHTML = matches.map(function(d) {',
+    '    const licBadge = d.licenseNo ? "医籍: " + d.licenseNo : "番号未登録";',
+    '    const tagBadge = d.tag ? " [" + d.tag + "]" : "";',
+    '    return "<div class=\\"suggest-item\\" onclick=\\"pickDoctorFromSuggest64(\'" + slotKey + "\', \'" + d.name + "\', \'" + (d.licenseNo || "") + "\')\\">" +',
+    '      "<span>👨‍⚕️ " + d.name + " 先生" + tagBadge + "</span>" +',
+    '      "<span class=\\"suggest-lic\\">" + licBadge + "</span>" +',
+    '    "</div>";',
+    '  }).join("");',
+    '  drop.style.display = "block";',
+    '}',
+    '',
+    'function pickDoctorFromSuggest64(slotKey, docName, licenseNo) {',
+    '  const row = state.slotRows.find(function(r) { return r.slotKey === slotKey; });',
+    '  if (!row) return;',
+    '',
+    '  const actSelect = document.getElementById("act_" + slotKey);',
+    '  const actionType = actSelect ? actSelect.value : "勤務打診";',
+    '  const cusInput = document.getElementById("cus_" + slotKey);',
+    '  const srchInput = document.getElementById("srch_" + slotKey);',
+    '  const drop = document.getElementById("sug_" + slotKey);',
+    '',
+    '  if (!Array.isArray(row.customDocs)) row.customDocs = [];',
+    '  const existingIdx = row.customDocs.findIndex(function(d) { return d.name === docName; });',
+    '  if (existingIdx >= 0) {',
+    '    row.customDocs[existingIdx].actionType = actionType;',
+    '    if (licenseNo) row.customDocs[existingIdx].licenseNo = licenseNo;',
+    '  } else {',
+    '    row.customDocs.push({ name: docName, licenseNo: licenseNo || "", actionType: actionType });',
+    '  }',
+    '',
+    '  const phraseList = row.customDocs.map(function(d) { return d.name + "先生へ" + (d.actionType || "勤務打診"); });',
+    '  cusInput.value = phraseList.join(" / ");',
+    '',
+    '  if (srchInput) srchInput.value = "";',
+    '  if (drop) drop.style.display = "none";',
+    '',
+    '  const tagsBox = document.getElementById("tags_" + slotKey);',
+    '  if (tagsBox) tagsBox.innerHTML = buildPickedDocsTagsHtml64(slotKey, row.customDocs);',
+    '',
+    '  onSlotEdit64(slotKey);',
+    '}',
+    '',
+    'function removeCustomDoc64(slotKey, idx) {',
+    '  const row = state.slotRows.find(function(r) { return r.slotKey === slotKey; });',
+    '  if (!row || !Array.isArray(row.customDocs)) return;',
+    '',
+    '  row.customDocs.splice(idx, 1);',
+    '  const cusInput = document.getElementById("cus_" + slotKey);',
+    '  if (cusInput) {',
+    '    cusInput.value = row.customDocs.map(function(d) { return d.name + "先生へ" + (d.actionType || "勤務打診"); }).join(" / ");',
+    '  }',
+    '  const tagsBox = document.getElementById("tags_" + slotKey);',
+    '  if (tagsBox) tagsBox.innerHTML = buildPickedDocsTagsHtml64(slotKey, row.customDocs);',
+    '',
+    '  onSlotEdit64(slotKey);',
+    '}',
+    '',
+    'function onSlotEdit64(slotKey) {',
+    '  const row = state.slotRows.find(function(r) { return r.slotKey === slotKey; });',
+    '  if (!row) return;',
+    '',
+    '  const sel = document.getElementById("sel_" + slotKey).value;',
+    '  const cbox = document.getElementById("cbox_" + slotKey);',
+    '  const spbox = document.getElementById("spbox_" + slotKey);',
+    '  const spamt = document.getElementById("spamt_" + slotKey);',
+    '  const cusInput = document.getElementById("cus_" + slotKey);',
+    '  const stfSelect = document.getElementById("stf_" + slotKey);',
+    '',
+    '  if (cbox) cbox.style.display = (sel === "カスタム入力") ? "block" : "none";',
+    '  if (spbox) spbox.style.display = (sel === "特別時給＋ステイ") ? "block" : "none";',
+    '',
+    '  if (sel !== "カスタム入力") {',
+    '    row.customDocs = [];',
+    '  }',
+    '',
+    '  let finalDec = sel;',
+    '  if (sel === "") {',
+    '    finalDec = "";',
+    '    if (stfSelect) stfSelect.value = "";',
+    '  } else if (sel === "カスタム入力") {',
+    '    finalDec = cusInput.value.trim() || "要検討";',
+    '  } else if (sel === "特別時給＋ステイ") {',
+    '    const amtVal = spamt ? spamt.value : "+2,000円";',
+    '    finalDec = "特別時給(" + amtVal + ")＋ステイ";',
+    '  }',
+    '',
+    '  const isStayLike = isStayLikeDecision64(finalDec);',
+    '',
+    '  // ★ステイ・特別時給＋ステイの時は担当者欄をクリアしてグレーアウト（クローズ）する',
+    '  if (stfSelect) {',
+    '    if (isStayLike) {',
+    '      stfSelect.value = "";',
+    '      stfSelect.disabled = true;',
+    '      stfSelect.style.background = "#cbd5e1";',
+    '      stfSelect.style.color = "#64748b";',
+    '      stfSelect.style.cursor = "not-allowed";',
+    '      stfSelect.style.opacity = "0.65";',
+    '      if (stfSelect.options.length > 0) stfSelect.options[0].text = "(担当不要)";',
+    '    } else {',
+    '      stfSelect.disabled = false;',
+    '      stfSelect.style.background = "";',
+    '      stfSelect.style.color = "";',
+    '      stfSelect.style.cursor = "";',
+    '      stfSelect.style.opacity = "1";',
+    '      if (stfSelect.options.length > 0) stfSelect.options[0].text = "(未定)";',
+    '    }',
+    '  }',
+    '',
+    '  const finalStaff = (isStayLike || !stfSelect) ? "" : stfSelect.value;',
+    '',
+    '  row.curDecision = finalDec;',
+    '  row.curAssignee = finalStaff;',
+    '',
+    '  const isEdited = (row.curDecision !== row.origDecision) || (row.curAssignee !== row.origAssignee);',
+    '  if (isEdited) {',
+    '    state.changedSlots[slotKey] = {',
+    '      decision: finalDec,',
+    '      assignee: finalStaff,',
+    '      customDocs: Array.isArray(row.customDocs) ? row.customDocs : [],',
+    '      dateLabel: row.dateLabel,',
+    '      clinicTitle: row.clinicTitle',
+    '    };',
+    '  } else {',
+    '    delete state.changedSlots[slotKey];',
+    '  }',
+    '',
+    '  const tr = document.getElementById("tr_" + slotKey);',
+    '  if (tr) {',
+    '    tr.classList.toggle("is-edited", isEdited);',
+    '    tr.classList.toggle("is-stay", isStayLike);',
+    '  }',
+    '  const rstBtn = document.getElementById("rst_" + slotKey);',
+    '  if (rstBtn) {',
+    '    rstBtn.style.display = isEdited ? "block" : "none";',
+    '  }',
+    '  const afterEl = document.getElementById("after_" + slotKey);',
+    '  if (afterEl) {',
+    '    afterEl.className = "diff-after" + (isEdited ? " changed" : "");',
+    '    afterEl.innerHTML = buildAfterDiffHtml64(row);',
+    '  }',
+    '  renderDateTabs();',
+    '  updateEditCounter();',
+    '}',
+    '',
+    'function resetSlotRow64(slotKey) {',
+    '  const row = state.slotRows.find(function(r) { return r.slotKey === slotKey; });',
+    '  if (!row) return;',
+    '  row.curDecision = row.origDecision;',
+    '  row.curAssignee = row.origAssignee;',
+    '  row.customDocs = [];',
+    '  delete state.changedSlots[slotKey];',
+    '  renderDateTabs();',
+    '  renderStageTable();',
+    '  updateEditCounter();',
+    '  setStatus("↩️ 「" + row.clinicTitle + "」を編集前の状態に戻しました。", "#69f0ae");',
+    '}',
+    '',
+    'function applyBulkStaff64(overwriteAll) {',
+    '  const staff = document.getElementById("bulkStaffSelect").value;',
+    '  if (!staff) {',
+    '    alert("一括セットする担当者名を選択してください！");',
+    '    return;',
+    '  }',
+    '  const lockedByOthers = getLockedStaffSetByOthers();',
+    '  if (lockedByOthers.has(staff)) {',
+    '    alert("🔒 「" + staff + "」さんは他の方が現在作業中のため一括セットできません。");',
+    '    return;',
+    '  }',
+    '',
+    '  const scope = document.getElementById("bulkTargetScope").value;',
+    '  let count = 0;',
+    '',
+    '  state.slotRows.forEach(function(row) {',
+    '    if (!isRowMatchRegionFilter(row)) return;',
+    '    if (scope === "VISIBLE_DATE" && row.dateLabel !== state.activeDateTab) return;',
+    '    // ★ステイ・特別時給＋ステイの枠には担当者を一括セットしない',
+    '    if (isStayLikeDecision64(row.curDecision)) return;',
+    '    if (!overwriteAll && row.curAssignee) return;',
+    '',
+    '    row.curAssignee = staff;',
+    '    state.changedSlots[row.slotKey] = {',
+    '      decision: row.curDecision,',
+    '      assignee: row.curAssignee,',
+    '      customDocs: Array.isArray(row.customDocs) ? row.customDocs : [],',
+    '      dateLabel: row.dateLabel,',
+    '      clinicTitle: row.clinicTitle',
+    '    };',
+    '    count++;',
+    '  });',
+    '',
+    '  renderDateTabs();',
+    '  renderStageTable();',
+    '  updateEditCounter();',
+    '  setStatus("⚡ " + count + " 枠に担当者「" + staff + "」を一括セットしました！（ステイ枠は除外）", "#ffc72c");',
+    '}',
+    '',
+    'function applyBulkStayToUndecided64() {',
+    '  const scope = document.getElementById("bulkTargetScope").value;',
+    '  const scopeLabel = (scope === "VISIBLE_DATE") ? "表示中の日付・地域" : "選択地域の全日程";',
+    '  if (!confirm("【" + scopeLabel + "】にある担当者未定の枠をすべて「ステイ」に変更しますか？\\n（※すでに担当者が入っている枠はそのまま残ります）")) {',
+    '    return;',
+    '  }',
+    '',
+    '  let count = 0;',
+    '  state.slotRows.forEach(function(row) {',
+    '    if (!isRowMatchRegionFilter(row)) return;',
+    '    if (scope === "VISIBLE_DATE" && row.dateLabel !== state.activeDateTab) return;',
+    '    if (isSlotDecided64(row)) return;',
+    '',
+    '    row.curDecision = "ステイ";',
+    '    row.curAssignee = "";',
+    '    row.customDocs = [];',
+    '    state.changedSlots[row.slotKey] = {',
+    '      decision: "ステイ",',
+    '      assignee: "",',
+    '      customDocs: [],',
+    '      dateLabel: row.dateLabel,',
+    '      clinicTitle: row.clinicTitle',
+    '    };',
+    '    count++;',
+    '  });',
+    '',
+    '  renderDateTabs();',
+    '  renderStageTable();',
+    '  updateEditCounter();',
+    '  setStatus("⏸️ 未定だった " + count + " 枠をすべて「ステイ（担当不要）」に変更しました！", "#69f0ae");',
+    '}',
+    '',
+    'function onBundleEdit64(bKey, val) {',
+    '  const item = state.bundleRows.find(function(b) { return b.bundleKey === bKey; });',
+    '  if (!item) return;',
+    '  item.curVal = val.trim();',
+    '  state.changedBundles[bKey] = item.curVal;',
+    '  const el = document.getElementById("bafter_" + bKey);',
+    '  if (el) {',
+    '    const isEd = (item.curVal !== item.origVal);',
+    '    el.className = "diff-after" + (isEd ? " changed" : "");',
+    '    el.innerText = "【編集後】" + item.curVal;',
+    '  }',
+    '  updateEditCounter();',
+    '}',
+    '',
+    'function updateEditCounter() {',
+    '  const totalChanges = Object.keys(state.changedSlots).length + Object.keys(state.changedBundles).length;',
+    '  document.getElementById("editCounterBadge").innerText = "未保存の変更: " + totalChanges + "件";',
+    '',
+    '  const targetRows = state.slotRows.filter(isRowMatchRegionFilter);',
+    '  const totalSlots = targetRows.length;',
+    '  const decidedSlots = targetRows.filter(isSlotDecided64).length;',
+    '  const remainSlots = totalSlots - decidedSlots;',
+    '',
+    '  document.getElementById("progressMainText").innerHTML =',
+    '    "📊 決定済み: <span>" + decidedSlots + "</span> / " + totalSlots + " 枠";',
+    '',
+    '  const remBadge = document.getElementById("progressRemainBadge");',
+    '  if (remainSlots === 0 && totalSlots > 0) {',
+    '    remBadge.className = "prog-remain all-done";',
+    '    remBadge.innerText = "🎉 すべて決定済み！";',
+    '  } else {',
+    '    remBadge.className = "prog-remain";',
+    '    remBadge.innerText = "残り対応(未定): " + remainSlots + "枠";',
+    '  }',
+    '',
+    '  const allTotal = state.slotRows.length;',
+    '  const allDecided = state.slotRows.filter(isSlotDecided64).length;',
+    '  const allRemain = allTotal - allDecided;',
+    '',
+    '  const submitBtn = document.getElementById("btnSubmitMnys64");',
+    '  const mainTxt = document.getElementById("btnSubmitMainTxt64");',
+    '  const subTxt = document.getElementById("btnSubmitSubTxt64");',
+    '',
+    '  if (submitBtn) {',
+    '    if (allTotal > 0 && allRemain === 0) {',
+    '      submitBtn.disabled = false;',
+    '      submitBtn.style.opacity = "1";',
+    '      submitBtn.style.cursor = "pointer";',
+    '      if (mainTxt) mainTxt.innerText = "🚀 ドキュメント反映 ＆ mnysへ提出";',
+    '      if (subTxt) subTxt.innerText = "超募集くんで日給計算・文案生成（全枠完了！）";',
+    '    } else {',
+    '      submitBtn.disabled = true;',
+    '      submitBtn.style.opacity = "0.45";',
+    '      submitBtn.style.cursor = "not-allowed";',
+    '      if (mainTxt) mainTxt.innerText = "🔒 mnysへ提出（全体の残り未定: " + allRemain + "枠）";',
+    '      if (subTxt) subTxt.innerText = "全枠の担当決定またはステイで解禁";',
+    '    }',
+    '  }',
+    '}',
+    '',
+    'function setStatus(msg, color) {',
+    '  const el = document.getElementById("statusBanner");',
+    '  el.style.color = color || "#ffc72c";',
+    '  el.innerText = msg;',
+    '}',
+    '',
+    'function saveDraftOnly64() {',
+    '  setStatus("💾 『編集くん_一時保存』シートにJSON＆一覧で一時保存しています...", "#ffc72c");',
+    '  google.script.run',
+    '    .withSuccessHandler(function(res) {',
+    '      setStatus("✅ 一時保存完了 (" + res.savedAt + ")！特定した医籍番号もシートにJSON保存されました。", "#69f0ae");',
+    '    })',
+    '    .withFailureHandler(function(err) { setStatus("❌ 一時保存エラー: " + err.message, "#ff5252"); })',
+    '    .saveHenshukunDraft({',
+    '      playerStaff: state.myStaff,',
+    '      changedSlots: state.changedSlots,',
+    '      changedBundles: state.changedBundles',
+    '    });',
+    '}',
+    '',
+    'function commitToDoc64(andSubmit) {',
+    '  if (andSubmit) {',
+    '    const allRemain = state.slotRows.length - state.slotRows.filter(isSlotDecided64).length;',
+    '    if (allRemain > 0) {',
+    '      alert("🔒 まだ対応（担当者またはステイ）が決まっていない枠が " + allRemain + " 枠残っています。\\nすべての枠を決定または「ステイ」にしてから提出してください。");',
+    '      return;',
+    '    }',
+    '  }',
+    '  setStatus(andSubmit ? "🚀 ドキュメントを更新して mnys へ提出中..." : "📄 Googleドキュメント本体へ反映中...", "#ffc72c");',
+    '  google.script.run',
+    '    .withSuccessHandler(function(res) {',
+    '      state.changedSlots = {};',
+    '      state.changedBundles = {};',
+    '      state.slotRows.forEach(function(r) { r.origDecision = r.curDecision; r.origAssignee = r.curAssignee; });',
+    '      state.bundleRows.forEach(function(b) { b.origVal = b.curVal; });',
+    '      renderDateTabs();',
+    '      renderStageTable();',
+    '      renderBundlesTable();',
+    '      updateEditCounter();',
+    '      setStatus(',
+    '        andSubmit',
+    '          ? "🎉 ドキュメント反映 ＆ mnys（超募集くん）への提出が完了しました！(" + res.committedAt + ")"',
+    '          : "✅ Googleドキュメント本体への反映が完了しました！(" + res.committedAt + ")"',
+    '        , "#69f0ae"',
+    '      );',
+    '    })',
+    '    .withFailureHandler(function(err) { setStatus("❌ 反映エラー: " + err.message, "#ff5252"); })',
+    '    .commitHenshukunToDocAndSubmit({',
+    '      playerStaff: state.myStaff,',
+    '      changedSlots: state.changedSlots,',
+    '      changedBundles: state.changedBundles',
+    '    }, andSubmit);',
+    '}'
+  ].join('\n');
 }

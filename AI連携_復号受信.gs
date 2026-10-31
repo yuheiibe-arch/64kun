@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * AI連携_復号受信.gs（caps365.jp 側：マスタ動的参照 ＋ 編集くん64メニュー統合版）
+ * AI連携_復号受信.gs（caps365.jp 側：マスタ動的参照 ＋ シンプルメニュー統合版）
  * ============================================================================
  */
 
@@ -26,29 +26,22 @@ const AI_RECEIVER_CONFIG = {
 };
 
 /**
- * スプレッドシート起動時のメニュー登録（『🎮 編集くん 64』起動メニューを統合）
+ * スプレッドシート起動時のシンプルメニュー登録
  */
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
 
-  ui.createMenu('🤖 AI総務・データ連携')
-    .addItem('📥 最新の暗号化シフトデータを取り込む（手動）', 'importLatestEncryptedShiftContextManual')
-    .addSeparator()
-    .addItem('⏰ 自動取込トリガーを設定（初回のみ）', 'installReceiverTrigger')
-    .addToUi();
-
   ui.createMenu('🤖 AI超募集MTG')
-    .addItem('① AI事前会議ドキュメントを生成（本番・通知あり）', 'runDemoAndSubmitMeetingDoc')
-    .addItem('② AI事前会議ドキュメントを生成（プレビューのみ）', 'runPreviewMeetingDocOnly')
+    .addItem('🎮 ① 編集くん 64 を開く（シフト確定・mnys提出）', 'openHenshukunModal')
     .addSeparator()
-    .addItem('🎮 編集くん 64 を開く（大画面・エリア別一括・同時編集）', 'openHenshukunModal')
-    .addItem('🚀 ③ 確定したドキュメントを読み取ってmnysへ提出（文案生成）', 'submitEditedDocToMnys')
+    .addItem('📄 ② AI事前会議ドキュメントを生成', 'runDemoAndSubmitMeetingDoc')
+    .addItem('📥 ③ 最新の暗号化シフトデータを取り込む', 'importLatestEncryptedShiftContextManual')
     .addToUi();
 }
 
 function installReceiverTrigger() {
   const funcName = 'autoCheckEncryptedMailTrigger';
-  ScriptApp.getProjectTriggers().forEach(t => {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
     if (t.getHandlerFunction() === funcName) ScriptApp.deleteTrigger(t);
   });
   ScriptApp.newTrigger(funcName).timeBased().everyMinutes(15).create();
@@ -84,11 +77,11 @@ function normalizeDocKeyReceive_(name) {
  * 『DSナレッジシート』内の各マスタ・履歴タブを動的に読み込む
  */
 function loadDoctorRoleMastersFromSheets_(ss) {
-  const sbuMap = new Map();        // normName -> { licenseNo, memo }
-  const ftAllowMap = new Map();    // normName -> { licenseNo, memo }
-  const negotiableMap = new Map(); // normName -> { licenseNo, route, humanMemo, aiMemo }
-  const cautionMap = new Map();    // normName -> NG条件テキスト
-  const recentKbMap = new Map();   // normName -> 直近打診履歴テキスト
+  const sbuMap = new Map();
+  const ftAllowMap = new Map();
+  const negotiableMap = new Map();
+  const cautionMap = new Map();
+  const recentKbMap = new Map();
 
   const sbuSheet = ss.getSheetByName(AI_RECEIVER_CONFIG.SHEET_SBU_MASTER);
   if (sbuSheet && sbuSheet.getLastRow() >= 2) {
@@ -98,7 +91,7 @@ function loadDoctorRoleMastersFromSheets_(ss) {
       if (!nameKey) continue;
       sbuMap.set(nameKey, {
         licenseNo: String(vals[r][1] || '').trim(),
-        memo: [vals[r][2], vals[r][3]].map(v => String(v || '').trim()).filter(Boolean).join(' / ')
+        memo: [vals[r][2], vals[r][3]].map(function(v) { return String(v || '').trim(); }).filter(Boolean).join(' / ')
       });
     }
   }
@@ -111,7 +104,7 @@ function loadDoctorRoleMastersFromSheets_(ss) {
       if (!nameKey) continue;
       ftAllowMap.set(nameKey, {
         licenseNo: String(vals[r][1] || '').trim(),
-        memo: [vals[r][2], vals[r][3]].map(v => String(v || '').trim()).filter(Boolean).join(' / ')
+        memo: [vals[r][2], vals[r][3]].map(function(v) { return String(v || '').trim(); }).filter(Boolean).join(' / ')
       });
     }
   }
@@ -124,9 +117,9 @@ function loadDoctorRoleMastersFromSheets_(ss) {
       if (!nameKey) continue;
       negotiableMap.set(nameKey, {
         licenseNo: String(vals[r][1] || '').trim(),
-        route: String(vals[r][2] || '').trim(),     // C列: 紹介経路
-        humanMemo: String(vals[r][3] || '').trim(), // D列: メモ（人間）
-        aiMemo: String(vals[r][4] || '').trim()     // E列: メモ（AI）
+        route: String(vals[r][2] || '').trim(),
+        humanMemo: String(vals[r][3] || '').trim(),
+        aiMemo: String(vals[r][4] || '').trim()
       });
     }
   }
@@ -137,7 +130,7 @@ function loadDoctorRoleMastersFromSheets_(ss) {
     for (let r = 1; r < vals.length; r++) {
       const nameKey = normalizeDocKeyReceive_(vals[r][0]);
       if (!nameKey) continue;
-      const ngText = vals[r].slice(1).map(v => String(v || '').trim()).filter(Boolean).join(' / ');
+      const ngText = vals[r].slice(1).map(function(v) { return String(v || '').trim(); }).filter(Boolean).join(' / ');
       if (ngText) cautionMap.set(nameKey, ngText);
     }
   }
@@ -155,13 +148,19 @@ function loadDoctorRoleMastersFromSheets_(ss) {
         const dt = String(vals[r][6] || '').slice(5, 10);
         const flag = String(vals[r][7] || '').trim();
         if (flag.includes('シフト調整') || flag) {
-          recentKbMap.set(nameKey, `直近${dt || '履歴'}打診(${flag}:${reply})`);
+          recentKbMap.set(nameKey, '直近' + (dt || '履歴') + '打診(' + flag + ':' + reply + ')');
         }
       }
     }
   }
 
-  return { sbuMap, ftAllowMap, negotiableMap, cautionMap, recentKbMap };
+  return {
+    sbuMap: sbuMap,
+    ftAllowMap: ftAllowMap,
+    negotiableMap: negotiableMap,
+    cautionMap: cautionMap,
+    recentKbMap: recentKbMap
+  };
 }
 
 /**
@@ -169,9 +168,12 @@ function loadDoctorRoleMastersFromSheets_(ss) {
  */
 function enrichDoctorTextWithSheetMasters_(rawText, roleMasters) {
   if (!rawText) return '';
-  const { sbuMap, ftAllowMap, negotiableMap, cautionMap } = roleMasters;
+  const sbuMap = roleMasters.sbuMap;
+  const ftAllowMap = roleMasters.ftAllowMap;
+  const negotiableMap = roleMasters.negotiableMap;
+  const cautionMap = roleMasters.cautionMap;
 
-  return String(rawText).split(/([,、，\n]+)/).map(token => {
+  return String(rawText).split(/([,、，\n]+)/).map(function(token) {
     if (/^[,、，\n]+$/.test(token) || !token.trim()) return token;
 
     const parts = token.split(/([：:])/);
@@ -184,38 +186,35 @@ function enrichDoctorTextWithSheetMasters_(rawText, roleMasters) {
     const docKey = normalizeDocKeyReceive_(baseName);
     if (!docKey || docKey === '未充足') return token;
 
-    const cautionSuffix = cautionMap && cautionMap.has(docKey)
-      ? `[⚠️注意:${cautionMap.get(docKey)}]`
+    const cautionSuffix = (cautionMap && cautionMap.has(docKey))
+      ? '[⚠️注意:' + cautionMap.get(docKey) + ']'
       : '';
 
-    // 1. SBUシートに存在する場合
     if (sbuMap.has(docKey)) {
       const sbuInfo = sbuMap.get(docKey);
-      const memoSuffix = sbuInfo.memo ? `[${sbuInfo.memo}]` : '';
-      return `${baseName}(★SBU${memoSuffix}${cautionSuffix})${restPart}`;
+      const memoSuffix = sbuInfo.memo ? '[' + sbuInfo.memo + ']' : '';
+      return baseName + '(★SBU' + memoSuffix + cautionSuffix + ')' + restPart;
     }
 
-    // 2. 常勤依頼手当シートに存在する場合
     if (ftAllowMap.has(docKey)) {
       const ftInfo = ftAllowMap.get(docKey);
-      const memoSuffix = ftInfo.memo ? `[${ftInfo.memo}]` : '';
+      const memoSuffix = ftInfo.memo ? '[' + ftInfo.memo + ']' : '';
       if (isShotei) {
-        return `${baseName}(常勤・所定休出★移動相談可${memoSuffix}${cautionSuffix})${restPart}`;
+        return baseName + '(常勤・所定休出★移動相談可' + memoSuffix + cautionSuffix + ')' + restPart;
       } else if (isFullTime) {
-        return `${baseName}(常勤※通常勤務のため移動不可${memoSuffix}${cautionSuffix})${restPart}`;
+        return baseName + '(常勤※通常勤務のため移動不可' + memoSuffix + cautionSuffix + ')' + restPart;
       }
     }
 
-    // 3. 交渉しやすい医師シートに存在する場合
     if (negotiableMap.has(docKey)) {
       const negInfo = negotiableMap.get(docKey);
       const details = [negInfo.route, negInfo.humanMemo, negInfo.aiMemo].filter(Boolean).join(' / ');
-      const detailSuffix = details ? `[${details}]` : '';
-      return `${baseName}(★交渉しやすい医師${detailSuffix}${cautionSuffix})${restPart}`;
+      const detailSuffix = details ? '[' + details + ']' : '';
+      return baseName + '(★交渉しやすい医師' + detailSuffix + cautionSuffix + ')' + restPart;
     }
 
     if (cautionSuffix) {
-      return `${nameWithTag}${cautionSuffix}${restPart}`;
+      return nameWithTag + cautionSuffix + restPart;
     }
 
     return token;
@@ -263,10 +262,10 @@ function importLatestEncryptedShiftContext_(isForceManual) {
   writeKinmukunCandidateSheets_(ss, payloadObj, roleMasters);
 
   Logger.log(
-    `✅ 復号・全6シート更新完了！（生成日時: ${payloadObj.generatedAt} / ` +
-    `不在枠: ${(payloadObj.unfilledList || []).length}件 / ` +
-    `個別打診候補: ${Math.max(0, (payloadObj.spotCandidateRows || []).length - 1)}件 / ` +
-    `複数日程おまとめ: ${Math.max(0, (payloadObj.bundledCandidateRows || []).length - 1)}名）`
+    '✅ 復号・全6シート更新完了！（生成日時: ' + payloadObj.generatedAt + ' / ' +
+    '不在枠: ' + (payloadObj.unfilledList || []).length + '件 / ' +
+    '個別打診候補: ' + Math.max(0, (payloadObj.spotCandidateRows || []).length - 1) + '件 / ' +
+    '複数日程おまとめ: ' + Math.max(0, (payloadObj.bundledCandidateRows || []).length - 1) + '名）'
   );
 }
 
@@ -318,7 +317,7 @@ function xorStreamCipherReceive_(inputBytes, secretKey, ivStr) {
     if (i % 32 === 0) {
       keyStream = Utilities.computeDigest(
         Utilities.DigestAlgorithm.SHA_256,
-        `${secretKey}|${ivStr}|${blockIndex}`,
+        secretKey + '|' + ivStr + '|' + blockIndex,
         Utilities.Charset.UTF_8
       );
       blockIndex++;
@@ -354,22 +353,24 @@ function writeUnfilledSheet_(ss, unfilledList, generatedAt, roleMasters) {
     return;
   }
 
-  const rows = unfilledList.map(item => [
-    item.date || '',
-    item.clinic || '',
-    item.absenceTime || '',
-    item.listedWage || '',
-    enrichDoctorTextWithSheetMasters_(item.prevDocs || '', roleMasters),
-    enrichDoctorTextWithSheetMasters_(item.nextDocs || '', roleMasters),
-    item.phase || '',
-    item.prevExtStatus || '',
-    item.nextEarlyStatus || '',
-    item.assignee || '',
-    item.status || '',
-    item.specialWage || '',
-    item.memo || '',
-    generatedAt || ''
-  ]);
+  const rows = unfilledList.map(function(item) {
+    return [
+      item.date || '',
+      item.clinic || '',
+      item.absenceTime || '',
+      item.listedWage || '',
+      enrichDoctorTextWithSheetMasters_(item.prevDocs || '', roleMasters),
+      enrichDoctorTextWithSheetMasters_(item.nextDocs || '', roleMasters),
+      item.phase || '',
+      item.prevExtStatus || '',
+      item.nextEarlyStatus || '',
+      item.assignee || '',
+      item.status || '',
+      item.specialWage || '',
+      item.memo || '',
+      generatedAt || ''
+    ];
+  });
 
   sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
   applyLeftAlignToSheet_(sheet, rows.length + 1, headers.length);
@@ -460,9 +461,10 @@ function writeStreakWarningsSheet_(ss, streakWarnings, roleMasters) {
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#fff2cc');
   sheet.setFrozenRows(1);
 
-  const { ftAllowMap, sbuMap } = roleMasters;
+  const ftAllowMap = roleMasters.ftAllowMap;
+  const sbuMap = roleMasters.sbuMap;
 
-  const filtered = (streakWarnings || []).filter(w => {
+  const filtered = (streakWarnings || []).filter(function(w) {
     const docKey = normalizeDocKeyReceive_(w.doctor);
     const isFtAllowDoc = ftAllowMap.has(docKey);
     return isFtAllowDoc || w.streakDays >= 10 || w.type === 'BRIDGE';
@@ -473,7 +475,7 @@ function writeStreakWarningsSheet_(ss, streakWarnings, roleMasters) {
     return;
   }
 
-  const rows = filtered.map(w => {
+  const rows = filtered.map(function(w) {
     const docKey = normalizeDocKeyReceive_(w.doctor);
     let label = w.doctor;
     let memoNote = w.note || '';
@@ -481,7 +483,7 @@ function writeStreakWarningsSheet_(ss, streakWarnings, roleMasters) {
     if (ftAllowMap.has(docKey)) {
       const m = ftAllowMap.get(docKey).memo;
       label += '(常勤依頼手当対象)';
-      if (m) memoNote = `【条件:${m}】 ` + memoNote;
+      if (m) memoNote = '【条件:' + m + '】 ' + memoNote;
     } else if (sbuMap.has(docKey)) {
       label += '(★SBU)';
     } else if (w.isFullTime) {
@@ -508,22 +510,24 @@ function writeStreakWarningsSheet_(ss, streakWarnings, roleMasters) {
  * 『交渉しやすい医師』『交渉注意医師』『ナレッジシート（直近打診履歴）』の情報を付加して展開する
  */
 function writeKinmukunCandidateSheets_(ss, payload, roleMasters) {
-  const { negotiableMap, cautionMap, recentKbMap } = roleMasters;
+  const negotiableMap = roleMasters.negotiableMap;
+  const cautionMap = roleMasters.cautionMap;
+  const recentKbMap = roleMasters.recentKbMap;
 
-  const buildMasterNote = (rawDocName) => {
+  const buildMasterNote = function(rawDocName) {
     const docKey = normalizeDocKeyReceive_(rawDocName);
     if (!docKey) return '';
     const notes = [];
     if (negotiableMap && negotiableMap.has(docKey)) {
       const n = negotiableMap.get(docKey);
       const detail = [n.route, n.humanMemo, n.aiMemo].filter(Boolean).join('/');
-      notes.push(`★交渉しやすい${detail ? '[' + detail + ']' : ''}`);
+      notes.push('★交渉しやすい' + (detail ? '[' + detail + ']' : ''));
     }
     if (cautionMap && cautionMap.has(docKey)) {
-      notes.push(`⚠️交渉注意[${cautionMap.get(docKey)}]`);
+      notes.push('⚠️交渉注意[' + cautionMap.get(docKey) + ']');
     }
     if (recentKbMap && recentKbMap.has(docKey)) {
-      notes.push(`📩${recentKbMap.get(docKey)}`);
+      notes.push('📩' + recentKbMap.get(docKey));
     }
     return notes.join(' / ');
   };
@@ -535,12 +539,14 @@ function writeKinmukunCandidateSheets_(ss, payload, roleMasters) {
     if (!sh) sh = ss.insertSheet(AI_RECEIVER_CONFIG.SHEET_SPOT_CANDIDATES);
     sh.clearContents();
 
-    const headers = [...spotRaw[0], 'マスタ・NG条件・直近打診履歴'];
+    const headers = spotRaw[0].concat(['マスタ・NG条件・直近打診履歴']);
     sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#d9ead3');
     sh.setFrozenRows(1);
 
     if (spotRaw.length > 1) {
-      const bodyRows = spotRaw.slice(1).map(r => [...r, buildMasterNote(r[5])]);
+      const bodyRows = spotRaw.slice(1).map(function(r) {
+        return r.concat([buildMasterNote(r[5])]);
+      });
       sh.getRange(2, 7, bodyRows.length, 1).setNumberFormat('@');
       sh.getRange(2, 1, bodyRows.length, headers.length).setValues(bodyRows);
       applyLeftAlignToSheet_(sh, bodyRows.length + 1, headers.length);
@@ -556,12 +562,14 @@ function writeKinmukunCandidateSheets_(ss, payload, roleMasters) {
     if (!sh) sh = ss.insertSheet(AI_RECEIVER_CONFIG.SHEET_BUNDLED_CANDIDATES);
     sh.clearContents();
 
-    const headers = [...bundleRaw[0], 'マスタ・NG条件・直近打診履歴'];
+    const headers = bundleRaw[0].concat(['マスタ・NG条件・直近打診履歴']);
     sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#cfe2f3');
     sh.setFrozenRows(1);
 
     if (bundleRaw.length > 1) {
-      const bodyRows = bundleRaw.slice(1).map(r => [...r, buildMasterNote(r[0])]);
+      const bodyRows = bundleRaw.slice(1).map(function(r) {
+        return r.concat([buildMasterNote(r[0])]);
+      });
       sh.getRange(2, 2, bodyRows.length, 1).setNumberFormat('@');
       sh.getRange(2, 1, bodyRows.length, headers.length).setValues(bodyRows);
       applyLeftAlignToSheet_(sh, bodyRows.length + 1, headers.length);

@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6a_編集くん64_マスタと整形.gs
- * （設定・モーダル起動・日付/文字列クレンジング・拠点/担当者/医師検索マスタ読込）
+ * （日付スラッシュ分割バグ修正・異体字/漢字ブレ強化・BQパック医籍番号補完版）
  * ============================================================================
  */
 
@@ -33,20 +33,30 @@ function cleanSidebarDisplayText_(text) {
     .split('\n');
 
   const cleanedLines = [];
-  for (let line of lines) {
-    let s = line.trim();
+  for (let i = 0; i < lines.length; i++) {
+    let s = lines[i].trim();
     if (!s) continue;
     if (s.startsWith('💡')) {
       const body = s.replace(/^💡(?:現状・注意|注意)[：:]\s*/, '');
-      const parts = body.split(/[。\/／]+/).map(p => p.trim()).filter(Boolean).filter(p => {
-        if (/(通常常勤|通常勤務).*?(延長不可|早出不可|移動不可|打診不可|不可)/.test(p)) return false;
-        if (/^(前医|後医|前後医).*?(延長不可|早出不可|調整余地なし|不在|なし|不可)$/.test(p)) return false;
-        if (/^(延長不可|早出不可|調整余地なし|特になし|該当なし|問題なし)$/.test(p)) return false;
-        return true;
-      });
+      // ★日付（10/27など数字に挟まれたスラッシュ）では分割せず、「。」またはスペース付きスラッシュでのみ分割する
+      const parts = body
+        .split(/(?:。|\s+[\/／]\s+|(?<!\d)[\/／](?!\d))+/)
+        .map(function(p) { return p.replace(/^[・\s]+/, '').trim(); })
+        .filter(Boolean)
+        .filter(function(p) {
+          if (/(通常常勤|通常勤務).*?(延長不可|早出不可|移動不可|打診不可|不可)/.test(p)) return false;
+          if (/^(前医|後医|前後医|前後枠).*?(延長不可|早出不可|調整余地なし|医師なし|不在|なし|不可)$/.test(p)) return false;
+          if (/^(延長不可|早出不可|調整余地なし|前後枠の医師なし|前後枠なし|特になし|該当なし|問題なし)$/.test(p)) return false;
+          return true;
+        });
       if (parts.length > 0) {
-        cleanedLines.push('💡注意：\n' + parts.map(p => '・' + p).join('\n'));
+        cleanedLines.push('💡注意：\n' + parts.map(function(p) { return '・' + p; }).join('\n'));
       }
+    } else if (s.startsWith('・')) {
+      const itemBody = s.replace(/^[・\s]+/, '').trim();
+      if (/^(前医|後医|前後医|前後枠).*?(延長不可|早出不可|調整余地なし|医師なし|不在|なし|不可)$/.test(itemBody)) continue;
+      if (/^(延長不可|早出不可|調整余地なし|前後枠の医師なし|前後枠なし|特になし|該当なし|問題なし)$/.test(itemBody)) continue;
+      cleanedLines.push('・' + itemBody);
     } else {
       cleanedLines.push(s);
     }
@@ -61,14 +71,14 @@ function toJapaneseDateLabel64_(rawDateStr) {
   const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
   const dt = new Date(y, mo - 1, d);
   const dows = ['日', '月', '火', '水', '木', '金', '土'];
-  const dow = isNaN(dt.getTime()) ? '' : ` (${dows[dt.getDay()]})`;
-  return `${y}年${mo}月${d}日${dow}`;
+  const dow = isNaN(dt.getTime()) ? '' : ' (' + dows[dt.getDay()] + ')';
+  return y + '年' + mo + '月' + d + '日' + dow;
 }
 
 function toSortDateKey64_(rawDateStr) {
   const m = String(rawDateStr || '').match(/(\d{4})[\/\-年](\d{1,2})[\/\-月](\d{1,2})/);
   if (!m) return '9999/99/99';
-  return `${m[1]}/${('0' + m[2]).slice(-2)}/${('0' + m[3]).slice(-2)}`;
+  return m[1] + '/' + ('0' + m[2]).slice(-2) + '/' + ('0' + m[3]).slice(-2);
 }
 
 function toSearchNorm64_(str) {
@@ -80,20 +90,24 @@ function toSearchNorm64_(str) {
     .replace(/[\s\u3000]+/g, '')
     .replace(/[﨑嵜]/g, '崎').replace(/髙/g, '高').replace(/[瀧泷]/g, '滝')
     .replace(/[邊邉]/g, '辺').replace(/[齋齊斉]/g, '斎').replace(/澤/g, '沢')
-    .replace(/廣/g, '広').replace(/國/g, '国').replace(/嶋/g, '島')
-    .replace(/[栁柳]/g, '柳').replace(/[濵濱]/g, '浜').replace(/櫻/g, '桜').replace(/眞/g, '真')
+    .replace(/廣/g, '広').replace(/國/g, '国').replace(/[嶋嶌]/g, '島')
+    .replace(/[栁柳]/g, '柳').replace(/[濵濱]/g, '浜').replace(/櫻/g, '桜')
+    .replace(/眞/g, '真').replace(/惠/g, '恵').replace(/[壽寿]/g, '寿')
+    .replace(/[靜静]/g, '静').replace(/[榮栄]/g, '栄').replace(/[彌弥]/g, '弥')
+    .replace(/[祐裕]/g, '祐').replace(/[佳圭]/g, '佳').replace(/[智知]/g, '智')
+    .replace(/ヶ/g, 'ケ')
     .trim();
 }
 
 function loadDoctorSearchList64_(ss) {
   const cache = CacheService.getScriptCache();
-  const cached = cache.get('HENSHUKUN_DOC_SEARCH_LIST_V2');
+  const cached = cache.get('HENSHUKUN_DOC_SEARCH_LIST_V3');
   if (cached) {
     try { return JSON.parse(cached); } catch (e) {}
   }
 
   const docMap = new Map();
-  const addDoc = (rawName, rawLic, tagLabel) => {
+  const addDoc = function(rawName, rawLic, tagLabel) {
     const cleanName = String(rawName || '')
       .replace(/[\(（\[【].*$/g, '')
       .replace(/[:：].*$/, '')
@@ -107,7 +121,7 @@ function loadDoctorSearchList64_(ss) {
     if (!norm) return;
 
     const licStr = String(rawLic || '').trim();
-    const validLic = (/^\d{5,7}$/.test(licStr) || (licStr.length >= 4 && licStr !== '-')) ? licStr : '';
+    const validLic = (/^\d{4,7}$/.test(licStr) || (licStr.length >= 4 && licStr !== '-' && !/^\d{1,3}$/.test(licStr))) ? licStr : '';
 
     const ex = docMap.get(norm);
     if (!ex) {
@@ -118,7 +132,7 @@ function loadDoctorSearchList64_(ss) {
     }
   };
 
-  const scanSheet = (shName, nameCol, licCol, tagText) => {
+  const scanSheet = function(shName, nameCol, licCol, tagText) {
     const sh = ss.getSheetByName(shName);
     if (!sh || sh.getLastRow() < 2) return;
     const vals = sh.getDataRange().getDisplayValues();
@@ -136,28 +150,71 @@ function loadDoctorSearchList64_(ss) {
   scanSheet('最新_応募シフト', 2, 1, '');
   scanSheet('最新_連勤注意リスト', 1, 0, '');
 
+  if (typeof fetchAndDecryptBqMailForResolver_ === 'function') {
+    try {
+      const bqData = fetchAndDecryptBqMailForResolver_();
+      if (bqData) {
+        (bqData.kakutei || []).forEach(function(s) { addDoc(s.n, s.id || '', ''); });
+        (bqData.obo || []).forEach(function(s) { addDoc(s.n, s.id || '', ''); });
+      }
+    } catch (e) {}
+  }
+
   const kbSh = ss.getSheetByName('ナレッジシート');
   if (kbSh && kbSh.getLastRow() >= 2) {
     const lastR = kbSh.getLastRow();
     const startR = Math.max(2, lastR - 799);
     const kbVals = kbSh.getRange(startR, 1, lastR - startR + 1, 2).getDisplayValues();
-    for (let i = 0; i < kbVals.length; i++) addDoc(kbVals[i][1], kbVals[i][0], '');
+    for (let i = 0; i < kbVals.length; i++) {
+      const rawA = String(kbVals[i][0] || '').trim();
+      const validKbLic = (/^\d{5,7}$/.test(rawA) && Number(rawA) >= 100000) ? rawA : '';
+      addDoc(kbVals[i][1], validKbLic, '');
+    }
   }
 
   const shiftSh = ss.getSheetByName('最新_当日シフト');
   if (shiftSh && shiftSh.getLastRow() >= 2) {
     const sVals = shiftSh.getDataRange().getDisplayValues();
     for (let r = 1; r < sVals.length; r++) {
-      [sVals[r][7], sVals[r][8], sVals[r][9]].forEach(txt => {
-        String(txt || '').split(/[,、，\/]+/).forEach(tok => addDoc(tok, '', ''));
+      [sVals[r][7], sVals[r][8], sVals[r][9]].forEach(function(txt) {
+        String(txt || '').split(/[,、，\/]+/).forEach(function(tok) { addDoc(tok, '', ''); });
       });
     }
   }
 
-  const list = Array.from(docMap.values()).sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+  const allDocs = Array.from(docMap.values());
+  const withLicList = allDocs.filter(function(d) { return Boolean(d.licenseNo); });
+
+  allDocs.forEach(function(d) {
+    if (d.licenseNo) return;
+    if (d.norm.length < 2) return;
+    const prefix2 = d.norm.slice(0, 2);
+    const sameSurnameWithLic = withLicList.filter(function(cand) {
+      return cand.norm.slice(0, 2) === prefix2;
+    });
+
+    if (sameSurnameWithLic.length === 1) {
+      d.licenseNo = sameSurnameWithLic[0].licenseNo;
+      if (!d.tag && sameSurnameWithLic[0].tag) d.tag = sameSurnameWithLic[0].tag;
+    } else if (sameSurnameWithLic.length > 1) {
+      const closeMatch = sameSurnameWithLic.find(function(cand) {
+        if (cand.norm.length !== d.norm.length) return false;
+        let diff = 0;
+        for (let k = 0; k < d.norm.length; k++) {
+          if (d.norm[k] !== cand.norm[k]) diff++;
+        }
+        return diff <= 1;
+      });
+      if (closeMatch) {
+        d.licenseNo = closeMatch.licenseNo;
+      }
+    }
+  });
+
+  const list = allDocs.sort(function(a, b) { return a.name.localeCompare(b.name, 'ja'); });
   try {
     if (list.length > 0 && list.length <= 1500) {
-      cache.put('HENSHUKUN_DOC_SEARCH_LIST_V2', JSON.stringify(list), 1800);
+      cache.put('HENSHUKUN_DOC_SEARCH_LIST_V3', JSON.stringify(list), 1800);
     }
   } catch (e) {}
   return list;
@@ -188,7 +245,7 @@ function loadClinicAndStaffMasters64_(ss) {
 
   const staffList = [];
   const seenStaff = new Set();
-  const readStaffSheet = (sh) => {
+  const readStaffSheet = function(sh) {
     if (!sh || sh.getLastRow() < 2) return;
     const vals = sh.getDataRange().getDisplayValues();
     for (let r = 1; r < vals.length; r++) {
@@ -207,7 +264,7 @@ function loadClinicAndStaffMasters64_(ss) {
       readStaffSheet(extSs.getSheetByName('担当者') || extSs.getSheets()[0]);
     } catch (e) {}
   }
-  staffList.sort((a, b) => a.localeCompare(b, 'ja'));
+  staffList.sort(function(a, b) { return a.localeCompare(b, 'ja'); });
 
   return {
     clinicMap: clinicMap,
