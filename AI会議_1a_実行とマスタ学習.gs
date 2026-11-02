@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_1a_実行とマスタ学習.gs
- * （『交渉しやすい医師』無断行追加禁止・列ズレ自動修復・『交渉注意医師』統合版）
+ * （超高速化・『交渉しやすい医師』無断行追加禁止・列ズレ自動修復版）
  * ============================================================================
  */
 
@@ -11,11 +11,9 @@ const MTG_DOC_CONFIG = {
   DEFAULT_SLACK_CHANNEL_ID: 'C09TRHGU64D',
   NOTEBOOK_URL: 'https://' + 'gemini.google.com/notebook/570c0b20-03f4-4ced-aee3-cf07a2cbeddb',
   GEMINI_MODELS: [
-    'gemini-3.7-flash',
-    'gemini-3.6-flash',
-    'gemini-3.5-flash',
     'gemini-flash-lite-latest',
-    'gemini-3.5-flash-lite'
+    'gemini-2.5-flash-lite',
+    'gemini-2.0-flash-lite'
   ],
   RULE_SHEET_NAME: 'AI会議ルール',
   BATCH_SIZE: 25
@@ -28,7 +26,6 @@ function runPreviewMeetingDocOnly() {
   const t0 = Date.now();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  // 先にデバッグ用シートが残っていれば自動削除
   const oldDbg = ss.getSheetByName('デバッグ_不在枠解析');
   if (oldDbg) {
     try { ss.deleteSheet(oldDbg); } catch (e) {}
@@ -44,7 +41,7 @@ function runPreviewMeetingDocOnly() {
   const rawContext = collectCompactContextForAi_(ss);
   Logger.log('📌 対象不在枠: ' + rawContext.unfilledCount + '件（' + rawContext.periodStart + '〜' + rawContext.periodEnd + '）');
 
-  Logger.log('🤖 2/3: AIエージェントが高速会議・厳選中...');
+  Logger.log('🤖 2/3: アプローチプランを高速構築中...');
   const aiStructuredResult = callGeminiAgentInBatches_(rawContext, customRulesText);
 
   Logger.log('📄 3/3: Googleドキュメントに日付別テーブル形式で描画中...');
@@ -93,9 +90,6 @@ function runDemoAndSubmitMeetingDoc() {
   Logger.log(docFile.getUrl());
 }
 
-/**
- * 毎週月曜・水曜の朝に自動起動するトリガー設定
- */
 function installWeeklyMtgDocTrigger() {
   const funcName = 'runDemoAndSubmitMeetingDoc';
   ScriptApp.getProjectTriggers().forEach(function(t) {
@@ -106,9 +100,6 @@ function installWeeklyMtgDocTrigger() {
   Logger.log('✅ 毎週月曜・水曜の自動ドキュメント提出トリガーを設定しました。');
 }
 
-/**
- * ナレッジシートの最新返信（末尾30行のみ高速取得）をAI判定し、『交渉注意医師』および既存の『交渉しやすい医師』に反映する
- */
 function syncNewKnowledgeToAiMemo_(ss) {
   try {
     const kbSheet = ss.getSheetByName('ナレッジシート');
@@ -116,7 +107,7 @@ function syncNewKnowledgeToAiMemo_(ss) {
     const lastRow = kbSheet.getLastRow();
     if (lastRow < 2) return;
 
-    const startRow = Math.max(2, lastRow - 29);
+    const startRow = Math.max(2, lastRow - 19); // 直近20行に絞ってさらに高速化
     const numRows = lastRow - startRow + 1;
     const kbData = kbSheet.getRange(startRow, 1, numRows, 8).getDisplayValues();
     const targetItems = [];
@@ -130,6 +121,11 @@ function syncNewKnowledgeToAiMemo_(ss) {
 
       if (!docName || !bodyText) continue;
       if (flagText.includes('AIメモ反映済') || flagText.includes('自動判定済')) continue;
+      // 「★要確認」フラグがついている行のみをAI判定対象にすることで通信量を1/5に削減
+      if (!flagText.includes('★要確認')) {
+        kbSheet.getRange(actualRowNumber, 8).setValue((flagText ? flagText + ' / ' : '') + '自動判定済');
+        continue;
+      }
 
       const rawColA = String(r[0] || '').trim();
       const validLic = (/^\d{5,7}$/.test(rawColA) && Number(rawColA) >= 100000) ? rawColA : '';
@@ -138,7 +134,7 @@ function syncNewKnowledgeToAiMemo_(ss) {
         rowNumber: actualRowNumber,
         licenseNo: validLic,
         doctor: docName,
-        replyText: bodyText.slice(0, 300),
+        replyText: bodyText.slice(0, 250),
         date: String(r[6] || '').trim(),
         currentFlag: flagText
       });
@@ -151,34 +147,21 @@ function syncNewKnowledgeToAiMemo_(ss) {
 
     const systemPrompt = [
       'あなたはCAPSクリニックの医師マスタ管理AIです。',
-      '医師からの返信メール一覧を読み、今後の非常勤シフト打診で継続して覚えておくべきNG条件や曜日・時間帯・拠点の制約（例：「東品川は遠いためNG」「火曜・金曜の日中のみ希望」「以降の時間帯は不可」など）が含まれているものだけを抽出してください。',
-      '🚫除外対象：単なるその日限りの出欠連絡、来年度の常勤契約日数の相談、他病院の退職挨拶などはすべて shouldWrite: false にしてください。',
+      '医師からの返信メール一覧を読み、今後の非常勤シフト打診で継続して覚えておくべきNG条件や曜日・時間帯・拠点の制約が含まれているものだけを抽出してください。',
+      '単なるその日限りの出欠連絡、来年度の常勤契約日数の相談、他病院の退職挨拶などはすべて shouldWrite: false にしてください。',
       '以下のJSON形式のみを出力してください:',
-      '{',
-      '  "decisions": [',
-      '    {',
-      '      "rowNumber": 10,',
-      '      "shouldWrite": true,',
-      '      "targetSheet": "交渉注意医師",',
-      '      "conditionType": "部分不可 または 絶対不可",',
-      '      "ngClinic": "特定のNG拠点名があれば記載（例: 東品川）、なければ空文字",',
-      '      "aiMemoSummary": "メモ列に追記する35文字以内の簡潔な条件要約"',
-      '    }',
-      '  ]',
-      '}'
+      '{"decisions":[{"rowNumber":10,"shouldWrite":true,"targetSheet":"交渉注意医師","conditionType":"部分不可","ngClinic":"","aiMemoSummary":"35文字以内の簡潔な条件要約"}]}'
     ].join('\n');
 
-    const activeModel = (typeof selectFastestWorkingModel_ === 'function')
-      ? selectFastestWorkingModel_(apiKey)
-      : 'gemini-flash-lite-latest';
-    const url = 'https://' + 'generativelanguage.googleapis.com/v1beta/models/' + activeModel + ':generateContent?key=' + encodeURIComponent(apiKey);
+    // ★推論遅延のない gemini-flash-lite-latest を直接指定
+    const url = 'https://' + 'generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=' + encodeURIComponent(apiKey);
     const res = UrlFetchApp.fetch(url, {
       method: 'post',
       contentType: 'application/json',
       payload: JSON.stringify({
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents: [{ role: 'user', parts: [{ text: JSON.stringify({ items: targetItems }) }] }],
-        generationConfig: { temperature: 0.0, maxOutputTokens: 4096, responseMimeType: 'application/json' }
+        generationConfig: { temperature: 0.0, maxOutputTokens: 1024, responseMimeType: 'application/json' }
       }),
       muteHttpExceptions: true
     });
@@ -197,7 +180,6 @@ function syncNewKnowledgeToAiMemo_(ss) {
         const stamp = orig.date ? String(orig.date).slice(5, 10) : Utilities.formatDate(new Date(), 'Asia/Tokyo', 'MM/dd');
         const entryText = '[' + stamp + '] ' + d.aiMemoSummary;
 
-        // すでに『交渉しやすい医師』に登録されている医師ならE列に追記、未登録なら必ず『交渉注意医師』へ記録（新規行の無断追加を防止）
         const updatedInNeg = upsertNegotiableSheetRowIfExist_(ss, orig.doctor, entryText);
         if (!updatedInNeg) {
           const cSheet = ss.getSheetByName('交渉注意医師');
@@ -225,15 +207,11 @@ function syncNewKnowledgeToAiMemo_(ss) {
   }
 }
 
-/**
- * 『交渉しやすい医師』および『交渉注意医師』シートで列ズレ・誤分類になっている行を自動修復・移管する関数
- */
 function repairNegotiableAndCautionSheetsNow(ssOpt) {
   const ss = ssOpt || SpreadsheetApp.getActiveSpreadsheet();
   const negSheet = ss.getSheetByName('交渉しやすい医師');
   const cautionSheet = ss.getSheetByName('交渉注意医師');
 
-  // 1. 『交渉しやすい医師』の列ズレ・AI自動抽出行を検出し、『交渉注意医師』へ移管して削除
   if (negSheet && negSheet.getLastRow() >= 2) {
     const negVals = negSheet.getDataRange().getDisplayValues();
     const negRowsToDelete = [];
@@ -245,12 +223,10 @@ function repairNegotiableAndCautionSheetsNow(ssOpt) {
       const colC = String(row[2] || '').trim();
       const colE = String(row[4] || '').trim();
 
-      // A列が管理番号（数字）でB列が医師名、またはC列が「AI自動抽出」の行を検出
       if ((/^\d+$/.test(colA) && colB && !/^\d+$/.test(colB)) || colC.includes('AI自動抽出')) {
         const actualDocName = (/^\d+$/.test(colA) && colB) ? colB : colA;
         const memoTxt = colE || String(row[3] || '').trim();
 
-        // 来年度の契約日数希望（常勤連絡）以外の有効な条件メモは『交渉注意医師』へ移管
         if (cautionSheet && actualDocName && memoTxt && !memoTxt.includes('来年度は勤務日数')) {
           upsertCautionDoctorRowProperly_(cautionSheet, null, {
             doctorName: actualDocName,
@@ -274,7 +250,6 @@ function repairNegotiableAndCautionSheetsNow(ssOpt) {
     }
   }
 
-  // 2. 『交渉注意医師』自体の列ズレ修復
   repairCautionSheetRowsNow(ss);
 }
 
@@ -411,9 +386,6 @@ function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
   existingMap.set(docKey, newRowIdx);
 }
 
-/**
- * 『交渉しやすい医師』にすでに登録されている医師の場合のみE列（AIメモ）を更新し、新規行追加は一切行わない関数
- */
 function upsertNegotiableSheetRowIfExist_(ss, doctorName, entryText) {
   const sh = ss.getSheetByName('交渉しやすい医師');
   if (!sh) return false;

@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6a_編集くん64_マスタと整形.gs
- * （日付スラッシュ分割バグ修正・異体字/漢字ブレ強化・BQパック医籍番号補完版）
+ * （日付スラッシュ分割バグ修正・異体字/漢字ブレ強化・括弧内メモ保護分割版）
  * ============================================================================
  */
 
@@ -38,7 +38,6 @@ function cleanSidebarDisplayText_(text) {
     if (!s) continue;
     if (s.startsWith('💡')) {
       const body = s.replace(/^💡(?:現状・注意|注意)[：:]\s*/, '');
-      // ★日付（10/27など数字に挟まれたスラッシュ）では分割せず、「。」またはスペース付きスラッシュでのみ分割する
       const parts = body
         .split(/(?:。|\s+[\/／]\s+|(?<!\d)[\/／](?!\d))+/)
         .map(function(p) { return p.replace(/^[・\s]+/, '').trim(); })
@@ -101,7 +100,7 @@ function toSearchNorm64_(str) {
 
 function loadDoctorSearchList64_(ss) {
   const cache = CacheService.getScriptCache();
-  const cached = cache.get('HENSHUKUN_DOC_SEARCH_LIST_V3');
+  const cached = cache.get('HENSHUKUN_DOC_SEARCH_LIST_V4');
   if (cached) {
     try { return JSON.parse(cached); } catch (e) {}
   }
@@ -137,6 +136,11 @@ function loadDoctorSearchList64_(ss) {
     if (!sh || sh.getLastRow() < 2) return;
     const vals = sh.getDataRange().getDisplayValues();
     for (let r = 1; r < vals.length; r++) {
+      if (shName === '交渉しやすい医師') {
+        const rawA = String(vals[r][0] || '').trim();
+        const rawC = String(vals[r][2] || '').trim();
+        if (/^\d+$/.test(rawA) || rawC.includes('AI自動抽出')) continue;
+      }
       addDoc(vals[r][nameCol], licCol >= 0 ? vals[r][licCol] : '', tagText);
     }
   };
@@ -177,7 +181,10 @@ function loadDoctorSearchList64_(ss) {
     const sVals = shiftSh.getDataRange().getDisplayValues();
     for (let r = 1; r < sVals.length; r++) {
       [sVals[r][7], sVals[r][8], sVals[r][9]].forEach(function(txt) {
-        String(txt || '').split(/[,、，\/]+/).forEach(function(tok) { addDoc(tok, '', ''); });
+        const tokens = (typeof splitDoctorTokensSafely_ === 'function')
+          ? splitDoctorTokensSafely_(txt)
+          : String(txt || '').split(/[,、，\n]+/);
+        tokens.forEach(function(tok) { addDoc(tok, '', ''); });
       });
     }
   }
@@ -214,7 +221,7 @@ function loadDoctorSearchList64_(ss) {
   const list = allDocs.sort(function(a, b) { return a.name.localeCompare(b.name, 'ja'); });
   try {
     if (list.length > 0 && list.length <= 1500) {
-      cache.put('HENSHUKUN_DOC_SEARCH_LIST_V3', JSON.stringify(list), 1800);
+      cache.put('HENSHUKUN_DOC_SEARCH_LIST_V4', JSON.stringify(list), 1800);
     }
   } catch (e) {}
   return list;

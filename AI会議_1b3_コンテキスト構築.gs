@@ -1,9 +1,15 @@
 /**
  * ============================================================================
  * AI会議_1b3_コンテキスト構築.gs
- * （①前後医延長・早出 ➔ ②ドミナント2診崩し ➔ ③確定シフト＆60分休憩ルール個別打診の構築）
+ * （本日分除外・明日以降のみ抽出・日付1桁正規化・0回実績除外・玉突き不在防止版）
  * ============================================================================
  */
+
+function normalizeDateYmd1b3_(rawDateStr) {
+  const m = String(rawDateStr || '').trim().match(/(\d{4})[\/\-年](\d{1,2})[\/\-月](\d{1,2})/);
+  if (!m) return String(rawDateStr || '').trim();
+  return m[1] + '/' + ('0' + m[2]).slice(-2) + '/' + ('0' + m[3]).slice(-2);
+}
 
 function evaluateValidAdjacentDocsForSlot_(docsStr, actionType, dateStr, dow, targetClinic, targetArea, timeInfo, masters) {
   const tokens = splitDoctorTokensSafely_(docsStr);
@@ -13,6 +19,7 @@ function evaluateValidAdjacentDocsForSlot_(docsStr, actionType, dateStr, dow, ta
   tokens.forEach(function(tok) {
     const k = normKeyForDoc_(tok);
     if (!k || masters.absoluteNgDocSet.has(k)) return;
+    if (masters.sbuSet.has(k)) return;
     if (masters.streakNgMap.has(k) && masters.streakNgMap.get(k).includes(dateStr)) return;
 
     const tm = tok.match(/(\d{1,2}):(\d{2})\s*[\-〜～]\s*(\d{1,2}):(\d{2})/);
@@ -29,17 +36,19 @@ function evaluateValidAdjacentDocsForSlot_(docsStr, actionType, dateStr, dow, ta
 
     if (!isDoctorCompatibleWithSlot_(k, dow, targetClinic, targetArea, timeInfo, actionType, masters)) return;
 
-    if (tok.includes('常勤')) {
+    const headPart = String(tok).replace(/\[.*$/g, '');
+    const isFt = !headPart.includes('非常勤') && headPart.includes('常勤');
+
+    if (isFt) {
       const condStr = masters.ftAllowCondMap.get(k) || '';
-      if (masters.ftAllowDocSet.has(k) && tok.includes('所定休出') && isFtConditionCompatibleWithTarget_(condStr, targetClinic, targetArea)) {
+      if (masters.ftAllowDocSet.has(k) && headPart.includes('所定休出') && isFtConditionCompatibleWithTarget_(condStr, targetClinic, targetArea)) {
         validTokens.push(k + '(常勤・所定休出)');
         validDocKeys.add(k);
       }
       return;
     }
 
-    const roleBadge = masters.sbuSet.has(k) ? '(★SBU)' : '(非常勤)';
-    validTokens.push(k + roleBadge);
+    validTokens.push(k + '(非常勤)');
     validDocKeys.add(k);
   });
 
@@ -50,11 +59,62 @@ function evaluateValidAdjacentDocsForSlot_(docsStr, actionType, dateStr, dow, ta
   };
 }
 
+function makeNormalizedSpotKey_(dateStr, rawClinicStr, absTimeStr) {
+  const cleanD = normalizeDateYmd1b3_(dateStr);
+  const cleanC = cleanClinicBaseName_(rawClinicStr);
+  const dept = String(rawClinicStr || '').includes('内科') ? '内科' : '小児科';
+  return cleanD + '_' + cleanC + '_' + dept + '_' + String(absTimeStr || '').trim();
+}
+
+function canDoctorLeaveSourceWithoutCreatingAbsence_(docKey, srcRow, targetBands, pairEval) {
+  const countByBand = {
+    'A': Number(srcRow[4] || 0),
+    'B': Number(srcRow[5] || 0),
+    'C': Number(srcRow[6] || 0)
+  };
+  const docsByBand = {
+    'A': splitDoctorTokensSafely_(srcRow[7]).map(normKeyForDoc_),
+    'B': splitDoctorTokensSafely_(srcRow[8]).map(normKeyForDoc_),
+    'C': splitDoctorTokensSafely_(srcRow[9]).map(normKeyForDoc_)
+  };
+
+  for (let i = 0; i < targetBands.length; i++) {
+    const tb = targetBands[i];
+    if (countByBand[tb] < 2 || !docsByBand[tb].includes(docKey)) {
+      return false;
+    }
+  }
+
+  const allBands = ['A', 'B', 'C'];
+  for (let i = 0; i < allBands.length; i++) {
+    const b = allBands[i];
+    if (targetBands.includes(b)) continue;
+    if (!docsByBand[b].includes(docKey)) continue;
+
+    if ((b === 'C' && targetBands.includes('B')) || (b === 'B' && targetBands.includes('C'))) {
+      if (countByBand[b] < 2) {
+        return false;
+      }
+    }
+
+    if ((b === 'A' && targetBands.includes('B')) || (b === 'B' && targetBands.includes('A'))) {
+      if (pairEval.estMinutes > 60 || (pairEval.rank !== 'S' && pairEval.rank !== 'A')) {
+        if (countByBand[b] < 2) return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 function collectCompactContextForAi_(ss) {
-  const today = new Date();
-  const todayYmd = Utilities.formatDate(today, 'Asia/Tokyo', 'yyyy/MM/dd');
-  const twoWeeksYmd = Utilities.formatDate(new Date(today.getTime() + 14 * 86400000), 'Asia/Tokyo', 'yyyy/MM/dd');
-  const oneMonthYmd = Utilities.formatDate(new Date(today.getTime() + 31 * 86400000), 'Asia/Tokyo', 'yyyy/MM/dd');
+  const now = new Date();
+  const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const tomorrowDt = new Date(todayMidnight.getTime() + 1 * 86400000); // 明日（本日分は除外）
+
+  const tomorrowYmd = Utilities.formatDate(tomorrowDt, 'Asia/Tokyo', 'yyyy/MM/dd');
+  const twoWeeksYmd = Utilities.formatDate(new Date(tomorrowDt.getTime() + 14 * 86400000), 'Asia/Tokyo', 'yyyy/MM/dd');
+  const oneMonthYmd = Utilities.formatDate(new Date(tomorrowDt.getTime() + 31 * 86400000), 'Asia/Tokyo', 'yyyy/MM/dd');
 
   const getRows = function(name) {
     const sh = ss.getSheetByName(name);
@@ -71,40 +131,86 @@ function collectCompactContextForAi_(ss) {
     return sh.getRange(startR, 1, lastR - startR + 1, numCols).getDisplayValues();
   };
 
-  const unfilledAll = getRows('最新_不在枠').filter(function(r) { return r[0] && r[0] >= todayYmd; });
+  const rawUnfilledRows = getRows('最新_不在枠').map(function(r) {
+    const copy = r.slice();
+    copy[0] = normalizeDateYmd1b3_(r[0]);
+    return copy;
+  });
+
+  // ★本日分は除外し、必ず「明日（tomorrowYmd）以降」のみを対象とする
+  const unfilledAll = rawUnfilledRows.filter(function(r) { return r[0] && r[0] >= tomorrowYmd; });
   const within2W = unfilledAll.filter(function(r) { return r[0] <= twoWeeksYmd; });
   const targetEndYmd = (within2W.length < 10 && unfilledAll.length > within2W.length) ? oneMonthYmd : twoWeeksYmd;
   const targetUnfilled = unfilledAll.filter(function(r) { return r[0] <= targetEndYmd; });
 
-  const periodStart = targetUnfilled.length > 0 ? targetUnfilled[0][0] : todayYmd;
+  const periodStart = targetUnfilled.length > 0 ? targetUnfilled[0][0] : tomorrowYmd;
   const periodEnd = targetUnfilled.length > 0 ? targetUnfilled[targetUnfilled.length - 1][0] : targetEndYmd;
 
-  const activeShifts = getRows('最新_当日シフト');
+  const activeShifts = getRows('最新_当日シフト').map(function(r) {
+    const copy = r.slice();
+    copy[0] = normalizeDateYmd1b3_(r[0]);
+    return copy;
+  });
   const streakWarnings = getRows('最新_連勤注意リスト');
   const spotCandidates = getRows('最新_個別打診候補');
-  const bundledCandidates = getRows('最新_おまとめ打診候補');
-  const kbRows = getRecentRows('ナレッジシート', 50);
+  const kbRows = getRecentRows('ナレッジシート', 120);
 
-  // Googleドキュメントからドミナント移動マトリクスを読み込み
   const dominantMatrix = loadDominantMatrixFromDoc_();
   const masters = buildMasterAndConfirmedShiftIndex_(ss, activeShifts, streakWarnings);
 
+  const latestReplyMap = new Map();
+  kbRows.forEach(function(r) {
+    const dKey = normKeyForDoc_(r[1]);
+    if (!dKey) return;
+    const rawFlag = String(r[7] || '').trim();
+    const rawPitch = String(r[3] || '').trim();
+
+    if (rawFlag.includes('一般連絡')) return;
+    if (!rawPitch.includes('【スタッフ打診】') && !rawFlag.includes('シフト調整')) return;
+
+    const dtStr = String(r[6] || '').slice(5, 10);
+    if (rawFlag.includes('承諾') || rawFlag.includes('成立')) {
+      latestReplyMap.set(dKey, (dtStr ? dtStr + 'の別枠打診：承諾実績あり' : '直近打診：承諾実績あり'));
+    } else if (rawFlag.includes('辞退')) {
+      latestReplyMap.set(dKey, (dtStr ? dtStr + 'の別枠打診：予定合わず辞退' : '直近打診：辞退履歴あり'));
+    }
+  });
+
   const spotMap = new Map();
   spotCandidates.forEach(function(r) {
-    const key = r[0] + '_' + r[2] + '_' + r[3];
+    const key = makeNormalizedSpotKey_(r[0], r[2], r[3]);
     if (!spotMap.has(key)) spotMap.set(key, []);
     const dKey = normKeyForDoc_(r[5]);
-    if (!dKey || masters.absoluteNgDocSet.has(dKey)) return;
+    if (!dKey || masters.absoluteNgDocSet.has(dKey) || masters.sbuSet.has(dKey)) return;
+
+    const sameDowSlotNum = Number(String(r[8] || '0').replace(/[^0-9]/g, '')) || 0;
+    const subCountNum = Number(String(r[9] || '0').replace(/[^0-9]/g, '')) || 0;
+    const totalCountNum = Number(String(r[10] || '0').replace(/[^0-9]/g, '')) || 0;
+
+    if (sameDowSlotNum === 0 && subCountNum === 0 && totalCountNum === 0) return;
+
+    let trackRecordLabel = '';
+    if (sameDowSlotNum > 0) {
+      trackRecordLabel = '同曜日同枠' + sameDowSlotNum + '回実績';
+    } else if (totalCountNum > 0) {
+      trackRecordLabel = '同拠点通算' + totalCountNum + '回実績';
+    } else {
+      trackRecordLabel = '同拠点別枠' + subCountNum + '回実績';
+    }
+
     spotMap.get(key).push({
       rank: r[4],
       doctor: dKey,
-      sameDowSlotCount: String(r[8] || '0').replace(/回$/g, '') + '回',
-      totalCount: r[10],
-      rawNote: String(r[13] || '').trim()
+      sameDowSlotNum: sameDowSlotNum,
+      totalCountNum: totalCountNum,
+      trackRecordLabel: trackRecordLabel,
+      rawNote: String(r[13] || '').trim(),
+      latestReplyDetail: latestReplyMap.get(dKey) || ''
     });
   });
 
   const targetDatesSet = new Set();
+
   const slotsContext = targetUnfilled.map(function(u, idx) {
     const dateStr = String(u[0] || '').trim();
     const clinic = String(u[1] || '').trim();
@@ -116,11 +222,9 @@ function collectCompactContextForAi_(ss) {
     const timeInfo = parseAbsenceTimeline_(absTime);
     targetDatesSet.add(dateStr);
 
-    // ① 前後医（延長・早出）
     const prevChecked = evaluateValidAdjacentDocsForSlot_(u[4] || 'なし', '延長', dateStr, dow, cleanTargetClinic, area, timeInfo, masters);
     const nextChecked = evaluateValidAdjacentDocsForSlot_(u[5] || 'なし', '早出', dateStr, dow, cleanTargetClinic, area, timeInfo, masters);
 
-    // ② ドミナント定義書に基づく2診崩し・併行募集の抽出
     const dayShifts = activeShifts.filter(function(s) { return String(s[0] || '').trim() === dateStr; });
     const twoDocScoredList = [];
     const oneDocScoredList = [];
@@ -145,88 +249,91 @@ function collectCompactContextForAi_(ss) {
         if (pairEval.rank === 'NG' || pairEval.score <= 0) return;
 
         const sArea = inferAreaForDoc_(sClinic);
+        const primaryBand = timeInfo.targetBands[0];
+        const countCol = primaryBand === 'A' ? 4 : (primaryBand === 'B' ? 5 : 6);
+        const docsCol = primaryBand === 'A' ? 7 : (primaryBand === 'B' ? 8 : 9);
+        const docCount = Number(s[countCol] || 0);
+        const rawDocsStr = String(s[docsCol] || '');
+        if (!rawDocsStr || rawDocsStr === '未充足' || docCount < 1) return;
 
-        timeInfo.targetBands.forEach(function(bandCode) {
-          const countCol = bandCode === 'A' ? 4 : (bandCode === 'B' ? 5 : 6);
-          const docsCol = bandCode === 'A' ? 7 : (bandCode === 'B' ? 8 : 9);
-          const docCount = Number(s[countCol] || 0);
-          const rawDocsStr = String(s[docsCol] || '');
-          if (!rawDocsStr || rawDocsStr === '未充足' || docCount < 1) return;
+        const tokens = splitDoctorTokensSafely_(rawDocsStr);
+        const movableForTwoDoc = [];
+        const movableForOneDoc = [];
+        let bestScore = 0;
 
-          const tokens = splitDoctorTokensSafely_(rawDocsStr);
-          const movableForThisClinic = [];
-          let bestScore = 0;
+        tokens.forEach(function(tok) {
+          const k = normKeyForDoc_(tok);
+          if (!k || k === '未充足' || masters.absoluteNgDocSet.has(k)) return;
+          if (masters.streakNgMap.has(k) && masters.streakNgMap.get(k).includes(dateStr)) return;
 
-          tokens.forEach(function(tok) {
-            const k = normKeyForDoc_(tok);
-            if (!k || k === '未充足' || masters.absoluteNgDocSet.has(k)) return;
-            if (masters.streakNgMap.has(k) && masters.streakNgMap.get(k).includes(dateStr)) return;
-
-            const isFt = tok.includes('常勤');
-            if (isFt) {
-              const condStr = masters.ftAllowCondMap.get(k) || '';
-              if (!masters.ftAllowDocSet.has(k) || !tok.includes('所定休出') || !isFtConditionCompatibleWithTarget_(condStr, cleanTargetClinic, area)) {
-                return;
-              }
-            }
-
-            if (!isDoctorCompatibleWithSlot_(k, dow, cleanTargetClinic, area, timeInfo, '移動', masters)) return;
-
-            const isSbu = masters.sbuSet.has(k);
-            const isNeg = masters.negotiableMap.has(k);
-            const isSpecialMovable = isSbu || isNeg || isFt;
-
-            // 一般非常勤は優先度S・A（移動60分以内）のみ、広域Bは交渉しやすい医師・SBU・所定休出のみ
-            if (pairEval.rank === 'B' && !isSpecialMovable) return;
-
-            const docScore = pairEval.score + (isSbu ? 15 : (isNeg ? 10 : 0));
-            if (docScore > bestScore) bestScore = docScore;
-
-            const label = isSbu ? (k + '[★SBU]') : (isFt ? (k + '[常勤・所定休出]') : k);
-            movableForThisClinic.push({ label: label, isSpecial: isSpecialMovable });
-          });
-
-          if (movableForThisClinic.length === 0) return;
-
-          if (docCount >= 2 && !seenTwoDoc.has(cleanSrcClinic)) {
-            seenTwoDoc.add(cleanSrcClinic);
-            twoDocScoredList.push({
-              score: bestScore,
-              item: {
-                clinic: cleanSrcClinic,
-                area: sArea,
-                priorityRank: pairEval.rank,
-                estMinutes: pairEval.estMinutes,
-                movableDoctors: movableForThisClinic.map(function(d) { return d.label; })
-              }
-            });
-          } else if (docCount === 1 && !seenOneDoc.has(cleanSrcClinic)) {
-            const specOnly = movableForThisClinic.filter(function(d) { return d.isSpecial; });
-            if (specOnly.length > 0) {
-              seenOneDoc.add(cleanSrcClinic);
-              oneDocScoredList.push({
-                score: bestScore,
-                item: {
-                  clinic: cleanSrcClinic,
-                  area: sArea,
-                  priorityRank: pairEval.rank,
-                  estMinutes: pairEval.estMinutes,
-                  movableDoctors: specOnly.map(function(d) { return d.label; })
-                }
-              });
+          const headPart = String(tok).replace(/\[.*$/g, '');
+          const isFt = !headPart.includes('非常勤') && headPart.includes('常勤');
+          if (isFt) {
+            const condStr = masters.ftAllowCondMap.get(k) || '';
+            if (!masters.ftAllowDocSet.has(k) || !headPart.includes('所定休出') || !isFtConditionCompatibleWithTarget_(condStr, cleanTargetClinic, area)) {
+              return;
             }
           }
+
+          if (!isDoctorCompatibleWithSlot_(k, dow, cleanTargetClinic, area, timeInfo, '移動', masters)) return;
+
+          const isSbu = masters.sbuSet.has(k);
+          const isNeg = masters.negotiableMap.has(k);
+          const isSpecialMovable = isSbu || isNeg || isFt;
+
+          if (pairEval.rank === 'B' && !isSpecialMovable) return;
+
+          const docScore = pairEval.score + (isSbu ? 15 : (isNeg ? 10 : 0));
+          const label = isSbu ? (k + '[★SBU]') : (isFt ? (k + '[常勤・所定休出]') : k);
+
+          if (docCount >= 2) {
+            if (canDoctorLeaveSourceWithoutCreatingAbsence_(k, s, timeInfo.targetBands, pairEval)) {
+              movableForTwoDoc.push(label);
+              if (docScore > bestScore) bestScore = docScore;
+            }
+          } else if (docCount === 1 && isSpecialMovable) {
+            movableForOneDoc.push(label);
+            if (docScore > bestScore) bestScore = docScore;
+          }
         });
+
+        if (movableForTwoDoc.length > 0 && !seenTwoDoc.has(cleanSrcClinic)) {
+          seenTwoDoc.add(cleanSrcClinic);
+          twoDocScoredList.push({
+            score: bestScore,
+            item: {
+              clinic: cleanSrcClinic,
+              area: sArea,
+              priorityRank: pairEval.rank,
+              estMinutes: pairEval.estMinutes,
+              movableDoctors: movableForTwoDoc
+            }
+          });
+        } else if (movableForOneDoc.length > 0 && !seenOneDoc.has(cleanSrcClinic)) {
+          seenOneDoc.add(cleanSrcClinic);
+          oneDocScoredList.push({
+            score: bestScore,
+            item: {
+              clinic: cleanSrcClinic,
+              area: sArea,
+              priorityRank: pairEval.rank,
+              estMinutes: pairEval.estMinutes,
+              movableDoctors: movableForOneDoc
+            }
+          });
+        }
       });
     }
 
     twoDocScoredList.sort(function(a, b) { return b.score - a.score; });
     oneDocScoredList.sort(function(a, b) { return b.score - a.score; });
 
-    // ③ 個別打診候補（確定シフト突合 ＆ 移動60分以内・休憩60分確保ルール）
-    const cleanK = clinic.includes('北葛西') ? (isInternalMed ? '北葛西（内科）' : '北葛西（小児科）')
-      : (clinic.includes('亀有') ? (isInternalMed ? '亀有（内科）' : '亀有（小児科）') : cleanTargetClinic);
-    const rawSpots = spotMap.get(dateStr + '_' + cleanK + '_' + absTime) || [];
+    const rawSpots = (spotMap.get(makeNormalizedSpotKey_(dateStr, clinic, absTime)) || []).slice();
+    rawSpots.sort(function(a, b) {
+      if (b.sameDowSlotNum !== a.sameDowSlotNum) return b.sameDowSlotNum - a.sameDowSlotNum;
+      return b.totalCountNum - a.totalCountNum;
+    });
+
     const verifiedSpots = [];
     const dayConfirmedMap = masters.confirmedDocScheduleByDate.get(dateStr) || new Map();
 
@@ -252,7 +359,6 @@ function collectCompactContextForAi_(ss) {
             : (cs.startMin - timeInfo.endMin);
           const pairMobility = evaluateClinicPairMobility_(cleanTargetClinic, cs.clinic, dominantMatrix);
 
-          // 移動時間60分以内（優先度S・A）かつ、空き時間から移動時間を引いて60分以上の休憩が取れる場合のみ許可
           if ((pairMobility.rank !== 'S' && pairMobility.rank !== 'A') ||
               pairMobility.estMinutes > 60 ||
               (gapMin - pairMobility.estMinutes) < 60) {
@@ -260,7 +366,7 @@ function collectCompactContextForAi_(ss) {
             break;
           }
         }
-        otherConfirmedLabels.push(cs.clinic + '(' + cs.timeLabel + ')');
+        otherConfirmedLabels.push(cs.clinic + ' ' + cs.timeLabel);
       }
 
       if (isImpossibleSchedule) return;
@@ -268,10 +374,10 @@ function collectCompactContextForAi_(ss) {
       verifiedSpots.push({
         rank: sp.rank,
         doctor: dKey,
-        sameDowSlotCount: sp.sameDowSlotCount,
-        totalCount: sp.totalCount,
-        daySchedule: otherConfirmedLabels.length > 0 ? ('同日確定枠:' + otherConfirmedLabels.join(', ')) : '当日空き',
-        masterNote: sp.rawNote
+        trackRecordLabel: sp.trackRecordLabel,
+        daySchedule: otherConfirmedLabels.length > 0 ? ('同日確定枠:' + otherConfirmedLabels.join('、')) : '当日空き',
+        masterNote: sp.rawNote,
+        latestReplyDetail: sp.latestReplyDetail
       });
     });
 
@@ -294,23 +400,6 @@ function collectCompactContextForAi_(ss) {
       twoDocBreakdownCandidates: twoDocScoredList.slice(0, 4).map(function(x) { return x.item; }),
       oneDocParallelCandidates: oneDocScoredList.slice(0, 3).map(function(x) { return x.item; }),
       kinmukunCandidates: verifiedSpots.slice(0, 4)
-    };
-  });
-
-  const targetBundles = bundledCandidates.filter(function(r) {
-    const dKey = normKeyForDoc_(r[0]);
-    if (masters.absoluteNgDocSet.has(dKey)) return false;
-    const text = String(r[4] || '');
-    return Array.from(targetDatesSet).some(function(d) { return text.includes(d); });
-  }).slice(0, 12).map(function(r) {
-    const dKey = normKeyForDoc_(r[0]);
-    const extraMemo = masters.docMemoLookup.get(dKey) || '';
-    return {
-      doctor: dKey,
-      licenseNo: r[1],
-      slotCount: r[3],
-      targetSlotsText: r[4],
-      masterNote: [r[5] || '', extraMemo].filter(Boolean).join(' ')
     };
   });
 
@@ -354,7 +443,7 @@ function collectCompactContextForAi_(ss) {
     periodEnd: periodEnd,
     unfilledCount: targetUnfilled.length,
     slotsContext: slotsContext,
-    targetBundles: targetBundles,
+    targetBundles: [],
     streakList: streakList,
     recentFlaggedKb: recentFlaggedKb
   };

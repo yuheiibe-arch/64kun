@@ -1,49 +1,20 @@
 /**
  * ============================================================================
  * AI会議_2a_モデル通信と整形.gs
- * （モデル自動選定・並列バッチ通信・不要な内部思考メモや属性表記の完全除去）
+ * （一般連絡ノイズ100%遮断・シフト調整の承諾/辞退のみ表示・超高速版）
  * ============================================================================
  */
 
 const CANDIDATE_GEMINI_MODELS = [
-  'gemini-3.7-flash',
-  'gemini-3.6-flash',
-  'gemini-3.5-flash',
   'gemini-flash-lite-latest',
-  'gemini-3.5-flash-lite',
-  'gemini-3.1-flash-lite'
+  'gemini-2.5-flash-lite',
+  'gemini-2.0-flash-lite'
 ];
 
 let CACHED_WORKING_MODEL_ = null;
 
 function selectFastestWorkingModel_(apiKey) {
-  if (CACHED_WORKING_MODEL_) return CACHED_WORKING_MODEL_;
-
-  const baseUrl = 'https://' + 'generativelanguage.googleapis.com/v1beta/models/';
-  const pingReqs = CANDIDATE_GEMINI_MODELS.map(function(m) {
-    return {
-      url: baseUrl + m + ':generateContent?key=' + encodeURIComponent(apiKey),
-      method: 'post',
-      contentType: 'application/json',
-      payload: JSON.stringify({
-        contents: [{ parts: [{ text: '1' }] }],
-        generationConfig: { maxOutputTokens: 2 }
-      }),
-      muteHttpExceptions: true
-    };
-  });
-
-  const responses = UrlFetchApp.fetchAll(pingReqs);
-  for (let i = 0; i < responses.length; i++) {
-    if (responses[i].getResponseCode() === 200) {
-      CACHED_WORKING_MODEL_ = CANDIDATE_GEMINI_MODELS[i];
-      Logger.log('  🎯 事前疎通テスト完了！最優秀の稼働モデルを特定: 【 ' + CACHED_WORKING_MODEL_ + ' 】');
-      return CACHED_WORKING_MODEL_;
-    }
-  }
-
   CACHED_WORKING_MODEL_ = 'gemini-flash-lite-latest';
-  Logger.log('  ⚠️ フォールバックモデルを選択: 【 ' + CACHED_WORKING_MODEL_ + ' 】');
   return CACHED_WORKING_MODEL_;
 }
 
@@ -70,9 +41,6 @@ function cleanPlanTextFormatting_(text) {
     .trim();
 }
 
-/**
- * 現状・注意メモ（auditNote）から内部思考（不可理由・除外理由・自明な文言）を完全除去する関数
- */
 function cleanAuditNoteFormatting_(noteText) {
   const raw = String(noteText || '')
     .replace(/亀原本院/g, '亀有')
@@ -80,8 +48,9 @@ function cleanAuditNoteFormatting_(noteText) {
     .trim();
   if (!raw || raw === '-' || raw === 'なし' || raw === '特になし') return '';
 
-  const sentences = raw.split(/(?:。|\s+[\/／]\s+|(?<!\d)[\/／](?!\d)|\n)+/).map(function(s) { return s.trim(); }).filter(Boolean);
+  const sentences = raw.split(/(?:。|\s+[\/／]\s+|\n)+/).map(function(s) { return s.trim(); }).filter(Boolean);
   const meaningful = sentences.filter(function(s) {
+    if (s.includes('一般連絡')) return false; // 一般連絡は絶対に出さない
     if (/(通常常勤|通常勤務).*?(延長不可|早出不可|移動不可|打診不可|不可)/.test(s)) return false;
     if (/(中抜け|空き時間).*?(調整困難|不可|対象外|除外)/.test(s)) return false;
     if (/(除外|対象外|相談しない|候補外)/.test(s)) return false;
@@ -93,203 +62,132 @@ function cleanAuditNoteFormatting_(noteText) {
   return meaningful.join(' / ');
 }
 
-function cleanAndPromoteValidPlans_(aiPlan) {
-  const rawPlans = [aiPlan.plan1, aiPlan.plan2, aiPlan.plan3]
-    .map(function(p) { return cleanPlanTextFormatting_(p); })
-    .filter(Boolean);
+function buildDeterministicSlotPlanFast_(slot) {
+  const actions = [];
+  const auditNotes = [];
 
-  const validPlans = [];
-  const nonActionRegex = /(延長不可|早出不可|移動不可|打診不可|調整不可|相談不可|対象外|余地なし|該当なし|候補なし|不在のため|12連勤NG)/;
+  if (slot.currentMemo && String(slot.currentMemo).trim() && slot.currentMemo !== '-') {
+    auditNotes.push('【進行中メモ】' + String(slot.currentMemo).trim());
+  }
 
-  rawPlans.forEach(function(p) {
-    const hasPositiveAction = /(へ延長打診|へ早出打診|へ移動打診|へ個別打診|時給UP募集を立て)/.test(p);
-    if (nonActionRegex.test(p) && !hasPositiveAction) {
-      return;
+  // 1. 第1優先：自拠点の前後医による「延長・早出」（※SBUは対象外）
+  const formatAdjAction = function(docsStr, actionLabel) {
+    if (!docsStr || docsStr === 'なし') return;
+    docsStr.split(' / ').map(function(s) { return s.trim(); }).filter(Boolean).forEach(function(dTok) {
+      if (dTok.includes('SBU')) return;
+      const cleanName = dTok.replace(/[\(（].*?[\)）]/g, '').trim();
+      const isFtHoliday = !dTok.includes('非常勤') && dTok.includes('所定休出');
+      if (isFtHoliday) {
+        actions.push((actionLabel === '延長' ? '前医の' : '後医の') + cleanName + '先生（常勤・所定休出）へ' + actionLabel + '打診（常勤追加勤務手当1,500円/h）');
+      } else {
+        actions.push((actionLabel === '延長' ? '前医の' : '後医の') + cleanName + '先生（非常勤）へ' + actionLabel + '打診');
+      }
+    });
+  };
+  formatAdjAction(slot.prevDocs, '延長');
+  formatAdjAction(slot.nextDocs, '早出');
+
+  // 2. 第2優先：ドミナント定義書（優先度S・A・特例B）に基づく他拠点からの「2診目崩し」
+  (slot.twoDocBreakdownCandidates || []).forEach(function(cand) {
+    if (actions.length >= 3) return;
+    const docs = cand.movableDoctors || [];
+    if (docs.length === 0) return;
+
+    const allSbu = docs.every(function(d) { return d.includes('SBU'); });
+    const allowLabel = allSbu ? '（移動手当0円）' : '（移動依頼手当10,000円）';
+
+    const formatMovDoc = function(d) {
+      const base = d.replace(/\[.*?\]/g, '').trim();
+      if (d.includes('SBU')) return base + '先生[★SBU]';
+      if (!d.includes('非常勤') && d.includes('所定休出')) return base + '先生[常勤・所定休出]';
+      return base + '先生';
+    };
+
+    if (docs.length === 1) {
+      actions.push('【2診目崩し】' + cand.clinic + '（2診目：' + formatMovDoc(docs[0]) + '）へ移動打診' + allowLabel);
+    } else {
+      const twoNames = '①' + formatMovDoc(docs[0]) + ' / ②' + formatMovDoc(docs[1]);
+      actions.push('【2診目崩し】' + cand.clinic + '（2診目：' + twoNames + '）のどちらか1名へ移動打診' + allowLabel);
     }
-    if (p === '-' || p === 'なし' || p === '特になし') {
-      return;
-    }
-    validPlans.push(p);
   });
 
-  const cleanNote = cleanAuditNoteFormatting_(aiPlan.auditNote);
+  // 3. 第3優先：確定シフト突合済みの「個別打診」
+  (slot.kinmukunCandidates || []).forEach(function(sp) {
+    if (actions.length >= 3) return;
+
+    let recLabel = sp.trackRecordLabel || '';
+    if (!recLabel) {
+      const sCount = Number(String(sp.sameDowSlotCount || '0').replace(/[^0-9]/g, '')) || 0;
+      const tCount = Number(String(sp.totalCount || '0').replace(/[^0-9]/g, '')) || 0;
+      if (sCount === 0 && tCount === 0) return;
+      recLabel = sCount > 0 ? ('同曜日同枠' + sCount + '回実績') : ('同拠点通算' + tCount + '回実績');
+    }
+
+    actions.push(sp.doctor + '先生へ個別打診（' + recLabel + '）');
+
+    if (sp.daySchedule && sp.daySchedule.startsWith('同日確定枠:')) {
+      auditNotes.push(sp.doctor + '先生は' + sp.daySchedule.replace('同日確定枠:', '同日別枠（') + '）あり');
+    }
+
+    // ★シフト調整の履歴（承諾・辞退）のみを端的に表示し、一般連絡（12/31の空き連絡や年末調整など）は一切出さない
+    if (sp.latestReplyDetail) {
+      auditNotes.push(sp.doctor + '先生は' + sp.latestReplyDetail);
+    } else if (sp.masterNote && !sp.masterNote.includes('一般連絡')) {
+      const dateMatch = sp.masterNote.match(/直近(\d{1,2}\/\d{1,2})打診\(([^:：)]+)/);
+      if (dateMatch && dateMatch[2].includes('シフト調整')) {
+        const kindLabel = dateMatch[2].includes('辞退') ? 'の別枠打診：辞退履歴あり' : 'の別枠打診：承諾実績あり';
+        auditNotes.push(sp.doctor + '先生は' + dateMatch[1] + kindLabel);
+      }
+    }
+  });
+
+  // 4. まだ3案に満たない場合は「1診・併行募集」を追加
+  (slot.oneDocParallelCandidates || []).forEach(function(cand) {
+    if (actions.length >= 3) return;
+    const docs = cand.movableDoctors || [];
+    if (docs.length === 0) return;
+    const base = docs[0].replace(/\[.*?\]/g, '').trim();
+    actions.push('【1診・併行募集】' + cand.clinic + '（1診：' + base + '先生）に時給UP募集を立て、埋まり次第移動打診（移動依頼手当10,000円）');
+  });
+
+  const baseClinicName = String(slot.clinic || '')
+    .replace(/[\(（]小児科[\)）]|[\(（]内科[\)）]|小児科|内科/g, '')
+    .trim();
+  const showDept = (baseClinicName.includes('亀有') || baseClinicName.includes('北葛西') || slot.dept === '内科');
+  const exactClinicAndDept = showDept ? ('【' + baseClinicName + '（' + slot.dept + '）】') : ('【' + baseClinicName + '】');
+
+  const wageLabel = formatCleanWageLabel_(slot.specialWage, slot.listedWage);
+  const exactAbsenceTime = slot.absenceTime + '（' + wageLabel + '）';
 
   return {
-    plan1: validPlans[0] || '',
-    plan2: validPlans[1] || '',
-    plan3: validPlans[2] || '',
-    auditNote: cleanNote || '-'
+    slotId: slot.slotId,
+    date: slot.date,
+    clinicAndDept: exactClinicAndDept,
+    absenceTime: exactAbsenceTime,
+    assignee: slot.assignee || '',
+    plan1: cleanPlanTextFormatting_(actions[0] || ''),
+    plan2: cleanPlanTextFormatting_(actions[1] || ''),
+    plan3: cleanPlanTextFormatting_(actions[2] || ''),
+    auditNote: cleanAuditNoteFormatting_(auditNotes.join(' / ')) || '-'
   };
 }
 
 function callGeminiAgentInBatches_(rawContext, customRulesText) {
-  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-  if (!apiKey) throw new Error('スクリプトプロパティに GEMINI_API_KEY が見つかりません。');
-
-  const activeModel = selectFastestWorkingModel_(apiKey);
-
+  const t0 = Date.now();
   const allSlots = rawContext.slotsContext || [];
-  const batchSize = Math.max(30, Math.ceil(allSlots.length / 3));
-  const chunks = [];
-
-  for (let i = 0; i < allSlots.length; i += batchSize) {
-    chunks.push(allSlots.slice(i, i + batchSize));
-  }
-
-  Logger.log('  ↳ 確定モデル【' + activeModel + '】で全 ' + chunks.length + ' バッチ＋総括（計' + (chunks.length + 1) + '通信）を一斉並列分析中...');
-
-  const slotSystemPrompt = buildSlotChunkPrompt_(customRulesText);
-  const summarySystemPrompt = buildSummaryMetaPrompt_();
-
-  const requestsPayloadList = chunks.map(function(chunk) {
-    return {
-      systemPrompt: slotSystemPrompt,
-      userObj: { slots: chunk }
-    };
-  });
-
-  requestsPayloadList.push({
-    systemPrompt: summarySystemPrompt,
-    userObj: {
-      periodStart: rawContext.periodStart,
-      periodEnd: rawContext.periodEnd,
-      unfilledCount: rawContext.unfilledCount,
-      targetBundles: rawContext.targetBundles || [],
-      recentFlaggedKb: rawContext.recentFlaggedKb || [],
-      customRules: customRulesText
-    }
-  });
-
-  const results = invokeVerifiedModelParallel_(apiKey, activeModel, requestsPayloadList);
-
-  const aiPlanMap = new Map();
-  for (let i = 0; i < chunks.length; i++) {
-    const parsed = results[i];
-    if (parsed && Array.isArray(parsed.slotPlans)) {
-      parsed.slotPlans.forEach(function(p) {
-        if (p && p.slotId != null) {
-          aiPlanMap.set(Number(p.slotId), p);
-        }
-      });
-    }
-  }
 
   const allSlotPlans = allSlots.map(function(origSlot) {
-    const aiPlan = aiPlanMap.get(Number(origSlot.slotId)) || {};
-
-    const baseClinicName = String(origSlot.clinic || '')
-      .replace(/[\(（]小児科[\)）]|[\(（]内科[\)）]|小児科|内科/g, '')
-      .trim();
-    const showDept = (baseClinicName.includes('亀有') || baseClinicName.includes('北葛西') || origSlot.dept === '内科');
-    const exactClinicAndDept = showDept ? ('【' + baseClinicName + '（' + origSlot.dept + '）】') : ('【' + baseClinicName + '】');
-
-    const wageLabel = formatCleanWageLabel_(origSlot.specialWage, origSlot.listedWage);
-    const exactAbsenceTime = origSlot.absenceTime + '（' + wageLabel + '）';
-
-    const cleaned = cleanAndPromoteValidPlans_(aiPlan);
-
-    return {
-      slotId: origSlot.slotId,
-      date: origSlot.date,
-      clinicAndDept: exactClinicAndDept,
-      absenceTime: exactAbsenceTime,
-      assignee: origSlot.assignee || '',
-      plan1: cleaned.plan1,
-      plan2: cleaned.plan2,
-      plan3: cleaned.plan3,
-      auditNote: cleaned.auditNote
-    };
+    return buildDeterministicSlotPlanFast_(origSlot);
   });
+  Logger.log('  ⚡ 全 ' + allSlotPlans.length + ' 枠のプラン構築完了（' + (Date.now() - t0) + 'ms）');
 
-  const summaryPart = results[chunks.length] || {};
-  const cleanBundles = (summaryPart.bundleRecommendations || []).map(function(b) {
-    return {
-      doctor: cleanPlanTextFormatting_(b.doctor || ''),
-      targetSlots: b.targetSlots || '',
-      reasonAndNote: b.reasonAndNote || ''
-    };
-  });
+  const executiveSummary = '対象期間（' + rawContext.periodStart + '〜' + rawContext.periodEnd + '）の医師不在枠は計' + rawContext.unfilledCount + '件です。自拠点の前後医による延長・早出、およびドミナント近隣拠点からの2診目崩しを最優先で打診してください。';
 
   return {
-    executiveSummary: summaryPart.executiveSummary || '',
+    executiveSummary: executiveSummary,
     slotPlans: allSlotPlans,
-    bundleRecommendations: cleanBundles,
+    bundleRecommendations: [],
     announcementProposal: buildOfficialAnnouncementProposal_(rawContext.slotsContext),
-    masterUpdateQuestions: summaryPart.masterUpdateQuestions || []
+    masterUpdateQuestions: []
   };
-}
-
-function invokeVerifiedModelParallel_(apiKey, primaryModel, requestsPayloadList) {
-  const baseUrl = 'https://' + 'generativelanguage.googleapis.com/v1beta/models/';
-  const results = new Array(requestsPayloadList.length).fill(null);
-
-  const safeParse = function(res) {
-    const resJson = JSON.parse(res.getContentText());
-    const rawText = resJson.candidates[0].content.parts.map(function(p) { return p.text || ''; }).join('').trim();
-    try {
-      return JSON.parse(rawText);
-    } catch (e) {
-      const lastCloseBrace = rawText.lastIndexOf('}');
-      if (lastCloseBrace > 0) {
-        try {
-          return JSON.parse(rawText.slice(0, lastCloseBrace + 1) + ']}');
-        } catch (e2) {}
-      }
-      return { slotPlans: [] };
-    }
-  };
-
-  const makeReqs = function(modelName, indices) {
-    const url = baseUrl + modelName + ':generateContent?key=' + encodeURIComponent(apiKey);
-    return indices.map(function(idx) {
-      const item = requestsPayloadList[idx];
-      return {
-        url: url,
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify({
-          systemInstruction: { parts: [{ text: item.systemPrompt }] },
-          contents: [{ role: 'user', parts: [{ text: JSON.stringify(item.userObj) }] }],
-          generationConfig: {
-            temperature: 0.0,
-            maxOutputTokens: 16384,
-            responseMimeType: 'application/json'
-          }
-        }),
-        muteHttpExceptions: true
-      };
-    });
-  };
-
-  const allIndices = requestsPayloadList.map(function(_, idx) { return idx; });
-  const responses = UrlFetchApp.fetchAll(makeReqs(primaryModel, allIndices));
-  const failedIndices = [];
-
-  for (let i = 0; i < responses.length; i++) {
-    const code = responses[i].getResponseCode();
-    if (code === 200) {
-      Logger.log('    ✅ バッチ ' + (i + 1) + '/' + requestsPayloadList.length + ' 完了 (' + primaryModel + ')');
-      results[i] = safeParse(responses[i]);
-    } else {
-      Logger.log('    ⚠️ バッチ ' + (i + 1) + ' (' + code + ') -> 高速バックアップ(gemini-flash-lite-latest)で即回収します');
-      failedIndices.push(i);
-    }
-  }
-
-  if (failedIndices.length > 0) {
-    Utilities.sleep(1500);
-    const retryModel = 'gemini-flash-lite-latest';
-    const retryResponses = UrlFetchApp.fetchAll(makeReqs(retryModel, failedIndices));
-    for (let k = 0; k < failedIndices.length; k++) {
-      const origIdx = failedIndices[k];
-      if (retryResponses[k].getResponseCode() === 200) {
-        Logger.log('    ✅ バッチ ' + (origIdx + 1) + '/' + requestsPayloadList.length + ' 回収完了 (' + retryModel + ')');
-        results[origIdx] = safeParse(retryResponses[k]);
-      } else {
-        results[origIdx] = { slotPlans: [] };
-      }
-    }
-  }
-
-  return results;
 }

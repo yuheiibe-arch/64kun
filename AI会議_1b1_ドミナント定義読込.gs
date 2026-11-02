@@ -7,8 +7,8 @@
 
 const DOMINANT_DOC_CONFIG = {
   DOC_ID: '1XUx2cLqN2P2RhUakpLEOn4xFzv7XnqQ_Jqm376xw1jU',
-  CACHE_KEY: 'CAPS_DOMINANT_MATRIX_V2',
-  CACHE_TTL_SEC: 21600 // 6時間キャッシュ
+  CACHE_KEY: 'CAPS_DOMINANT_MATRIX_V3',
+  CACHE_TTL_SEC: 21600
 };
 
 function normKeyForDoc_(name) {
@@ -30,7 +30,7 @@ function normKeyForDoc_(name) {
 function cleanClinicBaseName_(raw) {
   return String(raw || '')
     .replace(/^[★☆\s]+/, '')
-    .replace(/※.*$/g, '') // ★「※越谷LTタ5分」等の注記を確実に除去
+    .replace(/※.*$/g, '')
     .replace(/【|】/g, '')
     .replace(/[\(（].*?[\)）]/g, '')
     .replace(/小児科|内科/g, '')
@@ -48,14 +48,15 @@ function cleanClinicBaseName_(raw) {
 
 function inferAreaForDoc_(clinicName) {
   const c = String(clinicName || '');
-  if (/関西|大阪|兵庫|京都|奈良|滋賀|和歌山|鶴見緑地|西宮|千里|高槻|あべの|天美|東岸和田|今里|門真|守口|枚方|吹田|豊中|茨木|八尾|松原|堺|尼崎|伊丹|宝塚|川西|明石|神戸|姫路|生駒|大和|橿原|草津|大津|阿波座|長吉長原/.test(c)) {
+  // ★「草加松原」が大阪府松原市（天美）の「松原」に誤爆しないよう埼玉を先に判定
+  if (/越谷|川口|川越|志木|所沢|南浦和|与野|草加松原|草加|浦和|吉川/.test(c)) {
+    return '埼玉';
+  }
+  if (/関西|大阪|兵庫|京都|奈良|滋賀|和歌山|鶴見緑地|西宮|千里|高槻|あべの|天美|東岸和田|今里|門真|守口|枚方|吹田|豊中|茨木|八尾|堺|尼崎|伊丹|宝塚|川西|明石|神戸|姫路|生駒|橿原|草津|大津|阿波座|長吉長原/.test(c)) {
     return '関西';
   }
   if (/海老名|高田|武蔵小杉|相模大野|相模原|新百合|茅ヶ崎|茅ケ崎|天王町|小田栄|東戸塚|宮前平|川崎|横浜/.test(c)) {
     return '神奈川';
-  }
-  if (/越谷|川口|川越|志木|所沢|南浦和|与野|草加|浦和|吉川/.test(c)) {
-    return '埼玉';
   }
   if (/二和向台|柏の葉|柏|村上|稲毛|流山|新鎌|幕張|八千代|妙典|千葉|新浦安|浦安|市川|本八幡|船橋/.test(c)) {
     return '千葉';

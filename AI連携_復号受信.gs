@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * AI連携_復号受信.gs（caps365.jp 側：スクリプトプロパティ完全分離・セキュア版）
+ * AI連携_復号受信.gs（caps365.jp 側：一般連絡ノイズ完全除外・セキュア版）
  * ※スクリプトプロパティに AI_BRIDGE_SECRET_KEY を設定して使用します
  * ============================================================================
  */
@@ -10,14 +10,12 @@ const AI_RECEIVER_CONFIG = {
   SECRET_PROP_KEY: 'AI_BRIDGE_SECRET_KEY',
   LAST_PROCESSED_MSG_KEY: 'AI_BRIDGE_LAST_PROCESSED_MSG_ID',
 
-  // マスタ参照シート名（DSナレッジシート内）
   SHEET_SBU_MASTER: 'SBU',
   SHEET_FULLTIME_ALLOW_MASTER: '常勤依頼手当',
   SHEET_NEGOTIABLE_MASTER: '交渉しやすい医師',
   SHEET_CAUTION_MASTER: '交渉注意医師',
   SHEET_KNOWLEDGE_HISTORY: 'ナレッジシート',
 
-  // 自動生成・更新されるシート名
   SHEET_UNFILLED: '最新_不在枠',
   SHEET_ACTIVE_SHIFTS: '最新_当日シフト',
   SHEET_OUBO_SHIFTS: '最新_応募シフト',
@@ -26,9 +24,6 @@ const AI_RECEIVER_CONFIG = {
   SHEET_BUNDLED_CANDIDATES: '最新_おまとめ打診候補'
 };
 
-/**
- * スプレッドシート起動時のシンプルメニュー登録
- */
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
 
@@ -139,6 +134,7 @@ function loadDoctorRoleMastersFromSheets_(ss) {
     }
   }
 
+  // ★『ナレッジシート』からは「一般連絡（年末調整・備品・大晦日連絡など）」を除外し、シフト調整の辞退・承諾のみを記録
   const kbSheet = ss.getSheetByName(AI_RECEIVER_CONFIG.SHEET_KNOWLEDGE_HISTORY);
   if (kbSheet) {
     const kbLast = kbSheet.getLastRow();
@@ -148,12 +144,13 @@ function loadDoctorRoleMastersFromSheets_(ss) {
       for (let r = 0; r < vals.length; r++) {
         const nameKey = normalizeDocKeyReceive_(vals[r][1]);
         if (!nameKey) continue;
-        const reply = String(vals[r][2] || '').replace(/\n+/g, ' ').slice(0, 40);
-        const dt = String(vals[r][6] || '').slice(5, 10);
         const flag = String(vals[r][7] || '').trim();
-        if (flag.includes('シフト調整') || flag) {
-          recentKbMap.set(nameKey, '直近' + (dt || '履歴') + '打診(' + flag + ':' + reply + ')');
-        }
+        // ★「シフト調整」または「★要確認」のみを対象とし、「一般連絡」は完全にスキップする
+        if (!flag.includes('シフト調整') && !flag.includes('★要確認')) continue;
+
+        const dt = String(vals[r][6] || '').slice(5, 10);
+        const cleanFlag = flag.split('/')[0].trim();
+        recentKbMap.set(nameKey, '直近' + (dt || '履歴') + '打診(' + cleanFlag + ')');
       }
     }
   }
@@ -167,9 +164,6 @@ function loadDoctorRoleMastersFromSheets_(ss) {
   };
 }
 
-/**
- * 医師名文字列に対して『SBU』『常勤依頼手当』『交渉しやすい医師』『交渉注意医師』シートの情報を動的に付与する
- */
 function enrichDoctorTextWithSheetMasters_(rawText, roleMasters) {
   if (!rawText) return '';
   const sbuMap = roleMasters.sbuMap;
@@ -534,7 +528,6 @@ function writeKinmukunCandidateSheets_(ss, payload, roleMasters) {
     return notes.join(' / ');
   };
 
-  // 1. 『最新_個別打診候補』シート
   const spotRaw = payload.spotCandidateRows || [];
   if (spotRaw.length > 0) {
     let sh = ss.getSheetByName(AI_RECEIVER_CONFIG.SHEET_SPOT_CANDIDATES);
@@ -557,7 +550,6 @@ function writeKinmukunCandidateSheets_(ss, payload, roleMasters) {
     }
   }
 
-  // 2. 『最新_おまとめ打診候補』シート
   const bundleRaw = payload.bundledCandidateRows || [];
   if (bundleRaw.length > 0) {
     let sh = ss.getSheetByName(AI_RECEIVER_CONFIG.SHEET_BUNDLED_CANDIDATES);
