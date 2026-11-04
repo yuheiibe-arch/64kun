@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_2a_モデル通信と整形.gs
- * （一般連絡ノイズ100%遮断・シフト調整の承諾/辞退のみ表示・超高速版）
+ * （残存医への延長確認＋2診目崩し移動のセット提案表記・進行中メモ誤字補正・同日重複注意書き版）
  * ============================================================================
  */
 
@@ -50,7 +50,7 @@ function cleanAuditNoteFormatting_(noteText) {
 
   const sentences = raw.split(/(?:。|\s+[\/／]\s+|\n)+/).map(function(s) { return s.trim(); }).filter(Boolean);
   const meaningful = sentences.filter(function(s) {
-    if (s.includes('一般連絡')) return false; // 一般連絡は絶対に出さない
+    if (s.includes('一般連絡')) return false;
     if (/(通常常勤|通常勤務).*?(延長不可|早出不可|移動不可|打診不可|不可)/.test(s)) return false;
     if (/(中抜け|空き時間).*?(調整困難|不可|対象外|除外)/.test(s)) return false;
     if (/(除外|対象外|相談しない|候補外)/.test(s)) return false;
@@ -62,15 +62,124 @@ function cleanAuditNoteFormatting_(noteText) {
   return meaningful.join(' / ');
 }
 
-function buildDeterministicSlotPlanFast_(slot) {
+function buildMasterNameCorrectionMap2a_(allSlots) {
+  const officialNames = new Set();
+
+  (allSlots || []).forEach(function(slot) {
+    [slot.prevDocs, slot.nextDocs, slot.backupDocs].forEach(function(str) {
+      String(str || '').split(/[\/／,、\s]+/).forEach(function(tok) {
+        const clean = tok.replace(/[\(（\[【｛].*$/g, '').replace(/先生$/g, '').trim();
+        if (clean && clean.length >= 2 && clean !== 'なし' && clean !== '未充足') officialNames.add(clean);
+      });
+    });
+    (slot.twoDocBreakdownCandidates || []).concat(slot.oneDocParallelCandidates || []).forEach(function(c) {
+      (c.movableDoctors || []).forEach(function(d) {
+        const clean = String(d || '').replace(/[\(（\[【｛].*$/g, '').replace(/先生$/g, '').trim();
+        if (clean && clean.length >= 2) officialNames.add(clean);
+      });
+    });
+    (slot.kinmukunCandidates || []).forEach(function(sp) {
+      const clean = String(sp.doctor || '').replace(/[\(（\[【｛].*$/g, '').replace(/先生$/g, '').trim();
+      if (clean && clean.length >= 2) officialNames.add(clean);
+    });
+  });
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (typeof loadDoctorSearchList64_ === 'function') {
+      loadDoctorSearchList64_(ss).forEach(function(d) {
+        if (d.name && d.name.length >= 2) officialNames.add(d.name);
+      });
+    }
+  } catch (e) {}
+
+  return Array.from(officialNames);
+}
+
+function toPhoneticHomophoneKey2a_(nameStr) {
+  return String(nameStr || '')
+    .normalize('NFKC')
+    .replace(/[\s\u3000]+/g, '')
+    .replace(/[巧匠]/g, '匠')
+    .replace(/[滝瀧泷]/g, '瀧')
+    .replace(/[高髙]/g, '高')
+    .replace(/[崎﨑嵜]/g, '崎')
+    .replace(/[辺邊邉]/g, '辺')
+    .replace(/[斎齋齊斉]/g, '斎')
+    .replace(/[沢澤]/g, '沢')
+    .replace(/[広廣]/g, '広')
+    .replace(/[浜濵濱]/g, '浜')
+    .replace(/[真眞]/g, '真')
+    .replace(/[恵惠]/g, '恵')
+    .replace(/[島嶋嶌]/g, '島')
+    .replace(/[柳栁]/g, '柳')
+    .replace(/[桜櫻]/g, '桜')
+    .replace(/[国國]/g, '国')
+    .replace(/[徳德]/g, '徳')
+    .replace(/[朗郎]/g, '郎')
+    .replace(/[介助]/g, '介')
+    .replace(/[悠祐裕]/g, '祐')
+    .replace(/[佳圭]/g, '佳')
+    .replace(/[智知]/g, '智');
+}
+
+function correctDoctorNamesInMemoText_(memoText, officialNameList) {
+  let s = String(memoText || '').trim();
+  if (!s || !officialNameList || officialNameList.length === 0) return s;
+
+  return s.replace(/([一-龠々ヶケ]{2,6})先生/g, function(fullMatch, rawDocName) {
+    if (officialNameList.includes(rawDocName)) return fullMatch;
+
+    const targetKey = toPhoneticHomophoneKey2a_(rawDocName);
+    const exactKeyHit = officialNameList.find(function(offName) {
+      return toPhoneticHomophoneKey2a_(offName) === targetKey;
+    });
+    if (exactKeyHit) {
+      return exactKeyHit + '先生';
+    }
+
+    if (rawDocName.length >= 3) {
+      const closeHits = officialNameList.filter(function(offName) {
+        if (offName.length !== rawDocName.length) return false;
+        if (toPhoneticHomophoneKey2a_(offName.slice(0, 2)) !== toPhoneticHomophoneKey2a_(rawDocName.slice(0, 2))) return false;
+        let diff = 0;
+        for (let i = 0; i < offName.length; i++) {
+          if (offName[i] !== rawDocName[i]) diff++;
+        }
+        return diff === 1;
+      });
+      if (closeHits.length === 1) {
+        return closeHits[0] + '先生';
+      }
+    }
+
+    return fullMatch;
+  });
+}
+
+function extractCandidateDoctorsFromPlanText2a_(planText) {
+  const s = String(planText || '').replace(/｛※.*?｝/g, '').replace(/※.*?確認後に/g, '').trim();
+  if (!s) return [];
+  const names = [];
+  const regex = /(?:①|②|③|前医の|後医の|2診目[：:]|1診[：:]|^|\s)([一-龠々ヶケ]{2,6})先生/g;
+  let m;
+  while ((m = regex.exec(s)) !== null) {
+    const n = m[1].trim();
+    if (n && !names.includes(n)) names.push(n);
+  }
+  return names;
+}
+
+function buildDeterministicSlotPlanFast_(slot, officialNameList) {
   const actions = [];
   const auditNotes = [];
 
   if (slot.currentMemo && String(slot.currentMemo).trim() && slot.currentMemo !== '-') {
-    auditNotes.push('【進行中メモ】' + String(slot.currentMemo).trim());
+    const correctedMemo = correctDoctorNamesInMemoText_(slot.currentMemo, officialNameList);
+    auditNotes.push('【進行中メモ】' + correctedMemo);
   }
 
-  // 1. 第1優先：自拠点の前後医による「延長・早出」（※SBUは対象外）
+  // 1. 第1優先：自拠点の前後医による「延長・早出」
   const formatAdjAction = function(docsStr, actionLabel) {
     if (!docsStr || docsStr === 'なし') return;
     docsStr.split(' / ').map(function(s) { return s.trim(); }).filter(Boolean).forEach(function(dTok) {
@@ -87,7 +196,7 @@ function buildDeterministicSlotPlanFast_(slot) {
   formatAdjAction(slot.prevDocs, '延長');
   formatAdjAction(slot.nextDocs, '早出');
 
-  // 2. 第2優先：ドミナント定義書（優先度S・A・特例B）に基づく他拠点からの「2診目崩し」
+  // 2. 第2優先：ドミナント定義書に基づく他拠点からの「2診目崩し」（条件付き延長セット含む）
   (slot.twoDocBreakdownCandidates || []).forEach(function(cand) {
     if (actions.length >= 3) return;
     const docs = cand.movableDoctors || [];
@@ -96,17 +205,29 @@ function buildDeterministicSlotPlanFast_(slot) {
     const allSbu = docs.every(function(d) { return d.includes('SBU'); });
     const allowLabel = allSbu ? '（移動手当0円）' : '（移動依頼手当10,000円）';
 
-    const formatMovDoc = function(d) {
-      const base = d.replace(/\[.*?\]/g, '').trim();
-      if (d.includes('SBU')) return base + '先生[★SBU]';
-      if (!d.includes('非常勤') && d.includes('所定休出')) return base + '先生[常勤・所定休出]';
-      return base + '先生';
+    const parseMovDocObj = function(d) {
+      const condMatch = String(d).match(/｛※(.*?)｝/);
+      const condText = condMatch ? condMatch[1].trim() : '';
+      const withoutCond = String(d).replace(/｛※.*?｝/g, '').trim();
+      const base = withoutCond.replace(/\[.*?\]/g, '').trim();
+      let label = base + '先生';
+      if (withoutCond.includes('SBU')) label = base + '先生[★SBU]';
+      else if (!withoutCond.includes('非常勤') && withoutCond.includes('所定休出')) label = base + '先生[常勤・所定休出]';
+      return { label: label, condText: condText };
     };
 
     if (docs.length === 1) {
-      actions.push('【2診目崩し】' + cand.clinic + '（2診目：' + formatMovDoc(docs[0]) + '）へ移動打診' + allowLabel);
+      const mObj = parseMovDocObj(docs[0]);
+      if (mObj.condText) {
+        // ★残存医の延長確認が必要なセット案（例：野口優輔先生へ21:00まで延長打診を確認後に井上信明先生へ移動打診）
+        actions.push('【2診目崩し・要延長セット】' + cand.clinic + '（※残る' + mObj.condText + 'に、2診目：' + mObj.label + '）へ移動打診' + allowLabel);
+      } else {
+        actions.push('【2診目崩し】' + cand.clinic + '（2診目：' + mObj.label + '）へ移動打診' + allowLabel);
+      }
     } else {
-      const twoNames = '①' + formatMovDoc(docs[0]) + ' / ②' + formatMovDoc(docs[1]);
+      const m1 = parseMovDocObj(docs[0]);
+      const m2 = parseMovDocObj(docs[1]);
+      const twoNames = '①' + m1.label + (m1.condText ? '[※' + m1.condText + ']' : '') + ' / ②' + m2.label + (m2.condText ? '[※' + m2.condText + ']' : '');
       actions.push('【2診目崩し】' + cand.clinic + '（2診目：' + twoNames + '）のどちらか1名へ移動打診' + allowLabel);
     }
   });
@@ -129,7 +250,6 @@ function buildDeterministicSlotPlanFast_(slot) {
       auditNotes.push(sp.doctor + '先生は' + sp.daySchedule.replace('同日確定枠:', '同日別枠（') + '）あり');
     }
 
-    // ★シフト調整の履歴（承諾・辞退）のみを端的に表示し、一般連絡（12/31の空き連絡や年末調整など）は一切出さない
     if (sp.latestReplyDetail) {
       auditNotes.push(sp.doctor + '先生は' + sp.latestReplyDetail);
     } else if (sp.masterNote && !sp.masterNote.includes('一般連絡')) {
@@ -146,7 +266,7 @@ function buildDeterministicSlotPlanFast_(slot) {
     if (actions.length >= 3) return;
     const docs = cand.movableDoctors || [];
     if (docs.length === 0) return;
-    const base = docs[0].replace(/\[.*?\]/g, '').trim();
+    const base = docs[0].replace(/\[.*?\]|｛.*?｝/g, '').trim();
     actions.push('【1診・併行募集】' + cand.clinic + '（1診：' + base + '先生）に時給UP募集を立て、埋まり次第移動打診（移動依頼手当10,000円）');
   });
 
@@ -162,24 +282,65 @@ function buildDeterministicSlotPlanFast_(slot) {
   return {
     slotId: slot.slotId,
     date: slot.date,
+    shortClinicLabel: baseClinicName + ' ' + slot.absenceTime,
     clinicAndDept: exactClinicAndDept,
     absenceTime: exactAbsenceTime,
     assignee: slot.assignee || '',
     plan1: cleanPlanTextFormatting_(actions[0] || ''),
     plan2: cleanPlanTextFormatting_(actions[1] || ''),
     plan3: cleanPlanTextFormatting_(actions[2] || ''),
-    auditNote: cleanAuditNoteFormatting_(auditNotes.join(' / ')) || '-'
+    rawAuditNotes: auditNotes
   };
 }
 
 function callGeminiAgentInBatches_(rawContext, customRulesText) {
   const t0 = Date.now();
   const allSlots = rawContext.slotsContext || [];
+  const officialNameList = buildMasterNameCorrectionMap2a_(allSlots);
 
   const allSlotPlans = allSlots.map(function(origSlot) {
-    return buildDeterministicSlotPlanFast_(origSlot);
+    return buildDeterministicSlotPlanFast_(origSlot, officialNameList);
   });
-  Logger.log('  ⚡ 全 ' + allSlotPlans.length + ' 枠のプラン構築完了（' + (Date.now() - t0) + 'ms）');
+
+  const dayDocSlotMap = new Map();
+  allSlotPlans.forEach(function(sp) {
+    [
+      { num: '案1', text: sp.plan1 },
+      { num: '案2', text: sp.plan2 },
+      { num: '案3', text: sp.plan3 }
+    ].forEach(function(pObj) {
+      const docNames = extractCandidateDoctorsFromPlanText2a_(pObj.text);
+      docNames.forEach(function(dName) {
+        const key = sp.date + '_' + dName;
+        if (!dayDocSlotMap.has(key)) dayDocSlotMap.set(key, []);
+        const list = dayDocSlotMap.get(key);
+        if (!list.some(function(x) { return x.slotId === sp.slotId; })) {
+          list.push({ slotId: sp.slotId, label: sp.shortClinicLabel, planNum: pObj.num });
+        }
+      });
+    });
+  });
+
+  allSlotPlans.forEach(function(sp) {
+    const notes = (sp.rawAuditNotes || []).slice();
+    const myDocs = new Set();
+    [sp.plan1, sp.plan2, sp.plan3].forEach(function(pt) {
+      extractCandidateDoctorsFromPlanText2a_(pt).forEach(function(dn) { myDocs.add(dn); });
+    });
+
+    myDocs.forEach(function(dName) {
+      const key = sp.date + '_' + dName;
+      const occurrences = (dayDocSlotMap.get(key) || []).filter(function(x) { return x.slotId !== sp.slotId; });
+      if (occurrences.length > 0) {
+        const otherLabels = occurrences.map(function(x) { return x.label + '[' + x.planNum + ']'; }).join('、');
+        notes.push('⚠️' + dName + '先生は同日他枠（' + otherLabels + '）でも候補（複数枠で確定時は自動でおまとめ打診化）');
+      }
+    });
+
+    sp.auditNote = cleanAuditNoteFormatting_(notes.join(' / ')) || '-';
+  });
+
+  Logger.log('  ⚡ 全 ' + allSlotPlans.length + ' 枠のプラン＆同日重複候補チェック完了（' + (Date.now() - t0) + 'ms）');
 
   const executiveSummary = '対象期間（' + rawContext.periodStart + '〜' + rawContext.periodEnd + '）の医師不在枠は計' + rawContext.unfilledCount + '件です。自拠点の前後医による延長・早出、およびドミナント近隣拠点からの2診目崩しを最優先で打診してください。';
 

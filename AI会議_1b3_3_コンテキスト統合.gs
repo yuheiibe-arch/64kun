@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_1b3_3_コンテキスト統合.gs
- * （各不在枠に対するアプローチ候補の統合・連勤リスト・ナレッジ抽出のメイン構築）
+ * （「野口優輔先生へ延長打診を確認後に井上信明先生へ移動打診」等のセット提案対応版）
  * ============================================================================
  */
 
@@ -93,7 +93,8 @@ function collectCompactContextForAi_(ss) {
     const cleanC = cleanClinicBaseName_(r[2]);
     const expandedTimes = normalizeAndExpandAbsenceTime1b3_(r[3], cleanC);
     const dKey = normKeyForDoc_(r[5]);
-    if (!dKey || masters.absoluteNgDocSet.has(dKey) || masters.sbuSet.has(dKey)) return;
+    const dispName = cleanDisplayDoctorName1b3_(r[5]);
+    if (!dKey || !dispName || masters.absoluteNgDocSet.has(dKey) || masters.sbuSet.has(dKey)) return;
 
     const sameDowSlotNum = Number(String(r[8] || '0').replace(/[^0-9]/g, '')) || 0;
     const subCountNum = Number(String(r[9] || '0').replace(/[^0-9]/g, '')) || 0;
@@ -115,7 +116,8 @@ function collectCompactContextForAi_(ss) {
       if (!spotMap.has(key)) spotMap.set(key, []);
       spotMap.get(key).push({
         rank: r[4],
-        doctor: dKey,
+        docKey: dKey,
+        doctor: dispName,
         sameDowSlotNum: sameDowSlotNum,
         totalCountNum: totalCountNum,
         trackRecordLabel: trackRecordLabel,
@@ -179,7 +181,8 @@ function collectCompactContextForAi_(ss) {
 
         tokens.forEach(function(tok) {
           const k = normKeyForDoc_(tok);
-          if (!k || k === '未充足' || masters.absoluteNgDocSet.has(k)) return;
+          const dispName = cleanDisplayDoctorName1b3_(tok);
+          if (!k || !dispName || k === '未充足' || masters.absoluteNgDocSet.has(k)) return;
           if (masters.streakNgMap.has(k) && masters.streakNgMap.get(k).includes(dateStr)) return;
 
           const headPart = String(tok).replace(/\[.*$/g, '');
@@ -199,20 +202,27 @@ function collectCompactContextForAi_(ss) {
 
           if (pairEval.rank === 'B' && !isSpecialMovable) return;
 
-          const docScore = pairEval.score + (isSbu ? 15 : (isNeg ? 10 : 0));
-          const label = isSbu ? (k + '[★SBU]') : (isFt ? (k + '[常勤・所定休出]') : k);
+          const baseDocScore = pairEval.score + (isSbu ? 15 : (isNeg ? 10 : 0));
+          const baseLabel = isSbu ? (dispName + '[★SBU]') : (isFt ? (dispName + '[常勤・所定休出]') : dispName);
 
           if (docCount >= 2) {
-            if (canDoctorLeaveSourceWithoutCreatingAbsence_(k, s, timeInfo, pairEval)) {
-              movableForTwoDoc.push(label);
-              if (docScore > bestScore) bestScore = docScore;
+            // ★無条件の2診目崩しか、残存医への延長・早出セット付きの2診目崩しかを判定
+            const leaveEval = evaluateDoctorLeaveSourceCondition1b3_(k, s, timeInfo, pairEval, masters);
+            if (leaveEval.canMove) {
+              const finalLabel = leaveEval.conditionNote
+                ? (baseLabel + '｛※' + leaveEval.conditionNote + '｝')
+                : baseLabel;
+              // 延長確認が必要なセット案は、無条件の2診目崩しより少しだけ優先度スコアを下げて並べる
+              const adjScore = leaveEval.conditionNote ? (baseDocScore - 8) : baseDocScore;
+              movableForTwoDoc.push(finalLabel);
+              if (adjScore > bestScore) bestScore = adjScore;
             }
           } else if (docCount === 1 && isSpecialMovable) {
             const isKitakasai = cleanSrcClinic.includes('北葛西');
-            const docHours = parseDocTokenWorkingMinutes1b3_(tok, primaryBand, isKitakasai);
+            const docHours = parseDocTokenWorkingMinutes1b3_(tok, primaryBand, isKitakasai, [s[7], s[8], s[9]].join(' / '));
             if (docHours.rawStartMin <= timeInfo.startMin && docHours.rawEndMin >= timeInfo.endMin) {
-              movableForOneDoc.push(label);
-              if (docScore > bestScore) bestScore = docScore;
+              movableForOneDoc.push(baseLabel);
+              if (baseDocScore > bestScore) bestScore = baseDocScore;
             }
           }
         });
@@ -258,7 +268,7 @@ function collectCompactContextForAi_(ss) {
     const dayConfirmedMap = masters.confirmedDocScheduleByDate.get(dateStr) || new Map();
 
     rawSpots.forEach(function(sp) {
-      const dKey = sp.doctor;
+      const dKey = sp.docKey || normKeyForDoc_(sp.doctor);
       if (prevChecked.docKeySet.has(dKey) || nextChecked.docKeySet.has(dKey)) return;
       if (masters.streakNgMap.has(dKey) && masters.streakNgMap.get(dKey).includes(dateStr)) return;
       if (!isDoctorCompatibleWithSlot_(dKey, dow, cleanTargetClinic, area, timeInfo, '個別', masters)) return;
@@ -293,7 +303,7 @@ function collectCompactContextForAi_(ss) {
 
       verifiedSpots.push({
         rank: sp.rank,
-        doctor: dKey,
+        doctor: sp.doctor,
         trackRecordLabel: sp.trackRecordLabel,
         daySchedule: otherConfirmedLabels.length > 0 ? ('同日確定枠:' + otherConfirmedLabels.join('、')) : '当日空き',
         masterNote: sp.rawNote,
