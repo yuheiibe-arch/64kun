@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 3_AI会議_ドキュメント描画と通知.gs
- * （第2部のお知らせ配信を6.5pt・行間1.0で1ページ完全収容・高速描画版）
+ * （初期値「案1」固定解除・第2部のお知らせ配信1ページ完全収容・高速描画版）
  * ============================================================================
  */
 
@@ -111,7 +111,7 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
   const metaText = [
     '📅 作成日時：' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm') + ' ｜ 対象期間：' + formatDateWithDow_(rawContext.periodStart) + ' ～ ' + formatDateWithDow_(rawContext.periodEnd) + '（対象不在枠：' + rawContext.unfilledCount + '件）',
     '💡 手当ルール：常勤追加勤務手当（1,500円/h）＝『常勤依頼手当』シート記載医師のみ ／ 拠点移動手当（10,000円）＝一律支給（SBUのみ0円）',
-    '✍️ 確定案の書き方：初期値は「案1」です。複数同時打診は「案1, 案2」や「全案」、見送りは「ステイ」を選択してください（同じ先生を複数枠で選んだ場合は、提出後に超募集くんで自動的におまとめ文案が作成されます）。'
+    '✍️ 確定案の書き方：初期値は未選択（空欄）です。採用する案（「案1」「案1, 案2」「全案」等）または「ステイ」を選択してください。担当者を後から決める場合は「あとで決定」を選ぶと決定済み扱いとなり、mnys側へは「未定」で送信されます。'
   ].join('\n');
   body.appendParagraph(metaText).setFontSize(8.5).setForegroundColor('#444444').setLineSpacing(1.25).setSpacingAfter(6);
 
@@ -157,16 +157,8 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
 
       const col2 = col2Lines.join('\n') || '要個別検討';
 
-      let defaultDec = '要検討';
-      if (p.plan1 && !p.plan1.includes('1診・併行募集')) {
-        defaultDec = '案1';
-      } else if (p.plan2 && !p.plan2.includes('1診・併行募集')) {
-        defaultDec = '案2';
-      } else if (p.plan3 && !p.plan3.includes('1診・併行募集')) {
-        defaultDec = '案3';
-      } else if (p.plan1) {
-        defaultDec = 'ステイ';
-      }
+      // ★初期値で「案1」に固定せず、未選択（空欄）にする
+      const defaultDec = '';
 
       tableRows.push([col1, col2, defaultDec, p.assignee || '']);
     });
@@ -175,7 +167,7 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
     styleReadableDocTable_(table, '#1a73e8', [115, 265, 95, 65]);
   });
 
-  // ★第2部：急募のお知らせ配信（改ページで新ページの先頭から開始し、フォント6.5pt・行間1.0・段落余白0で7日分を確実に1ページ内に収める）
+  // 第2部：急募のお知らせ配信（改ページで新ページの先頭から開始し、フォント6.5pt・行間1.0・段落余白0で7日分を確実に1ページ内に収める）
   body.appendPageBreak();
   body.appendParagraph('第2部：急募のお知らせ配信（1週間分・1ページ完全収容テンプレート）')
     .setFontSize(9).setBold(true).setSpacingBefore(0).setSpacingAfter(1);

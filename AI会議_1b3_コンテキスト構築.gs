@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_1b3_コンテキスト構築.gs
- * （本日分除外・明日以降のみ抽出・日付1桁正規化・0回実績除外・玉突き不在防止版）
+ * （確定シフト充足済み枠の完全除外・終日0人枠のみ補完・本日分除外・玉突き不在防止版）
  * ============================================================================
  */
 
@@ -9,6 +9,221 @@ function normalizeDateYmd1b3_(rawDateStr) {
   const m = String(rawDateStr || '').trim().match(/(\d{4})[\/\-年](\d{1,2})[\/\-月](\d{1,2})/);
   if (!m) return String(rawDateStr || '').trim();
   return m[1] + '/' + ('0' + m[2]).slice(-2) + '/' + ('0' + m[3]).slice(-2);
+}
+
+/**
+ * 「終日」や「9:00～21:00」などの表記を標準の「09:00-13:00」形式へ正規化・分解するヘルパー
+ */
+function normalizeAndExpandAbsenceTime1b3_(rawTimeStr, clinicName) {
+  const s = String(rawTimeStr || '').normalize('NFKC').trim();
+  const isKitakasai = String(clinicName || '').includes('北葛西');
+  const nightSlot = isKitakasai ? '18:00-20:00' : '18:00-21:00';
+
+  if (s.includes('終日')) {
+    return ['09:00-13:00', '15:00-18:00', nightSlot];
+  }
+
+  const m = s.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
+  if (!m) return s ? [s] : [];
+
+  const sh = Number(m[1]);
+  const sm = ('0' + m[2]).slice(-2);
+  const eh = Number(m[3]);
+  const em = ('0' + m[4]).slice(-2);
+  const formatted = ('0' + sh).slice(-2) + ':' + sm + '-' + ('0' + eh).slice(-2) + ':' + em;
+
+  if (sh <= 10 && eh >= 20) {
+    return ['09:00-13:00', '15:00-18:00', ('0' + eh).slice(-2) + ':' + em === '20:00' ? '18:00-20:00' : '18:00-21:00'];
+  }
+  if (sh <= 10 && eh === 18) {
+    return ['09:00-13:00', '15:00-18:00'];
+  }
+  if (sh === 15 && eh >= 20) {
+    return ['15:00-18:00', '18:00-' + ('0' + eh).slice(-2) + ':' + em];
+  }
+
+  return [formatted];
+}
+
+/**
+ * ★重要ガード：『最新_当日シフト』（確定シフト）を照合し、
+ * 指定された日付・拠点・診療科・時間帯（absTimeStr）において「すでに確定医師がいて不在が解消しているか」を判定する関数
+ * 戻り値: true = 確定医師がおり不在解消済み（書き出し不要） / false = 本当に医師不在（0人または部分不在）
+ */
+function isSlotAlreadyCoveredByActiveShift1b3_(dateStr, rawClinic, absTimeStr, activeShifts) {
+  const d = normalizeDateYmd1b3_(dateStr);
+  const cleanC = cleanClinicBaseName_(rawClinic);
+  const isInternal = String(rawClinic || '').includes('内科');
+
+  // 当該日・当該拠点・当該診療科の確定シフト行を検索
+  const matchingRows = (activeShifts || []).filter(function(s) {
+    if (normalizeDateYmd1b3_(s[0]) !== d) return false;
+    if (cleanClinicBaseName_(s[2]) !== cleanC) return false;
+    const sIsInternal = String(s[2] || '').includes('内科') || String(s[3] || '').includes('内科');
+    return sIsInternal === isInternal;
+  });
+
+  // 『最新_当日シフト』に行自体が存在しない場合は「終日0人（未充足）」なのでカバーされていない(false)
+  if (matchingRows.length === 0) return false;
+
+  const timeInfo = parseAbsenceTimeline_(absTimeStr);
+  const targetBands = timeInfo.targetBands || ['A'];
+  const row = matchingRows[0];
+
+  // 対象となるすべての時間帯（A/B/C）で確定医師がいて、かつ不在時間帯がカバーされているかチェック
+  for (let i = 0; i < targetBands.length; i++) {
+    const band = targetBands[i];
+    const countCol = band === 'A' ? 4 : (band === 'B' ? 5 : 6);
+    const docsCol = band === 'A' ? 7 : (band === 'B' ? 8 : 9);
+
+    const cntVal = parseInt(String(row[countCol] || '0').replace(/[^0-9]/g, ''), 10) || 0;
+    const docsStr = String(row[docsCol] || '').trim();
+
+    // 人数が0、または医師欄が空欄・「未充足」なら、本当に医師不在なので false（カバーされていない）
+    if (cntVal === 0 || !docsStr || docsStr === '未充足' || docsStr === '-' || docsStr === 'なし') {
+      return false;
+    }
+
+    // 医師欄に時刻指定（例: "〇〇(15:00-17:15)" のみの早上がり等）があり、absTimeStr（例: 17:15-18:00）をカバーできていない場合もチェック
+    const tokens = splitDoctorTokensSafely_(docsStr);
+    let bandFullyCovered = false;
+
+    for (let j = 0; j < tokens.length; j++) {
+      const tok = tokens[j];
+      if (!tok || tok.includes('未充足')) continue;
+      const tm = tok.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
+      if (!tm) {
+        // 時刻のカッコ書きがない通常の確定医師がいれば、その帯はフルタイムでカバーされている
+        bandFullyCovered = true;
+        break;
+      } else {
+        const docStart = Number(tm[1]) * 60 + Number(tm[2]);
+        const docEnd = Number(tm[3]) * 60 + Number(tm[4]);
+        // 確定医師の勤務時間が、今回の募集枠（timeInfo.startMin〜endMin）を包含していればカバー済み
+        if (docStart <= timeInfo.startMin && docEnd >= timeInfo.endMin) {
+          bandFullyCovered = true;
+          break;
+        }
+      }
+    }
+
+    if (!bandFullyCovered) {
+      return false; // 早上がり等で一部時間帯が空いている場合は不在未解消
+    }
+  }
+
+  // すべての対象時間帯に確定医師が配置済み＝「医師不在は解消している」
+  return true;
+}
+
+/**
+ * 『最新_不在枠』をベースにしつつ、
+ * 1) 確定シフトですでに医師が配置され不在が解消している枠（東品川17:15-18:00等）を除外し、
+ * 2) 終日不在等で『最新_不在枠』から漏れている本当に0人の枠（11/8東品川・錦糸町等）だけを補完する関数
+ */
+function recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilledRows, activeShifts, spotCandidates, tomorrowYmd, targetEndYmd) {
+  const combined = [];
+  const seenKeys = new Set();
+
+  const registerRowIfTrulyUnfilled = function(rowArr, isFromPrimaryUnfilledSheet) {
+    const d = normalizeDateYmd1b3_(rowArr[0]);
+    if (!d || d < tomorrowYmd) return;
+    const rawClinic = String(rowArr[1] || '').trim();
+    const cleanC = cleanClinicBaseName_(rawClinic);
+    if (!cleanC || cleanC.includes('バックアップ')) return;
+    const deptTag = rawClinic.includes('内科') ? '内科' : '小児科';
+    const expandedTimes = normalizeAndExpandAbsenceTime1b3_(rowArr[2], cleanC);
+
+    expandedTimes.forEach(function(tStr) {
+      const key = d + '_' + cleanC + '_' + deptTag + '_' + tStr;
+      if (seenKeys.has(key)) return;
+
+      // ★『最新_不在枠』以外のサブソース（mijyusoku募集リスト等）から補完する場合は、
+      // 『最新_当日シフト』の確定シフトにすでに医師がいれば「不在解消済み」なので絶対に書き出さない！
+      // また、『最新_不在枠』自体に残っている枠でも、確定シフトでフルカバーされていれば除外する
+      if (isSlotAlreadyCoveredByActiveShift1b3_(d, rawClinic, tStr, activeShifts)) {
+        return;
+      }
+
+      seenKeys.add(key);
+      const copy = rowArr.slice();
+      copy[0] = d;
+      copy[2] = tStr;
+      combined.push(copy);
+    });
+  };
+
+  // 1. 既存の『最新_不在枠』を登録（確定シフトで解消済みの枠は除外）
+  (rawUnfilledRows || []).forEach(function(r) {
+    registerRowIfTrulyUnfilled(r, true);
+  });
+
+  // 2. 『最新_当日シフト』で医師が空欄・「未充足」・0人になっている枠を復元
+  (activeShifts || []).forEach(function(s) {
+    const d = normalizeDateYmd1b3_(s[0]);
+    if (!d || d < tomorrowYmd || d > targetEndYmd) return;
+    const rawC = String(s[2] || '').trim();
+    const dept = String(s[3] || '').trim();
+    if (!rawC || rawC.includes('バックアップ')) return;
+    const cleanC = cleanClinicBaseName_(rawC);
+    const clinicLabel = dept.includes('内科') ? (cleanC + '（内科）') : cleanC;
+
+    const parseDocCount = function(cntVal, docsVal) {
+      const dStr = String(docsVal || '').trim();
+      if (!dStr || dStr === '未充足' || dStr === '-' || dStr === 'なし') return 0;
+      const n = parseInt(String(cntVal || '').replace(/[^0-9]/g, ''), 10);
+      return isNaN(n) ? 1 : n;
+    };
+
+    const cntA = parseDocCount(s[4], s[7]);
+    const cntB = parseDocCount(s[5], s[8]);
+    const cntC = parseDocCount(s[6], s[9]);
+    const docsA = cntA > 0 ? String(s[7] || '') : 'なし';
+    const docsB = cntB > 0 ? String(s[8] || '') : 'なし';
+    const docsC = cntC > 0 ? String(s[9] || '') : 'なし';
+
+    if (cntA === 0) {
+      registerRowIfTrulyUnfilled([d, clinicLabel, '09:00-13:00', '14,000円', 'なし', docsB, '', '', '', '', '未充足', '', '', ''], false);
+    }
+    if (cntB === 0) {
+      registerRowIfTrulyUnfilled([d, clinicLabel, '15:00-18:00', '13,000円', docsA, docsC, '', '', '', '', '未充足', '', '', ''], false);
+    }
+    if (cntC === 0 && !dept.includes('内科')) {
+      const nightTime = cleanC.includes('北葛西') ? '18:00-20:00' : '18:00-21:00';
+      registerRowIfTrulyUnfilled([d, clinicLabel, nightTime, '15,000円', docsB, 'なし', '', '', '', '', '未充足', '', '', ''], false);
+    }
+  });
+
+  // 3. 『BQシフト状況パック(mijyusoku)』や『最新_個別打診候補』からは、
+  // 「『最新_当日シフト』でも本当に医師がいない（未解消の）枠」のみを補完（確定シフトで解消済みの募集枠は100%スキップ）
+  if (typeof fetchAndDecryptBqMailForResolver_ === 'function') {
+    try {
+      const bqData = fetchAndDecryptBqMailForResolver_();
+      if (bqData && Array.isArray(bqData.mijyusoku)) {
+        bqData.mijyusoku.forEach(function(m) {
+          const d = normalizeDateYmd1b3_(m.d || m.date);
+          if (!d || d < tomorrowYmd || d > targetEndYmd) return;
+          const rawC = String(m.c || m.clinic || '').trim();
+          const rawT = String(m.t || m.time || '').trim();
+          if (!rawC || !rawT || rawC.includes('バックアップ')) return;
+          const wage = String(m.w || m.wage || m.listedWage || '13,000円');
+          const spWage = String(m.sp || m.specialWage || '');
+
+          registerRowIfTrulyUnfilled([
+            d, rawC, rawT, wage, m.prev || 'なし', m.next || 'なし', '', '', '', '', '未充足', spWage, '', ''
+          ], false);
+        });
+      }
+    } catch (e) {}
+  }
+
+  combined.sort(function(a, b) {
+    if (a[0] !== b[0]) return a[0] < b[0] ? -1 : 1;
+    if (a[1] !== b[1]) return a[1] < b[1] ? -1 : 1;
+    return String(a[2] || '') < String(b[2] || '') ? -1 : 1;
+  });
+
+  return combined;
 }
 
 function evaluateValidAdjacentDocsForSlot_(docsStr, actionType, dateStr, dow, targetClinic, targetArea, timeInfo, masters) {
@@ -110,7 +325,7 @@ function canDoctorLeaveSourceWithoutCreatingAbsence_(docKey, srcRow, targetBands
 function collectCompactContextForAi_(ss) {
   const now = new Date();
   const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const tomorrowDt = new Date(todayMidnight.getTime() + 1 * 86400000); // 明日（本日分は除外）
+  const tomorrowDt = new Date(todayMidnight.getTime() + 1 * 86400000);
 
   const tomorrowYmd = Utilities.formatDate(tomorrowDt, 'Asia/Tokyo', 'yyyy/MM/dd');
   const twoWeeksYmd = Utilities.formatDate(new Date(tomorrowDt.getTime() + 14 * 86400000), 'Asia/Tokyo', 'yyyy/MM/dd');
@@ -131,21 +346,6 @@ function collectCompactContextForAi_(ss) {
     return sh.getRange(startR, 1, lastR - startR + 1, numCols).getDisplayValues();
   };
 
-  const rawUnfilledRows = getRows('最新_不在枠').map(function(r) {
-    const copy = r.slice();
-    copy[0] = normalizeDateYmd1b3_(r[0]);
-    return copy;
-  });
-
-  // ★本日分は除外し、必ず「明日（tomorrowYmd）以降」のみを対象とする
-  const unfilledAll = rawUnfilledRows.filter(function(r) { return r[0] && r[0] >= tomorrowYmd; });
-  const within2W = unfilledAll.filter(function(r) { return r[0] <= twoWeeksYmd; });
-  const targetEndYmd = (within2W.length < 10 && unfilledAll.length > within2W.length) ? oneMonthYmd : twoWeeksYmd;
-  const targetUnfilled = unfilledAll.filter(function(r) { return r[0] <= targetEndYmd; });
-
-  const periodStart = targetUnfilled.length > 0 ? targetUnfilled[0][0] : tomorrowYmd;
-  const periodEnd = targetUnfilled.length > 0 ? targetUnfilled[targetUnfilled.length - 1][0] : targetEndYmd;
-
   const activeShifts = getRows('最新_当日シフト').map(function(r) {
     const copy = r.slice();
     copy[0] = normalizeDateYmd1b3_(r[0]);
@@ -154,6 +354,29 @@ function collectCompactContextForAi_(ss) {
   const streakWarnings = getRows('最新_連勤注意リスト');
   const spotCandidates = getRows('最新_個別打診候補');
   const kbRows = getRecentRows('ナレッジシート', 120);
+
+  const rawUnfilledRows = getRows('最新_不在枠').map(function(r) {
+    const copy = r.slice();
+    copy[0] = normalizeDateYmd1b3_(r[0]);
+    return copy;
+  });
+
+  // ★確定シフトで医師がいる枠は「解消済み」として除外し、本当に0人の不在枠のみを抽出・復元
+  const recoveredUnfilledAll = recoverMissingFullDayOrUnfilledRows1b3_(
+    rawUnfilledRows,
+    activeShifts,
+    spotCandidates,
+    tomorrowYmd,
+    twoWeeksYmd
+  );
+
+  const unfilledAll = recoveredUnfilledAll.filter(function(r) { return r[0] && r[0] >= tomorrowYmd; });
+  const within2W = unfilledAll.filter(function(r) { return r[0] <= twoWeeksYmd; });
+  const targetEndYmd = (within2W.length < 10 && unfilledAll.length > within2W.length) ? oneMonthYmd : twoWeeksYmd;
+  const targetUnfilled = unfilledAll.filter(function(r) { return r[0] <= targetEndYmd; });
+
+  const periodStart = targetUnfilled.length > 0 ? targetUnfilled[0][0] : tomorrowYmd;
+  const periodEnd = targetUnfilled.length > 0 ? targetUnfilled[targetUnfilled.length - 1][0] : targetEndYmd;
 
   const dominantMatrix = loadDominantMatrixFromDoc_();
   const masters = buildMasterAndConfirmedShiftIndex_(ss, activeShifts, streakWarnings);
@@ -178,8 +401,8 @@ function collectCompactContextForAi_(ss) {
 
   const spotMap = new Map();
   spotCandidates.forEach(function(r) {
-    const key = makeNormalizedSpotKey_(r[0], r[2], r[3]);
-    if (!spotMap.has(key)) spotMap.set(key, []);
+    const cleanC = cleanClinicBaseName_(r[2]);
+    const expandedTimes = normalizeAndExpandAbsenceTime1b3_(r[3], cleanC);
     const dKey = normKeyForDoc_(r[5]);
     if (!dKey || masters.absoluteNgDocSet.has(dKey) || masters.sbuSet.has(dKey)) return;
 
@@ -198,14 +421,18 @@ function collectCompactContextForAi_(ss) {
       trackRecordLabel = '同拠点別枠' + subCountNum + '回実績';
     }
 
-    spotMap.get(key).push({
-      rank: r[4],
-      doctor: dKey,
-      sameDowSlotNum: sameDowSlotNum,
-      totalCountNum: totalCountNum,
-      trackRecordLabel: trackRecordLabel,
-      rawNote: String(r[13] || '').trim(),
-      latestReplyDetail: latestReplyMap.get(dKey) || ''
+    expandedTimes.forEach(function(tStr) {
+      const key = makeNormalizedSpotKey_(r[0], r[2], tStr);
+      if (!spotMap.has(key)) spotMap.set(key, []);
+      spotMap.get(key).push({
+        rank: r[4],
+        doctor: dKey,
+        sameDowSlotNum: sameDowSlotNum,
+        totalCountNum: totalCountNum,
+        trackRecordLabel: trackRecordLabel,
+        rawNote: String(r[13] || '').trim(),
+        latestReplyDetail: latestReplyMap.get(dKey) || ''
+      });
     });
   });
 
