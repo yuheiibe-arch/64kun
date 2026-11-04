@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_4_ドキュメント提出.gs
- * （『編集くん 64』のカスタム医師・医籍番号・常勤フラグ・特別時給ステイ除外完全対応版）
+ * （A/B/Cの3時間帯別バックアップ医師特定・カスタムコメントのmnysメモ転記・「担当者未定」対応版）
  * ============================================================================
  */
 
@@ -24,7 +24,6 @@ function buildFullTimeDoctorChecker_(ss) {
       .trim();
   };
 
-  // 1. 『常勤依頼手当』シートの医師は全員常勤
   const ftSh = ss.getSheetByName('常勤依頼手当');
   if (ftSh && ftSh.getLastRow() >= 2) {
     const vals = ftSh.getDataRange().getDisplayValues();
@@ -36,7 +35,6 @@ function buildFullTimeDoctorChecker_(ss) {
     }
   }
 
-  // 2. 『最新_連勤注意リスト』に「(常勤」表記がある医師
   const stSh = ss.getSheetByName('最新_連勤注意リスト');
   if (stSh && stSh.getLastRow() >= 2) {
     const vals = stSh.getDataRange().getDisplayValues();
@@ -51,14 +49,13 @@ function buildFullTimeDoctorChecker_(ss) {
     }
   }
 
-  // 3. 『最新_当日シフト』に「(常勤」表記がある医師
   const actSh = ss.getSheetByName('最新_当日シフト');
   if (actSh && actSh.getLastRow() >= 2) {
     const vals = actSh.getDataRange().getDisplayValues();
     for (let r = 1; r < vals.length; r++) {
       [vals[r][7], vals[r][8], vals[r][9]].forEach(function(cellTxt) {
         String(cellTxt || '').split(/[,、，\n]+/).forEach(function(tok) {
-          if (tok.includes('常勤')) {
+          if (!tok.includes('非常勤') && tok.includes('常勤')) {
             const n = norm(tok);
             if (n) ftNames.add(n);
           }
@@ -72,7 +69,7 @@ function buildFullTimeDoctorChecker_(ss) {
     if (cleanLic && ftLicenses.has(cleanLic)) return true;
     const n = norm(docName);
     if (n && ftNames.has(n)) return true;
-    if (actionTextHint && String(actionTextHint).includes('常勤')) return true;
+    if (actionTextHint && !String(actionTextHint).includes('非常勤') && String(actionTextHint).includes('常勤')) return true;
     return false;
   };
 }
@@ -88,6 +85,10 @@ function submitEditedDocToMnys() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const resolver = buildCapsDoctorAndStaffResolver_(ss);
   const isFullTimeChecker = buildFullTimeDoctorChecker_(ss);
+  const backupDocsByDate = (typeof extractBackupDoctorsByDate64_ === 'function')
+    ? extractBackupDoctorsByDate64_(ss, [])
+    : {};
+  const backupUsedIdxByDateBand = {};
 
   const draftMap = (typeof loadLatestDraft64_ === 'function')
     ? loadLatestDraft64_(ss, docId)
@@ -103,7 +104,7 @@ function submitEditedDocToMnys() {
   const seenKeys = new Set();
 
   const addUniqueItem = function(item) {
-    const key = [item.date, item.clinic_name, item.department, item.target_time, item.approach_type, item.target_doctor].join('|');
+    const key = [item.date, item.clinic_name, item.department, item.target_time, item.approach_type, item.target_doctor, item.memo || ''].join('|');
     if (!seenKeys.has(key)) {
       seenKeys.add(key);
       extractedItems.push(item);
@@ -134,6 +135,7 @@ function submitEditedDocToMnys() {
           const slotKey = i + '_' + r;
           const slotDraft = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
           const customDocs = (slotDraft && Array.isArray(slotDraft.customDocs)) ? slotDraft.customDocs : [];
+          const customComment = (slotDraft && slotDraft.customComment) ? String(slotDraft.customComment).trim() : '';
 
           const items = parseEditedDocTableRow_(
             currentDate,
@@ -143,7 +145,10 @@ function submitEditedDocToMnys() {
             row.getCell(3).getText().trim(),
             resolver,
             customDocs,
-            isFullTimeChecker
+            customComment,
+            isFullTimeChecker,
+            backupDocsByDate,
+            backupUsedIdxByDateBand
           );
           items.forEach(addUniqueItem);
         }
@@ -175,19 +180,19 @@ function submitEditedDocToMnys() {
   let outSheet = ss.getSheetByName('ドキュメント確定出力JSON');
   if (!outSheet) outSheet = ss.insertSheet('ドキュメント確定出力JSON');
   outSheet.clearContents();
-  outSheet.getRange(1, 1, 1, 12).setValues([[
-    '日付', '拠点名', '診療科', '不在時間', 'アプローチ種別', '対象医師(正式名補正済)', '医籍番号', '移動元拠点', '特別時給', '担当者', '根拠・採用案', 'JSON出力'
+  outSheet.getRange(1, 1, 1, 13).setValues([[
+    '日付', '拠点名', '診療科', '不在時間', 'アプローチ種別', '対象医師(正式名補正済)', '医籍番号', '移動元拠点', '特別時給', '担当者', 'コメント・メモ', '根拠・採用案', 'JSON出力'
   ]]);
 
   const rowsForSheet = extractedItems.map(function(it, idx) {
     return [
       it.date, it.clinic_name, it.department, it.target_time, it.approach_type,
       it.target_doctor + (it.is_full_time ? '(常勤)' : ''), it.license_no || '', it.from_clinic, it.is_special_wage ? '特別時給' : '通常時給',
-      it.assignee, it.evidence, idx === 0 ? JSON.stringify(extractedItems, null, 2) : ''
+      it.assignee, it.memo || '', it.evidence, idx === 0 ? JSON.stringify(extractedItems, null, 2) : ''
     ];
   });
   outSheet.getRange(2, 7, rowsForSheet.length, 1).setNumberFormat('@');
-  outSheet.getRange(2, 1, rowsForSheet.length, 12).setValues(rowsForSheet);
+  outSheet.getRange(2, 1, rowsForSheet.length, 13).setValues(rowsForSheet);
 
   const targetEmail = props.getProperty('MNYS_RECEIVER_EMAIL');
   if (targetEmail) {
@@ -204,7 +209,7 @@ function submitEditedDocToMnys() {
         JSON.stringify(slice, null, 2)
       );
     }
-    SpreadsheetApp.getUi().alert('✅ 全 ' + extractedItems.length + ' 件（医籍番号・常勤判定連携済）を ' + targetEmail + ' へ送信しました！');
+    SpreadsheetApp.getUi().alert('✅ 全 ' + extractedItems.length + ' 件（医籍番号・常勤判定・コメント連携済）を ' + targetEmail + ' へ送信しました！');
   } else {
     SpreadsheetApp.getUi().alert(
       '✅ 全 ' + extractedItems.length + ' 件を『ドキュメント確定出力JSON』シートに出力しました！\n（※スクリプトプロパティに MNYS_RECEIVER_EMAIL を設定すると mnys.jp へ自動メール送信されます）'
@@ -214,15 +219,32 @@ function submitEditedDocToMnys() {
 
 function mapCustomActionToApproachType_(actionTypeStr, fullText) {
   const s = String(actionTypeStr || '') + ' ' + String(fullText || '');
+  if (s.includes('バックアップ')) return 'バックアップ勤務依頼';
   if (s.includes('移動') || s.includes('2診目崩し')) return '勤務地変更相談';
   if (s.includes('延長')) return '延長相談';
   if (s.includes('早出') || s.includes('前倒')) return '早出相談';
   return '個別アプローチ';
 }
 
-function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assigneeText, resolver, customDocs, isFullTimeChecker) {
-  const dec = String(decisionText || '').trim();
-  // ★「ステイ」および「特別時給(+2,000円〜+5,000円)＋ステイ」の行は個別打診対象から除外
+function detectBandFromTimeStr4_(timeStr) {
+  const m = String(timeStr || '').match(/(\d{1,2}):(\d{2})/);
+  if (!m) return 'A';
+  const sh = Number(m[1]);
+  if (sh < 13) return 'A';
+  if (sh < 18) return 'B';
+  return 'C';
+}
+
+function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assigneeText, resolver, customDocs, customComment, isFullTimeChecker, backupDocsByDate, backupUsedIdxByDateBand) {
+  let dec = String(decisionText || '').trim();
+  let commentText = String(customComment || '').trim();
+
+  const inlineMemoMatch = dec.match(/^(.*?)\s*[（\(]メモ[：:](.+?)[）\)]$/);
+  if (inlineMemoMatch) {
+    dec = inlineMemoMatch[1].trim();
+    if (!commentText) commentText = inlineMemoMatch[2].trim();
+  }
+
   if (!dec || /^(ステイ|特別時給.*ステイ|見送り|なし|不要|ー|\-|保留|要検討|併行募集)$/.test(dec)) return [];
 
   const firstLine = col1Text.split('\n')[0].trim();
@@ -232,8 +254,50 @@ function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assi
   const timeMatch = col1Text.match(/(\d{1,2}:\d{2}-\d{1,2}:\d{2})/);
   const targetTime = timeMatch ? timeMatch[1] : '';
   const isSpecialWage = col1Text.includes('特別時給') || dec.includes('特別時給');
-  const cleanAssignee = resolver.resolveStaff(assigneeText);
 
+  const rawAsg = String(assigneeText || '').trim();
+  const cleanAssignee = (!rawAsg || rawAsg === '担当者未定' || rawAsg === 'あとで決定' || rawAsg === '(未定)' || rawAsg === '未定')
+    ? '未定'
+    : (resolver.resolveStaff(rawAsg) || '未定');
+
+  const memoSuffix = commentText ? ('（メモ: ' + commentText + '）') : '';
+
+  // ★1. 「バックアップ医師に勤務依頼」が選択された場合の処理（A/B/Cの3時間帯ごとにバックアップ医師を特定）
+  if (dec.indexOf('バックアップ医師に勤務依頼') === 0) {
+    const band = detectBandFromTimeStr4_(targetTime);
+    const dayObj = (backupDocsByDate && backupDocsByDate[dateStr]) ? backupDocsByDate[dateStr] : { A: [], B: [], C: [] };
+    const bandBackups = dayObj[band] || [];
+    const bandKey = dateStr + '_' + band;
+    const usedIdx = (backupUsedIdxByDateBand && backupUsedIdxByDateBand[bandKey]) ? backupUsedIdxByDateBand[bandKey] : 0;
+    const pickedBackup = bandBackups[usedIdx] || bandBackups[0] || { name: 'バックアップ医師', licenseNo: '' };
+    if (backupUsedIdxByDateBand) backupUsedIdxByDateBand[bandKey] = usedIdx + 1;
+
+    const resolvedBk = resolver.resolveDoctor(pickedBackup.name, dateStr, 'バックアップ');
+    const bkName = resolvedBk.name || pickedBackup.name;
+    const bkLic = resolvedBk.licenseNo || pickedBackup.licenseNo || '';
+    const isFt = isFullTimeChecker ? isFullTimeChecker(bkName, bkLic, 'バックアップ') : false;
+
+    return [{
+      date: dateStr,
+      clinic_name: clinicName,
+      raw_clinic_name: clinicName,
+      department: dept,
+      target_time: targetTime,
+      time_category: '',
+      approach_type: 'バックアップ勤務依頼',
+      target_doctor: bkName,
+      license_no: bkLic,
+      is_full_time: isFt,
+      from_clinic: '関東バックアップ',
+      is_special_wage: isSpecialWage,
+      assignee: cleanAssignee,
+      memo: commentText,
+      comment: commentText,
+      evidence: '[バックアップ医師に勤務依頼] ' + bkName + '先生' + memoSuffix
+    }];
+  }
+
+  // ★2. カスタム入力で医師サジェスト選択された場合の処理
   const isPresetDec = /^(案[123１２３]|全案)/.test(dec);
   if (!isPresetDec && Array.isArray(customDocs) && customDocs.length > 0) {
     return customDocs.map(function(cd) {
@@ -259,11 +323,14 @@ function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assi
         from_clinic: fromClinic,
         is_special_wage: isSpecialWage,
         assignee: cleanAssignee,
-        evidence: '[編集くんカスタム確定] ' + dec
+        memo: commentText,
+        comment: commentText,
+        evidence: '[編集くんカスタム確定] ' + dec + memoSuffix
       };
     });
   }
 
+  // ★3. 案1〜案3・全案または自由記述カスタム入力の処理
   const planMap = {};
   col2Text.split('\n').forEach(function(line) {
     const m = line.match(/^【案([123１２３])】(.*)$/);
@@ -320,7 +387,9 @@ function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assi
         from_clinic: p.fromClinic,
         is_special_wage: isSpecialWage,
         assignee: cleanAssignee,
-        evidence: '[ドキュメント確定:' + actionObj.label + '] ' + actionObj.text
+        memo: commentText,
+        comment: commentText,
+        evidence: '[ドキュメント確定:' + actionObj.label + '] ' + actionObj.text + memoSuffix
       });
     });
   });
@@ -336,7 +405,9 @@ function parseBundleTableRow_(defaultYear, docColText, slotsColText, decColText,
   const resolvedDoc = resolver.resolveDoctor(rawDoc, '', '');
   const isFt = isFullTimeChecker ? isFullTimeChecker(resolvedDoc.name, resolvedDoc.licenseNo, docColText) : false;
   const assigneeFromDec = dec.replace(/採用|OK|◯|○|[\/／・,\s ]/g, '').trim();
-  const cleanAssignee = resolver.resolveStaff(assigneeFromDec);
+  const cleanAssignee = (!assigneeFromDec || assigneeFromDec === '担当者未定' || assigneeFromDec === 'あとで決定')
+    ? '未定'
+    : (resolver.resolveStaff(assigneeFromDec) || '未定');
 
   const items = [];
   let currentClinic = '';
@@ -367,6 +438,8 @@ function parseBundleTableRow_(defaultYear, docColText, slotsColText, decColText,
           from_clinic: '',
           is_special_wage: false,
           assignee: cleanAssignee,
+          memo: '',
+          comment: '',
           evidence: '[ドキュメント確定:おまとめ打診] ' + resolvedDoc.name + '先生 (' + currentClinic + ' ' + dateStr + ' ' + tRange + ')'
         });
       });

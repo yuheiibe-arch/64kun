@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6c_編集くん64_保存と提出.gs
- * （『編集くん_一時保存』シートへのJSON保存・ドキュメント反映・mnys提出連携）
+ * （カスタムコメントの一時保存・Googleドキュメントアプローチリスト転記・mnys提出連携）
  * ============================================================================
  */
 
@@ -36,8 +36,8 @@ function writeDraftToSheet64_(ss, docId, draftObj, playerStaff) {
   sh.getRange(1, 1, 1, 5).setValues([metaHeaders]).setBackground('#ffc72c').setFontWeight('bold');
   sh.getRange(2, 1, 1, 5).setValues([[nowStr, docId, playerStaff || '未選択', slotEntries.length, jsonStr]]);
 
-  const listHeaders = ['スロットキー', '日付', '拠点', '確定案（一時保存）', '特定済カスタム医師（医籍番号）', '担当者名（一時保存）', '更新時刻'];
-  sh.getRange(4, 1, 1, 7).setValues([listHeaders]).setBackground('#0046ad').setFontColor('#ffffff').setFontWeight('bold');
+  const listHeaders = ['スロットキー', '日付', '拠点', '確定案（一時保存）', '特定済カスタム医師（医籍番号）', '担当者名（一時保存）', 'カスタムコメント・メモ', '更新時刻'];
+  sh.getRange(4, 1, 1, 8).setValues([listHeaders]).setBackground('#0046ad').setFontColor('#ffffff').setFontWeight('bold');
 
   if (slotEntries.length > 0) {
     const rows = slotEntries.map(([k, v]) => {
@@ -51,10 +51,11 @@ function writeDraftToSheet64_(ss, docId, draftObj, playerStaff) {
         v.decision || '',
         cDocsText,
         v.assignee || '',
+        v.customComment || '',
         v.updatedTimeStr || nowStr
       ];
     });
-    sh.getRange(5, 1, rows.length, 7).setValues(rows);
+    sh.getRange(5, 1, rows.length, 8).setValues(rows);
   }
 }
 
@@ -75,6 +76,7 @@ function saveHenshukunDraft(payload) {
       draft.slots[slotKey] = {
         decision: val.decision,
         assignee: val.assignee,
+        customComment: String(val.customComment || '').trim(),
         customDocs: Array.isArray(val.customDocs) ? val.customDocs : [],
         dateLabel: val.dateLabel || '',
         clinicTitle: val.clinicTitle || '',
@@ -121,11 +123,22 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
             const rawC0 = cleanSidebarDisplayText_(row.getCell(0).getText());
             const c0Lines = rawC0.split('\n');
             c0Lines[0] = formatClinicTitle64_(c0Lines[0]);
-            const c1 = cleanSidebarDisplayText_(row.getCell(1).getText());
+
+            // 既存の「📝コメント：...」を除いた上で、新しいコメントがあればアプローチリスト（2列目＆3列目）に転記
+            let c1 = cleanSidebarDisplayText_(row.getCell(1).getText())
+              .replace(/\n*📝コメント[：:].*$/g, '')
+              .trim();
+            const cmnt = String(item.customComment || '').trim();
+            if (cmnt) {
+              c1 += '\n📝コメント：' + cmnt;
+            }
+
+            const baseDec = String(item.decision || '').trim();
+            const fullDecText = (cmnt && baseDec) ? (baseDec + '（メモ：' + cmnt + '）') : baseDec;
 
             row.getCell(0).setText(c0Lines.join('\n'));
             row.getCell(1).setText(c1);
-            row.getCell(2).setText(String(item.decision || '').trim());
+            row.getCell(2).setText(fullDecText);
             row.getCell(3).setText(String(item.assignee || '').trim());
             row.getCell(0).editAsText().setFontSize(8.5);
             row.getCell(1).editAsText().setFontSize(8.5);

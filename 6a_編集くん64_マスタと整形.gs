@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6a_編集くん64_マスタと整形.gs
- * （日付スラッシュ分割バグ修正・異体字/漢字ブレ強化・括弧内メモ保護分割版）
+ * （モーダル大画面化1440x920・異体字/漢字ブレ強化・括弧内メモ保護分割版）
  * ============================================================================
  */
 
@@ -14,8 +14,8 @@ const HENSHUKUN_CONFIG = {
 
 function openHenshukunModal() {
   const html = HtmlService.createHtmlOutput(buildHenshukun64Html_())
-    .setWidth(1260)
-    .setHeight(850);
+    .setWidth(1440)
+    .setHeight(920);
   SpreadsheetApp.getUi().showModalDialog(html, '🎮 編集くん 64 ― AI超募集MTG シフト確定スタジオ');
 }
 
