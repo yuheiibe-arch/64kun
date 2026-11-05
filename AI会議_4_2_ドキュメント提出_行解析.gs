@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_4_2_ドキュメント提出_行解析.gs
- * （提出時の募集シフト長時間枠への自動合わせ込み・特別時給交渉・要延長セット・指定医師抽出版）
+ * （提出時の募集シフト「bosyu」長時間枠への自動合わせ込み・特別時給交渉・要延長セット・指定医師抽出版）
  * ============================================================================
  */
 
@@ -21,12 +21,12 @@ function getSubmitRecruitContext4_2_() {
   const spotCands = getRows('最新_個別打診候補');
 
   const recruitSlotsIndex = new Map();
-  const addIdx = function(dRaw, rawClinic, rawTime) {
+  const addIdx = function(dRaw, rawClinic, rawTime, deptHint) {
     if (typeof normalizeDateYmd1b3_ !== 'function') return;
     const d = normalizeDateYmd1b3_(dRaw);
     const cleanC = cleanClinicBaseName_(rawClinic);
     if (!d || !cleanC || cleanC.includes('バックアップ')) return;
-    const deptTag = String(rawClinic || '').includes('内科') ? '内科' : '小児科';
+    const deptTag = (String(rawClinic || '').includes('内科') || String(deptHint || '').includes('内科')) ? '内科' : '小児科';
     const key = d + '_' + cleanC + '_' + deptTag;
     if (!recruitSlotsIndex.has(key)) recruitSlotsIndex.set(key, []);
     const list = recruitSlotsIndex.get(key);
@@ -35,15 +35,15 @@ function getSubmitRecruitContext4_2_() {
     });
   };
 
-  rawUnfilled.forEach(function(r) { addIdx(r[0], r[1], r[2]); });
-  spotCands.forEach(function(r) { addIdx(r[0], r[2], r[3]); });
+  rawUnfilled.forEach(function(r) { addIdx(r[0], r[1], r[2], ''); });
+  spotCands.forEach(function(r) { addIdx(r[0], r[2], r[3], ''); });
 
   if (typeof fetchAndDecryptBqMailForResolver_ === 'function') {
     try {
       const bqData = fetchAndDecryptBqMailForResolver_();
       if (bqData) {
-        (bqData.mijyusoku || []).concat(bqData.boshu || []).forEach(function(m) {
-          addIdx(m.d || m.date, m.c || m.clinic, m.t || m.time);
+        (bqData.bosyu || []).concat(bqData.mijyusoku || []).concat(bqData.boshu || []).forEach(function(m) {
+          addIdx(m.d || m.date, m.c || m.clinic, m.t || m.time, m.dp || m.dept || '');
         });
       }
     } catch (e) {}
@@ -102,7 +102,7 @@ function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assi
   const rawTargetTime = timeMatch ? timeMatch[1] : '';
 
   // ★ドキュメント上の表記が「15:00-16:00」等の短い不在時間になっていても、
-  //   募集シフトの長い募集時間（例：「15:00-18:00」や「15:00-17:00」）へ自動で合わせてから提出する！
+  //   募集シフト（bosyu）の長い募集時間（例：「15:00-18:00」や「15:00-17:00」）へ自動で合わせてから提出する！
   let targetTime = rawTargetTime;
   if (rawTargetTime && typeof expandToLongestRecruitSlotTime1b3_ === 'function') {
     const ctx = getSubmitRecruitContext4_2_();

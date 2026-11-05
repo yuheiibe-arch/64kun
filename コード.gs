@@ -18,21 +18,60 @@ function normalizeDocName_(name) {
 }
 
 /**
+ * ステージング（テスト環境）や自動配送テストのメールかを判定するヘルパー
+ */
+function isStagingOrTestMail_(message, bodyText, doctorName) {
+  const fromStr = String(message.getFrom() || '').toLowerCase();
+  const body = String(bodyText || '');
+  const doc = String(doctorName || '');
+  if (fromStr.includes('staging')) return true;
+  if (body.includes('staging.capsdoctor365.jp')) return true;
+  if (doc.includes('自動確認医師') || doc.includes('テスト')) return true;
+  if (body.includes('【自動確認】')) return true;
+  return false;
+}
+
+/**
+ * 「2026年11月15日」などの日本語日付を「2026/11/15」に正規化するヘルパー
+ */
+function normalizeCancelTargetDateYmd_(rawDateStr) {
+  const m = String(rawDateStr || '').match(/(\d{4})[年\/\-](\d{1,2})[月\/\-](\d{1,2})/);
+  if (!m) return '';
+  return m[1] + '/' + ('0' + m[2]).slice(-2) + '/' + ('0' + m[3]).slice(-2);
+}
+
+/**
+ * 『シフトキャンセル履歴』シートを取得（なければ自動作成）するヘルパー
+ */
+function ensureShiftCancelHistorySheet_(ss) {
+  const sheetName = 'シフトキャンセル履歴';
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) {
+    sh = ss.insertSheet(sheetName);
+    const headers = ['管理番号', 'キャンセル承認日時', '医師名', 'キャンセル対象日', '拠点名', '診療科', '時間帯', 'メールID'];
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setBackground('#c53929').setFontColor('#ffffff').setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+/**
  * 1. Gmailから「【要確認】医師からのお問い合わせ」を検索し、『医師質問』シートに自動転記
- * ※取りこぼし防止のため直近7日間の未登録メールIDをすべて回収します
+ * ※ステージング環境や自動確認テストメールは除外します
  */
 function getQuestionEmailsFromGmail_Final(spreadsheetId) {
   const sheetName = '医師質問';
   const timezone = 'Asia/Tokyo';
   const sourceEmail = 'doctor-support@caps365.jp';
 
-  const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(sheetName);
+  const ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
-    console.error(`シート「${sheetName}」が見つかりません。`);
+    console.error('シート「' + sheetName + '」が見つかりません。');
     return;
   }
 
-  const searchQuery = `from:${sourceEmail} subject:("【要確認】医師からのお問い合わせ") newer_than:7d`;
+  const searchQuery = 'from:' + sourceEmail + ' subject:("【要確認】医師からのお問い合わせ") newer_than:7d';
   const threads = GmailApp.search(searchQuery, 0, 80);
 
   const lastRow = sheet.getLastRow();
@@ -45,18 +84,20 @@ function getQuestionEmailsFromGmail_Final(spreadsheetId) {
 
   const newItems = [];
 
-  threads.forEach(thread => {
-    thread.getMessages().forEach(message => {
+  threads.forEach(function(thread) {
+    thread.getMessages().forEach(function(message) {
       const messageId = message.getId();
       if (existingIds.has(messageId)) return;
 
       const body = message.getPlainBody();
-      const doctorMatch = body.match(/【医師名】：(.+)/);
-      const contentMatch = body.match(/【内容】:\s*([\s\S]+)/);
+      const doctorMatch = body.match(/【医師名】[：:]\s*(.+)/);
+      const contentMatch = body.match(/【内容】[：:]\s*([\s\S]+)/);
 
       if (doctorMatch && contentMatch) {
         const doctorName = doctorMatch[1].trim();
         const content = contentMatch[1].trim();
+        if (isStagingOrTestMail_(message, body, doctorName)) return;
+
         const msgDate = message.getDate();
         const receivedTimestamp = Utilities.formatDate(msgDate, timezone, 'yyyy/MM/dd HH:mm:ss');
 
@@ -69,32 +110,46 @@ function getQuestionEmailsFromGmail_Final(spreadsheetId) {
     });
   });
 
-  newItems.sort((a, b) => a.timeMs - b.timeMs);
-  for (const item of newItems) {
+  newItems.sort(function(a, b) { return a.timeMs - b.timeMs; });
+  for (let i = 0; i < newItems.length; i++) {
     lastNumber++;
-    item.row[0] = lastNumber;
-    sheet.appendRow(item.row);
+    newItems[i].row[0] = lastNumber;
+    sheet.appendRow(newItems[i].row);
   }
 
   console.log(newItems.length + '件の質問・返信メールを転記しました。');
 }
 
 /**
- * 2. Gmailから「お問い合わせスタッフ送信」を検索し、『DS回答』シートに自動転記
+ * 2. Gmailから「お問い合わせスタッフ送信」を検索し、
+ *   - 通常メールは『DS回答』シートへ自動転記
+ *   - 「のキャンセル申請が承認されました。」メールは『シフトキャンセル履歴』シートへ自動蓄積（設計1）
  */
 function getAnswerEmailsFromGmail_Final(spreadsheetId) {
   const sheetName = 'DS回答';
   const timezone = 'Asia/Tokyo';
   const sourceEmail = 'doctor-support@caps365.jp';
 
-  const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(sheetName);
+  const ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
-    console.error(`シート「${sheetName}」が見つかりません。`);
+    console.error('シート「' + sheetName + '」が見つかりません。');
     return;
   }
 
-  const searchQuery = `from:${sourceEmail} subject:("お問い合わせスタッフ送信") newer_than:7d`;
-  const threads = GmailApp.search(searchQuery, 0, 80);
+  const cancelSheet = ensureShiftCancelHistorySheet_(ss);
+  const cancelLastRow = cancelSheet.getLastRow();
+  const existingCancelIds = cancelLastRow > 1
+    ? new Set(cancelSheet.getRange(2, 8, cancelLastRow - 1, 1).getDisplayValues().flat().filter(Boolean))
+    : new Set();
+  let lastCancelNumber = (cancelLastRow > 1 && !isNaN(Number(cancelSheet.getRange(cancelLastRow, 1).getValue())))
+    ? Number(cancelSheet.getRange(cancelLastRow, 1).getValue())
+    : 0;
+
+  // 初回（キャンセル履歴が空のとき）は直近30日分をスキャンして過去のキャンセルも一括回収する
+  const daysWindow = cancelLastRow <= 1 ? '30d' : '7d';
+  const searchQuery = 'from:' + sourceEmail + ' subject:("お問い合わせスタッフ送信") newer_than:' + daysWindow;
+  const threads = GmailApp.search(searchQuery, 0, 100);
 
   const lastRow = sheet.getLastRow();
   const existingIds = lastRow > 1
@@ -105,61 +160,87 @@ function getAnswerEmailsFromGmail_Final(spreadsheetId) {
     : 0;
 
   const newItems = [];
+  const newCancelItems = [];
 
-  threads.forEach(thread => {
-    thread.getMessages().forEach(message => {
+  threads.forEach(function(thread) {
+    thread.getMessages().forEach(function(message) {
       const messageId = message.getId();
-      if (existingIds.has(messageId)) return;
-
       const body = message.getPlainBody();
+      const doctorMatch = body.match(/【医師名】[：:]\s*(.+)/);
+      const contentMatch = body.match(/【内容】[：:]\s*([\s\S]+)/);
+      if (!doctorMatch || !contentMatch) return;
+
+      const doctorName = doctorMatch[1].trim();
+      const content = contentMatch[1].trim();
+      if (isStagingOrTestMail_(message, body, doctorName)) return;
+
+      const msgDate = message.getDate();
+      const sentTimestamp = Utilities.formatDate(msgDate, timezone, 'yyyy/MM/dd HH:mm:ss');
+
+      // ★設計1：シフトキャンセル承認メールの自動回収
       if (body.includes('のキャンセル申請が承認されました。')) {
+        if (existingCancelIds.has(messageId)) return;
+        const cancelMatch = content.match(/(\d{4}年\d{1,2}月\d{1,2}日)[\s ]+([^\s ]+)[\s ]+([^\s ]+)[\s ]+(\d{1,2}:\d{2}[~～\-]\d{1,2}:\d{2})※?のキャンセル申請が承認されました/);
+        const targetDateYmd = cancelMatch ? normalizeCancelTargetDateYmd_(cancelMatch[1]) : '';
+        const clinicName = cancelMatch ? cancelMatch[2].trim() : '';
+        const deptName = cancelMatch ? cancelMatch[3].trim() : '';
+        const timeRange = cancelMatch ? cancelMatch[4].replace(/[~～]/g, '-').trim() : '';
+
+        if (targetDateYmd) {
+          existingCancelIds.add(messageId);
+          newCancelItems.push({
+            timeMs: msgDate.getTime(),
+            row: [0, sentTimestamp, doctorName, targetDateYmd, clinicName, deptName, timeRange, messageId]
+          });
+        }
         return;
       }
 
-      const doctorMatch = body.match(/【医師名】：(.+)/);
-      const contentMatch = body.match(/【内容】:\s*([\s\S]+)/);
+      // 通常のスタッフ送信メール（7日以内）
+      if (existingIds.has(messageId)) return;
+      if ((Date.now() - msgDate.getTime()) > 8 * 24 * 60 * 60 * 1000) return;
 
-      if (doctorMatch && contentMatch) {
-        const doctorName = doctorMatch[1].trim();
-        const content = contentMatch[1].trim();
-        const msgDate = message.getDate();
-        const sentTimestamp = Utilities.formatDate(msgDate, timezone, 'yyyy/MM/dd HH:mm:ss');
-
-        let sender = '（不明）';
-        const lines = content.trim().split('\n').map(l => l.trim()).filter(Boolean);
-        const lastLine = lines.length > 0 ? lines[lines.length - 1] : '';
-        const senderMatch = lastLine.replace(/^(ドクターサポート部|ドクターサポート事務局)[\s\u3000]*/, '');
-        if (senderMatch && senderMatch.length <= 15) {
-          sender = senderMatch;
-        }
-
-        const urlMatch = content.match(/https?:\/\/[^\s]+/);
-        const url = urlMatch ? urlMatch[0] : '';
-
-        existingIds.add(messageId);
-        newItems.push({
-          timeMs: msgDate.getTime(),
-          row: [0, sentTimestamp, doctorName, content, sender, url, messageId]
-        });
+      let sender = '（不明）';
+      const lines = content.trim().split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
+      const lastLine = lines.length > 0 ? lines[lines.length - 1] : '';
+      const senderMatch = lastLine.replace(/^(ドクターサポート部|ドクターサポート事務局)[\s\u3000]*/, '');
+      if (senderMatch && senderMatch.length <= 15) {
+        sender = senderMatch;
       }
+
+      const urlMatch = content.match(/https?:\/\/[^\s]+/);
+      const url = urlMatch ? urlMatch[0] : '';
+
+      existingIds.add(messageId);
+      newItems.push({
+        timeMs: msgDate.getTime(),
+        row: [0, sentTimestamp, doctorName, content, sender, url, messageId]
+      });
     });
   });
 
-  newItems.sort((a, b) => a.timeMs - b.timeMs);
-  for (const item of newItems) {
+  newItems.sort(function(a, b) { return a.timeMs - b.timeMs; });
+  for (let i = 0; i < newItems.length; i++) {
     lastNumber++;
-    item.row[0] = lastNumber;
-    sheet.appendRow(item.row);
+    newItems[i].row[0] = lastNumber;
+    sheet.appendRow(newItems[i].row);
   }
 
-  console.log(newItems.length + '件の回答・打診メールを転記しました。');
+  newCancelItems.sort(function(a, b) { return a.timeMs - b.timeMs; });
+  for (let j = 0; j < newCancelItems.length; j++) {
+    lastCancelNumber++;
+    newCancelItems[j].row[0] = lastCancelNumber;
+    cancelSheet.appendRow(newCancelItems[j].row);
+  }
+
+  console.log(newItems.length + '件の回答・打診メール、および ' + newCancelItems.length + '件のシフトキャンセル履歴を転記しました。');
 }
 
 /**
- * 3. 『医師質問』と『DS回答』を双方向突合し、『ナレッジシート』（G列:日時、H列:NG候補フラグ付き）を自動生成
+ * 3. 『医師質問』と『DS回答』を双方向突合し、『ナレッジシート』を自動生成
  */
 function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
-  const ss = SpreadsheetApp.openById(spreadsheetId);
+  const ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
   const questionSheet = ss.getSheetByName('医師質問');
   const answerSheet = ss.getSheetByName('DS回答');
   const kbSheet = ss.getSheetByName('ナレッジシート');
@@ -187,8 +268,8 @@ function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
 
   const MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
-  const isShiftPitch = (text) => {
-    return /ご相談|ご変更いただくことは可能でしょうか|延長していただくことは可能でしょうか|前倒ししていただくことは可能でしょうか|医師不在となる可能性/.test(String(text || ''));
+  const isShiftPitch = function(text) {
+    return /ご相談|ご変更いただくことは可能でしょうか|延長していただくことは可能でしょうか|前倒ししていただくことは可能でしょうか|医師不在となる可能性|ご勤務につきまして/.test(String(text || ''));
   };
 
   // ①【スタッフ打診 ➔ 医師返信】の突合（シフト調整パターン）
@@ -234,8 +315,8 @@ function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
       kbSheet.appendRow([
         lastKbNumber,
         docName,
-        `【医師返信】\n${docReply}`,
-        `【スタッフ打診】\n${aContent}`,
+        '【医師返信】\n' + docReply,
+        '【スタッフ打診】\n' + aContent,
         aSender,
         aUrl,
         dtStr,
@@ -304,19 +385,23 @@ function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
 }
 
 /**
- * H列に入れる「NG候補フラグ」の自動判定
+ * ★強化版：H列に入れる「NG候補・種別フラグ」の自動判定
+ * （「18時までなら可能」「延長不可」などの時間条件付き返信も逃さずフラグ付け）
  */
 function detectNgOrConditionFlag_(docText, staffText) {
   const d = String(docText || '');
   const s = String(staffText || '');
 
+  if (/(\d{1,2})\s*(?:時|:00)\s*(?:までなら|まででしたら|までであれば|までしか|で上が|以降は難|以降は不可|以降は厳)|延長は(?:難|不可|厳)|早出は(?:難|不可|厳)/.test(d)) {
+    return 'シフト調整（時間条件・上限あり）';
+  }
   if (/からの勤務のため|遠方|以降は難しい|曜日は.*不可能|曜日は.*難しい|より早く着くことは不可能|2診体制でしたら|2診なら|応援に行く事は可能|変更いただいても大丈夫|働けるので声をかけて/.test(d)) {
     return '★要確認（交渉注意医師シート記載候補）';
   }
-  if (/ご快諾いただき|にてご勤務確定|勤務変更.*承知|延長問題ありません/.test(d + '\n' + s)) {
+  if (/ご快諾いただき|にてご勤務確定|勤務変更.*承知|変更の旨承知|延長問題ありません|どちらも可能です/.test(d + '\n' + s)) {
     return 'シフト調整（承諾・成立）';
   }
-  if (/難しいです|困難です|予定を入れてしまいました|お力になれず|都合がつかず/.test(d)) {
+  if (/難しいです|困難です|予定を入れてしまいました|お力になれず|都合がつかず|可能な日はありません/.test(d)) {
     return 'シフト調整（単発辞退）';
   }
   return '一般連絡';
@@ -333,14 +418,14 @@ function exportToTxtFile(spreadsheetId) {
   var textBuffer = [];
 
   for (var i = 1; i < data.length; i++) {
-    var id = data[i][0];         // A列: 管理番号
-    var questioner = data[i][1]; // B列: 質問者（医師名）
-    var question = data[i][2];   // C列: 質問内容・医師返信
-    var answer = data[i][3];     // D列: 回答・スタッフ打診
-    var answerer = data[i][4];   // E列: 回答者
-    var refUrl = data[i][5];     // F列: 参考URL
-    var dt = data[i][6] || '';   // G列: 日時
-    var flag = data[i][7] || ''; // H列: NG候補・種別フラグ
+    var id = data[i][0];
+    var questioner = data[i][1];
+    var question = data[i][2];
+    var answer = data[i][3];
+    var answerer = data[i][4];
+    var refUrl = data[i][5];
+    var dt = data[i][6] || '';
+    var flag = data[i][7] || '';
 
     if (question && answer) {
       var block = "【管理番号】 " + id + "\n" +

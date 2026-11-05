@@ -1,13 +1,10 @@
 /**
  * ============================================================================
  * AI会議_1b2_医師条件とタイムライン.gs
- * （タイムライン解析・括弧内メモ保護分割・医師マスタ＆確定シフト逆引き辞書）
+ * （タイムライン解析・シフトキャンセル日ブロック［設計1］・日別メール時間制約［設計2］統合版）
  * ============================================================================
  */
 
-/**
- * 括弧 (...) や [...] の内部にある「、」「/」では絶対に分割せず、医師単位で正確に分割する関数
- */
 function splitDoctorTokensSafely_(rawStr) {
   const s = String(rawStr || '');
   if (!s || s === 'なし' || s === '未充足') return [];
@@ -34,9 +31,6 @@ function splitDoctorTokensSafely_(rawStr) {
   return results;
 }
 
-/**
- * 1日のタイムライン（09:00〜21:00/20:00、休診13:00〜15:00）上で任意の不在区間を解析する関数
- */
 function parseAbsenceTimeline_(absTimeStr) {
   const m = String(absTimeStr || '').match(/(\d{1,2}):(\d{2})\s*[\-〜～]\s*(\d{1,2}):(\d{2})/);
   if (!m) {
@@ -87,12 +81,34 @@ function isFtConditionCompatibleWithTarget_(condStr, targetClinic, targetArea) {
 }
 
 /**
- * 医師マスタ条件（交渉注意・交渉しやすい医師メモ）と対象枠の適合チェック（内部思考フィルタ）
+ * 医師マスタ条件 ＋ 【設計1：シフトキャンセル履歴】 ＋ 【設計2：メール返信の日別時間制約（18時まで等）】の統合適合チェック
  */
-function isDoctorCompatibleWithSlot_(docKey, dow, targetClinic, targetArea, timeInfo, actionType, masters) {
+function isDoctorCompatibleWithSlot_(docKey, dow, targetClinic, targetArea, timeInfo, actionType, masters, dateStrOpt) {
   const cleanTarget = cleanClinicBaseName_(targetClinic);
   const cautionStructMap = masters.cautionStructMap;
   const negotiableMap = masters.negotiableMap;
+
+  // ★設計1＆設計2：対象日（dateStrOpt）が指定されている場合、キャンセル日ブロックとメール時間制約をチェック
+  if (dateStrOpt) {
+    // 1) その日にシフトキャンセルを出している医師は終日提案不可（例：11/15・11/26の加藤雅崇先生）
+    if (masters.canceledDatesByDoc && masters.canceledDatesByDoc.has(docKey)) {
+      if (masters.canceledDatesByDoc.get(docKey).has(dateStrOpt)) {
+        return false;
+      }
+    }
+    // 2) メール返信でその日の時間上限（「18時までなら可能」等）や辞退がある医師をブロック（例：11/8の柿本優先生）
+    if (masters.dateMailConstraintsMap) {
+      const dc = masters.dateMailConstraintsMap.get(dateStrOpt + '_' + docKey);
+      if (dc) {
+        if (dc.fullDayDeclined && actionType === '個別') return false;
+        if (timeInfo && timeInfo.endMin > dc.maxEndMin) return false;
+        if (timeInfo && timeInfo.startMin < dc.minStartMin) return false;
+        if (actionType === '延長' && dc.noExtend) return false;
+        if (actionType === '早出' && dc.noEarly) return false;
+        if (actionType === '移動' && dc.noMove) return false;
+      }
+    }
+  }
 
   if (cautionStructMap.has(docKey)) {
     const c = cautionStructMap.get(docKey);
@@ -122,9 +138,6 @@ function isDoctorCompatibleWithSlot_(docKey, dow, targetClinic, targetArea, time
   return true;
 }
 
-/**
- * 各マスタシートと『最新_当日シフト』（確定シフト）を読み込んで構造化する関数
- */
 function buildMasterAndConfirmedShiftIndex_(ss, activeShifts, streakWarnings) {
   const getRows = function(name) {
     const sh = ss.getSheetByName(name);
@@ -199,7 +212,7 @@ function buildMasterAndConfirmedShiftIndex_(ss, activeShifts, streakWarnings) {
     }
   });
 
-  // 4. 『最新_連勤注意リスト』
+  // 4. 『最新_連勤注意リスト』 ＋ 【設計1：シフトキャンセル履歴の日付統合】
   const streakNgMap = new Map();
   streakWarnings.forEach(function(w) {
     const k = normKeyForDoc_(w[1]);
@@ -209,7 +222,24 @@ function buildMasterAndConfirmedShiftIndex_(ss, activeShifts, streakWarnings) {
     }
   });
 
-  // 5. 『最新_当日シフト』（確定シフト）の日付×医師インデックス
+  const canceledDatesByDoc = (typeof loadShiftCancelDatesByDoctor1b2_ === 'function')
+    ? loadShiftCancelDatesByDoctor1b2_(ss)
+    : new Map();
+
+  // キャンセル日も streakNgMap に合流させることで、既存のすべての NG 日チェックでも自動的に弾かれるようにする
+  canceledDatesByDoc.forEach(function(dateSet, docKey) {
+    const joinedDates = Array.from(dateSet).join(',');
+    if (joinedDates) {
+      streakNgMap.set(docKey, (streakNgMap.get(docKey) ? streakNgMap.get(docKey) + ',' : '') + joinedDates);
+    }
+  });
+
+  // 5. 【設計2】医師返信メールからの日別・時間上限（例：11/8 柿本先生の「18時までなら可能」）マップ構築
+  const dateMailConstraintsMap = (typeof buildDateSpecificMailConstraintsMap1b2_ === 'function')
+    ? buildDateSpecificMailConstraintsMap1b2_(ss)
+    : new Map();
+
+  // 6. 『最新_当日シフト』（確定シフト）の日付×医師インデックス
   const confirmedDocScheduleByDate = new Map();
   activeShifts.forEach(function(r) {
     const d = String(r[0] || '').trim();
@@ -249,6 +279,8 @@ function buildMasterAndConfirmedShiftIndex_(ss, activeShifts, streakWarnings) {
     ftAllowDocSet: ftAllowDocSet,
     ftAllowCondMap: ftAllowCondMap,
     streakNgMap: streakNgMap,
+    canceledDatesByDoc: canceledDatesByDoc,
+    dateMailConstraintsMap: dateMailConstraintsMap,
     confirmedDocScheduleByDate: confirmedDocScheduleByDate
   };
 }

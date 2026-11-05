@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_2b_プロンプトと急募配信.gs
- * （19:00-21:00と18:00-21:00の二重表示防止・確定シフト充足済み除外・1P収容版）
+ * （BQシフト状況パック「bosyu」対応・重複枠は長い募集時間を採用・1P収容版）
  * ============================================================================
  */
 
@@ -76,15 +76,25 @@ function supplementNearTermUnfilledSlots_(existingSlots, windowStartYmd, windowE
     expanded.forEach(function(t) {
       if (!t) return;
 
-      // ★すでに同日・同拠点で時間帯が重なる枠（例：19:00-21:00 に対する 18:00-21:00）があれば二重登録しない！
-      const hasOverlap = combined.some(function(ex) {
+      // 同日・同拠点で時間帯が重なる枠があるかチェックし、より長い募集時間の方を採用する
+      const existingIdx = combined.findIndex(function(ex) {
         if (ex.date !== d || ex.clinic !== cleanC) return false;
         if (typeof isTimeRangeOverlapping1b3_ === 'function') {
           return isTimeRangeOverlapping1b3_(ex.absenceTime, t);
         }
         return ex.absenceTime === t;
       });
-      if (hasOverlap) return;
+
+      if (existingIdx !== -1) {
+        if (typeof parseAbsenceTimeline_ === 'function') {
+          const exTl = parseAbsenceTimeline_(combined[existingIdx].absenceTime);
+          const newTl = parseAbsenceTimeline_(t);
+          if (newTl.durationHours > exTl.durationHours) {
+            combined[existingIdx].absenceTime = t;
+          }
+        }
+        return;
+      }
 
       if (!isPrimary && typeof isSlotAlreadyCoveredByActiveShift1b3_ === 'function' && activeShifts.length > 0) {
         if (isSlotAlreadyCoveredByActiveShift1b3_(d, rawClinic, t, activeShifts)) {
@@ -104,20 +114,22 @@ function supplementNearTermUnfilledSlots_(existingSlots, windowStartYmd, windowE
     });
   };
 
-  // 1. 既存の不在枠（『最新_不在枠』で確定している 19:00-21:00 等を最優先登録）
+  // 1. 既存の不在枠（『最新_不在枠』等からすでに募集シフト時間へ拡張された枠）を登録
   (existingSlots || []).forEach(function(s) {
     if (s.dept && s.dept !== '小児科') return;
     addSlotItemIfTrulyUnfilled(s.date, s.clinic, s.absenceTime, s.listedWage, s.specialWage, true);
   });
 
-  // 2. 『BQシフト状況パック(mijyusoku)』から、まだ登録されていない時間帯の未充足枠のみ補完
+  // 2. 『BQシフト状況パック（bosyu / mijyusoku）』から未登録の枠・より長い募集枠を補完
   if (typeof fetchAndDecryptBqMailForResolver_ === 'function') {
     try {
       const bqData = fetchAndDecryptBqMailForResolver_();
-      if (bqData && Array.isArray(bqData.mijyusoku)) {
-        bqData.mijyusoku.forEach(function(m) {
+      if (bqData) {
+        const bqList = (bqData.bosyu || []).concat(bqData.mijyusoku || []).concat(bqData.boshu || []);
+        bqList.forEach(function(m) {
           const rawC = String(m.c || m.clinic || '').trim();
-          if (rawC.includes('内科') || String(m.dept || '').includes('内科')) return;
+          const rawDp = String(m.dp || m.dept || '').trim();
+          if (rawC.includes('内科') || rawDp.includes('内科')) return;
           addSlotItemIfTrulyUnfilled(m.d || m.date, rawC, m.t || m.time, m.w || m.wage || m.listedWage || '13000', m.sp || m.specialWage || '', false);
         });
       }

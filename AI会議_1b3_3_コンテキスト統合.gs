@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_1b3_3_コンテキスト統合.gs
- * （募集枠の長時間統合に伴う個別打診候補の帯単位マッチング・要延長セット対応版）
+ * （日別メール制約＆キャンセル日ブロック完全反映・募集枠統合時の個別打診候補マッチング版）
  * ============================================================================
  */
 
@@ -88,7 +88,7 @@ function collectCompactContextForAi_(ss) {
     if (!rawPitch.includes('【スタッフ打診】') && !rawFlag.includes('シフト調整')) return;
 
     const dtStr = String(r[6] || '').slice(5, 10);
-    if (rawFlag.includes('承諾') || rawFlag.includes('成立')) {
+    if (rawFlag.includes('承諾') || rawFlag.includes('成立') || rawFlag.includes('時間条件')) {
       latestReplyMap.set(dKey, (dtStr ? dtStr + 'の別枠打診：承諾実績あり' : '直近打診：承諾実績あり'));
     } else if (rawFlag.includes('辞退')) {
       latestReplyMap.set(dKey, (dtStr ? dtStr + 'の別枠打診：予定合わず辞退' : '直近打診：辞退履歴あり'));
@@ -202,7 +202,7 @@ function collectCompactContextForAi_(ss) {
             }
           }
 
-          if (!isDoctorCompatibleWithSlot_(k, dow, cleanTargetClinic, area, timeInfo, '移動', masters)) return;
+          if (!isDoctorCompatibleWithSlot_(k, dow, cleanTargetClinic, area, timeInfo, '移動', masters, dateStr)) return;
 
           const isSbu = masters.sbuSet.has(k);
           const isNeg = masters.negotiableMap.has(k);
@@ -264,8 +264,6 @@ function collectCompactContextForAi_(ss) {
     twoDocScoredList.sort(function(a, b) { return b.score - a.score; });
     oneDocScoredList.sort(function(a, b) { return b.score - a.score; });
 
-    // ★個別打診候補の取得：募集時間が「15:00-16:00」から「15:00-18:00」へ拡張された場合でも、
-    //   同日・同拠点・同診療科で時間帯が重なる個別打診候補をすべて合流させる
     const exactKey = makeNormalizedSpotKey_(dateStr, clinic, absTime);
     const prefix = makeSpotClinicDatePrefix1b3_(dateStr, clinic);
     const rawSpots = [];
@@ -302,7 +300,7 @@ function collectCompactContextForAi_(ss) {
       const dKey = sp.docKey || normKeyForDoc_(sp.doctor);
       if (prevChecked.docKeySet.has(dKey) || nextChecked.docKeySet.has(dKey)) return;
       if (masters.streakNgMap.has(dKey) && masters.streakNgMap.get(dKey).includes(dateStr)) return;
-      if (!isDoctorCompatibleWithSlot_(dKey, dow, cleanTargetClinic, area, timeInfo, '個別', masters)) return;
+      if (!isDoctorCompatibleWithSlot_(dKey, dow, cleanTargetClinic, area, timeInfo, '個別', masters, dateStr)) return;
 
       const confirmedList = dayConfirmedMap.get(dKey) || [];
       let isImpossibleSchedule = false;
