@@ -1,5 +1,5 @@
 // ===================================================================
-// ★★★ 1日1回、この「まとめ役」関数を実行するトリガーを1つだけ設定します ★★★
+// ★★★ メール回収 ＆ ナレッジシート作成 ＆ ドキュメント・Slack自動更新のまとめ役関数 ★★★
 // ===================================================================
 function runDailyTransferAndMatching() {
   const SPREADSHEET_ID = '1vh9hPfoaAGTZOm-GFtJQoSPgFB3GiABsbJ4ETgMqfbM';
@@ -8,18 +8,22 @@ function runDailyTransferAndMatching() {
   getAnswerEmailsFromGmail_Final(SPREADSHEET_ID);
   matchAndCreateKnowledgeBase_Final(SPREADSHEET_ID);
   exportToTxtFile(SPREADSHEET_ID);
+
+  // ★ナレッジシート更新に連動して、Googleドキュメント更新＆Slack結果ボードの差分更新を実行
+  try {
+    if (typeof syncAdjustmentResultsToDocAndSlack3_3_ === 'function') {
+      const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+      syncAdjustmentResultsToDocAndSlack3_3_(ss, false);
+    }
+  } catch (e) {
+    console.error('ドキュメント・Slack自動更新エラー: ' + e.message);
+  }
 }
 
-/**
- * 医師名のスペース（全角・半角）を除去して比較しやすくするヘルパー
- */
 function normalizeDocName_(name) {
   return String(name || '').replace(/[\s\u3000]+/g, '').replace(/先生$/g, '').trim();
 }
 
-/**
- * ステージング（テスト環境）や自動配送テストのメールかを判定するヘルパー
- */
 function isStagingOrTestMail_(message, bodyText, doctorName) {
   const fromStr = String(message.getFrom() || '').toLowerCase();
   const body = String(bodyText || '');
@@ -31,18 +35,12 @@ function isStagingOrTestMail_(message, bodyText, doctorName) {
   return false;
 }
 
-/**
- * 「2026年11月15日」などの日本語日付を「2026/11/15」に正規化するヘルパー
- */
 function normalizeCancelTargetDateYmd_(rawDateStr) {
   const m = String(rawDateStr || '').match(/(\d{4})[年\/\-](\d{1,2})[月\/\-](\d{1,2})/);
   if (!m) return '';
   return m[1] + '/' + ('0' + m[2]).slice(-2) + '/' + ('0' + m[3]).slice(-2);
 }
 
-/**
- * 『シフトキャンセル履歴』シートを取得（なければ自動作成）するヘルパー
- */
 function ensureShiftCancelHistorySheet_(ss) {
   const sheetName = 'シフトキャンセル履歴';
   let sh = ss.getSheetByName(sheetName);
@@ -55,10 +53,6 @@ function ensureShiftCancelHistorySheet_(ss) {
   return sh;
 }
 
-/**
- * 1. Gmailから「【要確認】医師からのお問い合わせ」を検索し、『医師質問』シートに自動転記
- * ※ステージング環境や自動確認テストメールは除外します
- */
 function getQuestionEmailsFromGmail_Final(spreadsheetId) {
   const sheetName = '医師質問';
   const timezone = 'Asia/Tokyo';
@@ -120,11 +114,6 @@ function getQuestionEmailsFromGmail_Final(spreadsheetId) {
   console.log(newItems.length + '件の質問・返信メールを転記しました。');
 }
 
-/**
- * 2. Gmailから「お問い合わせスタッフ送信」を検索し、
- *   - 通常メールは『DS回答』シートへ自動転記
- *   - 「のキャンセル申請が承認されました。」メールは『シフトキャンセル履歴』シートへ自動蓄積（設計1）
- */
 function getAnswerEmailsFromGmail_Final(spreadsheetId) {
   const sheetName = 'DS回答';
   const timezone = 'Asia/Tokyo';
@@ -146,7 +135,6 @@ function getAnswerEmailsFromGmail_Final(spreadsheetId) {
     ? Number(cancelSheet.getRange(cancelLastRow, 1).getValue())
     : 0;
 
-  // 初回（キャンセル履歴が空のとき）は直近30日分をスキャンして過去のキャンセルも一括回収する
   const daysWindow = cancelLastRow <= 1 ? '30d' : '7d';
   const searchQuery = 'from:' + sourceEmail + ' subject:("お問い合わせスタッフ送信") newer_than:' + daysWindow;
   const threads = GmailApp.search(searchQuery, 0, 100);
@@ -177,7 +165,6 @@ function getAnswerEmailsFromGmail_Final(spreadsheetId) {
       const msgDate = message.getDate();
       const sentTimestamp = Utilities.formatDate(msgDate, timezone, 'yyyy/MM/dd HH:mm:ss');
 
-      // ★設計1：シフトキャンセル承認メールの自動回収
       if (body.includes('のキャンセル申請が承認されました。')) {
         if (existingCancelIds.has(messageId)) return;
         const cancelMatch = content.match(/(\d{4}年\d{1,2}月\d{1,2}日)[\s ]+([^\s ]+)[\s ]+([^\s ]+)[\s ]+(\d{1,2}:\d{2}[~～\-]\d{1,2}:\d{2})※?のキャンセル申請が承認されました/);
@@ -196,7 +183,6 @@ function getAnswerEmailsFromGmail_Final(spreadsheetId) {
         return;
       }
 
-      // 通常のスタッフ送信メール（7日以内）
       if (existingIds.has(messageId)) return;
       if ((Date.now() - msgDate.getTime()) > 8 * 24 * 60 * 60 * 1000) return;
 
@@ -236,9 +222,6 @@ function getAnswerEmailsFromGmail_Final(spreadsheetId) {
   console.log(newItems.length + '件の回答・打診メール、および ' + newCancelItems.length + '件のシフトキャンセル履歴を転記しました。');
 }
 
-/**
- * 3. 『医師質問』と『DS回答』を双方向突合し、『ナレッジシート』を自動生成
- */
 function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
   const ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
   const questionSheet = ss.getSheetByName('医師質問');
@@ -272,7 +255,6 @@ function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
     return /ご相談|ご変更いただくことは可能でしょうか|延長していただくことは可能でしょうか|前倒ししていただくことは可能でしょうか|医師不在となる可能性|ご勤務につきまして/.test(String(text || ''));
   };
 
-  // ①【スタッフ打診 ➔ 医師返信】の突合（シフト調整パターン）
   for (let j = 0; j < answers.length; j++) {
     const aRow = answers[j];
     if (String(aRow[7] || '').trim() === '処理済み') continue;
@@ -331,7 +313,6 @@ function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
     }
   }
 
-  // ②【医師質問 ➔ スタッフ回答】の突合（従来のCS・医師発信パターン）
   for (let i = 0; i < questions.length; i++) {
     const qRow = questions[i];
     if (String(qRow[6] || '').trim() === '処理済み') continue;
@@ -384,10 +365,6 @@ function matchAndCreateKnowledgeBase_Final(spreadsheetId) {
   console.log(matchCount + '件のナレッジを生成しました。');
 }
 
-/**
- * ★強化版：H列に入れる「NG候補・種別フラグ」の自動判定
- * （「18時までなら可能」「延長不可」などの時間条件付き返信も逃さずフラグ付け）
- */
 function detectNgOrConditionFlag_(docText, staffText) {
   const d = String(docText || '');
   const s = String(staffText || '');
@@ -407,9 +384,6 @@ function detectNgOrConditionFlag_(docText, staffText) {
   return '一般連絡';
 }
 
-/**
- * 4. 『ナレッジシート』から Chatwork Bot ＆ AI総務用のテキストファイルを出力
- */
 function exportToTxtFile(spreadsheetId) {
   var ss = spreadsheetId ? SpreadsheetApp.openById(spreadsheetId) : SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName('ナレッジシート') || ss.getSheets()[0];

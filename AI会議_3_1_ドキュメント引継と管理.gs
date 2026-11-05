@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_3_1_ドキュメント引継と管理.gs
- * （前半：前回MTGドキュメントからの「確定案・担当者・メモ」自動引き継ぎ＆ファイル管理）
+ * （前半：前回MTG引継 ＋ 進行中メモからの案自動特定＆コンパクト「→ 調整結果」記載版）
  * ============================================================================
  */
 
@@ -29,20 +29,14 @@ function getSlotCarryOverKey3_(dateStr, rawClinicText, rawTimeText) {
   return [d, cleanC, dept, band].join('|');
 }
 
-/**
- * フォルダ内の直近の「超募集対策MTG」ドキュメント（昨日の11/04や月曜日のドキュメント等）を読み込み、
- * すでにスタッフが入力していた「確定案」「担当者名」「コメント」を抽出する関数
- */
 function loadPreviousMeetingDecisionsMap3_() {
   const map = new Map();
   const props = PropertiesService.getScriptProperties();
   const docIdsToScan = [];
 
-  // 1. スクリプトプロパティの直近ドキュメントID
   const lastSavedDocId = props.getProperty('SINGLE_MTG_DOC_ID');
   if (lastSavedDocId) docIdsToScan.push(lastSavedDocId);
 
-  // 2. 出力フォルダ内の直近3件のMTGドキュメント（古い順→新しい順で上書きして最新優先にする）
   try {
     const folder = DriveApp.getFolderById(DOC_OUTPUT_FOLDER_ID);
     const files = folder.getFilesByType(MimeType.GOOGLE_DOCS);
@@ -85,10 +79,11 @@ function loadPreviousMeetingDecisionsMap3_() {
             if (row.getNumCells() < 4) continue;
             const c0 = row.getCell(0).getText().trim();
             const c1 = row.getCell(1).getText().trim();
-            const c2 = row.getCell(2).getText().trim();
+            const c2Raw = row.getCell(2).getText().trim();
+            const c2Main = c2Raw.split('\n').filter(function(l) { return !l.trim().startsWith('→'); }).join(' ').trim();
             const c3 = row.getCell(3).getText().trim();
 
-            if (!c2 && !c3) continue;
+            if (!c2Main && !c3) continue;
 
             const c0Lines = c0.split('\n');
             const key = getSlotCarryOverKey3_(curDate, c0Lines[0] || '', c0Lines.slice(1).join(' '));
@@ -103,7 +98,7 @@ function loadPreviousMeetingDecisionsMap3_() {
             });
 
             map.set(key, {
-              rawDecision: c2,
+              rawDecision: c2Main,
               assignee: c3,
               prevPlanMap: prevPlanMap
             });
@@ -116,15 +111,9 @@ function loadPreviousMeetingDecisionsMap3_() {
   return map;
 }
 
-/**
- * 前回の確定案（prevEntry）を、今回の新しい【案1】〜【案3】（currentPlanObj）と照合し、
- * 案の順番が入れ替わっていても「対象医師名」を追いかけて新しい案番号へ自動マッピングして引き継ぐ関数
- */
-function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj) {
-  if (!prevEntry) return { decision: '', assignee: '', comment: '' };
-
-  let dec = String(prevEntry.rawDecision || '').trim();
-  const assignee = String(prevEntry.assignee || '').trim();
+function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj, origSlotOpt, mailHistoryIndexOpt) {
+  let dec = prevEntry ? String(prevEntry.rawDecision || '').trim() : '';
+  const assignee = prevEntry ? String(prevEntry.assignee || '').trim() : '';
   let comment = '';
 
   const memoMatch = dec.match(/^(.*?)\s*[（\(]メモ[：:](.+?)[）\)]$/);
@@ -140,76 +129,153 @@ function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj) {
     dec = dec.replace(/【特別時給.*?】/g, '').trim();
   }
 
-  if (!dec) {
-    return { decision: '', assignee: assignee, comment: comment };
-  }
-
-  // 「ステイ」「特別時給＋ステイ」「全案」「バックアップ医師に勤務依頼」またはカスタム医師入力はそのまま引き継ぐ
-  if (/^(ステイ|特別時給.*ステイ|全案|バックアップ医師に勤務依頼)$/.test(dec) || !/案[123１２３]/.test(dec)) {
-    return {
-      decision: dec + spTag + (comment ? ('（メモ：' + comment + '）') : ''),
-      assignee: assignee,
-      comment: comment
-    };
-  }
-
   const newPlans = {
     '1': String(currentPlanObj.plan1 || ''),
     '2': String(currentPlanObj.plan2 || ''),
     '3': String(currentPlanObj.plan3 || '')
   };
 
-  // 前回選ばれていた「案X」の医師が、今回の何案目にいるかを検索してマッピング
-  const tokens = dec.split(/[,、，\/／\n・\+＋]|(?:\s+と\s+)/).map(function(t) { return t.trim(); }).filter(Boolean);
-  const mappedTokens = [];
+  const planDocsByNum = {
+    '1': (typeof extractCandidateDoctorsFromPlanText2a_ === 'function') ? extractCandidateDoctorsFromPlanText2a_(newPlans['1']) : [],
+    '2': (typeof extractCandidateDoctorsFromPlanText2a_ === 'function') ? extractCandidateDoctorsFromPlanText2a_(newPlans['2']) : [],
+    '3': (typeof extractCandidateDoctorsFromPlanText2a_ === 'function') ? extractCandidateDoctorsFromPlanText2a_(newPlans['3']) : []
+  };
 
-  tokens.forEach(function(tok) {
-    const m = tok.match(/^(?:【?案)?([123１２３])(?:】)?(?:\(([^)]+)\))?$/);
-    if (!m) {
-      mappedTokens.push(tok);
-      return;
-    }
-    const oldNum = m[1].replace(/[１２３]/g, function(ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0); });
-    const subSpec = m[2] ? m[2].trim() : '';
-    const oldPlanText = (prevEntry.prevPlanMap && prevEntry.prevPlanMap[oldNum]) ? prevEntry.prevPlanMap[oldNum] : '';
+  let mappedDecisionBase = '';
 
-    if (!oldPlanText) {
-      if (newPlans[oldNum]) mappedTokens.push(subSpec ? ('案' + oldNum + '(' + subSpec + ')') : ('案' + oldNum));
-      return;
-    }
+  if (dec) {
+    if (/^(ステイ|特別時給.*ステイ|全案|バックアップ医師に勤務依頼)$/.test(dec) || !/案[123１２３]/.test(dec)) {
+      mappedDecisionBase = dec;
+    } else {
+      const tokens = dec.split(/[,、，\/／\n・\+＋]|(?:\s+と\s+)/).map(function(t) { return t.trim(); }).filter(Boolean);
+      const mappedTokens = [];
 
-    const oldDocs = (typeof extractCandidateDoctorsFromPlanText2a_ === 'function')
-      ? extractCandidateDoctorsFromPlanText2a_(oldPlanText)
-      : [];
+      tokens.forEach(function(tok) {
+        const m = tok.match(/^(?:【?案)?([123１２３])(?:】)?(?:\(([^)]+)\))?$/);
+        if (!m) {
+          mappedTokens.push(tok);
+          return;
+        }
+        const oldNum = m[1].replace(/[１２３]/g, function(ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0); });
+        const subSpec = m[2] ? m[2].trim() : '';
+        const oldPlanText = (prevEntry && prevEntry.prevPlanMap && prevEntry.prevPlanMap[oldNum]) ? prevEntry.prevPlanMap[oldNum] : '';
 
-    // 同じ医師が含まれる新しい案番号を探す
-    let matchedNewNum = '';
-    if (oldDocs.length > 0) {
-      ['1', '2', '3'].forEach(function(nNum) {
-        if (matchedNewNum || !newPlans[nNum]) return;
-        const newDocs = (typeof extractCandidateDoctorsFromPlanText2a_ === 'function')
-          ? extractCandidateDoctorsFromPlanText2a_(newPlans[nNum])
+        if (!oldPlanText) {
+          if (newPlans[oldNum]) mappedTokens.push(subSpec ? ('案' + oldNum + '(' + subSpec + ')') : ('案' + oldNum));
+          return;
+        }
+
+        const oldDocs = (typeof extractCandidateDoctorsFromPlanText2a_ === 'function')
+          ? extractCandidateDoctorsFromPlanText2a_(oldPlanText)
           : [];
-        if (oldDocs.some(function(od) { return newDocs.includes(od); })) {
-          matchedNewNum = nNum;
+
+        let matchedNewNum = '';
+        if (oldDocs.length > 0) {
+          ['1', '2', '3'].forEach(function(nNum) {
+            if (matchedNewNum || !newPlans[nNum]) return;
+            const newDocs = planDocsByNum[nNum] || [];
+            if (oldDocs.some(function(od) { return newDocs.includes(od); })) {
+              matchedNewNum = nNum;
+            }
+          });
+        }
+
+        if (matchedNewNum) {
+          const mappedLabel = subSpec ? ('案' + matchedNewNum + '(' + subSpec + ')') : ('案' + matchedNewNum);
+          if (!mappedTokens.includes(mappedLabel)) mappedTokens.push(mappedLabel);
         }
       });
-    }
 
-    if (matchedNewNum) {
-      const mappedLabel = subSpec ? ('案' + matchedNewNum + '(' + subSpec + ')') : ('案' + matchedNewNum);
-      if (!mappedTokens.includes(mappedLabel)) mappedTokens.push(mappedLabel);
+      mappedDecisionBase = mappedTokens.join(', ');
     }
-  });
-
-  if (mappedTokens.length === 0) {
-    // 前回選んだ医師が全員キャンセルやシフト変更等で候補から消えた場合は空欄に戻す
-    return { decision: '', assignee: '', comment: comment };
   }
 
-  const finalDec = mappedTokens.join(', ') + spTag + (comment ? ('（メモ：' + comment + '）') : '');
+  const rawCurrentMemo = origSlotOpt ? String(origSlotOpt.currentMemo || '').trim() : '';
+  const officialNames = (typeof buildMasterNameCorrectionMap2a_ === 'function' && origSlotOpt)
+    ? buildMasterNameCorrectionMap2a_([origSlotOpt])
+    : [];
+  const correctedCurrentMemo = (typeof correctDoctorNamesInMemoText_ === 'function')
+    ? correctDoctorNamesInMemoText_(rawCurrentMemo, officialNames)
+    : rawCurrentMemo;
+
+  // ★修正：「中﨑寿隆先生」の「﨑」や「髙」などCJK拡張漢字も途切れずフルネーム抽出する正規表現
+  const memoDocs = [];
+  if (correctedCurrentMemo && correctedCurrentMemo !== '-') {
+    const memoRe = /([一-龠々ヶケ﨑嵜髙瀧泷邊邉齋齊澤廣國嶋嶌栁濱櫻眞惠]{2,6})先生/g;
+    let mm;
+    while ((mm = memoRe.exec(correctedCurrentMemo)) !== null) {
+      if (!memoDocs.includes(mm[1])) memoDocs.push(mm[1]);
+    }
+  }
+
+  const matchedPlanNumsFromMemo = [];
+  const planLabelByMemoDoc = {};
+
+  memoDocs.forEach(function(mDoc) {
+    const mKey = normKeyForDoc_(mDoc);
+    ['1', '2', '3'].forEach(function(pNum) {
+      const pDocs = planDocsByNum[pNum] || [];
+      if (pDocs.some(function(pd) { return normKeyForDoc_(pd) === mKey; })) {
+        planLabelByMemoDoc[mDoc] = '案' + pNum;
+        if (!matchedPlanNumsFromMemo.includes(pNum)) {
+          matchedPlanNumsFromMemo.push(pNum);
+        }
+      }
+    });
+  });
+
+  if ((!mappedDecisionBase || mappedDecisionBase === '全案') && matchedPlanNumsFromMemo.length > 0) {
+    matchedPlanNumsFromMemo.sort();
+    mappedDecisionBase = matchedPlanNumsFromMemo.map(function(n) { return '案' + n; }).join(', ');
+  }
+
+  const targetDocsForResult = [];
+  memoDocs.forEach(function(d) {
+    if (!targetDocsForResult.includes(d)) targetDocsForResult.push(d);
+  });
+
+  if (mappedDecisionBase && /案[123]/.test(mappedDecisionBase)) {
+    const chosenNums = mappedDecisionBase.match(/[123]/g) || [];
+    chosenNums.forEach(function(n) {
+      // 「案1(②灘理絵先生)」のように特定の1名が指定されている場合はその医師のみを追加
+      const subMatch = mappedDecisionBase.match(new RegExp('案' + n + '\\(([^)]+)\\)'));
+      const subSpec = subMatch ? subMatch[1].replace(/^[①②12]\s*/, '').replace(/先生$/g, '').trim() : '';
+
+      (planDocsByNum[n] || []).forEach(function(d) {
+        if (subSpec && !d.includes(subSpec) && !subSpec.includes(d)) return;
+        if (!targetDocsForResult.includes(d)) {
+          targetDocsForResult.push(d);
+          planLabelByMemoDoc[d] = '案' + n;
+        }
+      });
+    });
+  }
+
+  let resultArrowLines = [];
+  if (targetDocsForResult.length > 0 && typeof evaluateDoctorAdjustmentStatusObj1b2_ === 'function' && mailHistoryIndexOpt) {
+    const cleanC = cleanClinicBaseName_(currentPlanObj.clinicAndDept || '');
+    const statusObjs = targetDocsForResult.map(function(docName) {
+      return evaluateDoctorAdjustmentStatusObj1b2_(
+        docName,
+        planLabelByMemoDoc[docName] || '',
+        currentPlanObj.date,
+        cleanC,
+        mailHistoryIndexOpt
+      );
+    });
+    resultArrowLines = formatCompactAdjustmentLines1b2_(statusObjs);
+  } else if (correctedCurrentMemo && correctedCurrentMemo !== '-' && targetDocsForResult.length === 0) {
+    resultArrowLines.push('→ 📋' + correctedCurrentMemo.replace(/\r?\n/g, ' / '));
+  }
+
+  let finalHeaderDec = mappedDecisionBase
+    ? (mappedDecisionBase + spTag + (comment ? ('（メモ：' + comment + '）') : ''))
+    : (comment ? ('（メモ：' + comment + '）') : '');
+
+  const fullDecisionCellText = [finalHeaderDec].concat(resultArrowLines).filter(Boolean).join('\n');
+
   return {
-    decision: finalDec,
+    decision: fullDecisionCellText,
     assignee: assignee,
     comment: comment
   };

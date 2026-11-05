@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6c_編集くん64_保存と提出.gs
- * （全案以外の選択時に推奨アプローチ列の該当案へ「薄い赤色マーカー」自動付与＆差し替え連動版）
+ * （OK［⭕承諾］の案は「薄い緑色マーカー #bbf7d0」、通常の選択案は「薄い赤色マーカー #ffd6d6」で色分けする版）
  * ============================================================================
  */
 
@@ -99,9 +99,10 @@ function saveHenshukunDraft(payload) {
 }
 
 /**
- * ★新設：確定案（rawDecisionText）を解析し、「全案」以外で案1〜案3が選択されている場合、
- * 2列目（AI推奨アプローチ列）の該当する【案X】の行に「薄い赤色（#ffd6d6）」のマーカーを付与する関数。
- * ※差し替え時は古いマーカーを一旦すべてクリアしてから新しい選択案にのみマーカーを付け直します。
+ * ★改善版：確定案および調整結果（rawDecisionText）を解析し、
+ * - ⭕承諾（OK）が出ている案 ➔ 「爽やかな緑色マーカー（#bbf7d0）」
+ * - それ以外の選択案（打診中・返信待ち等） ➔ 「薄い赤色マーカー（#ffd6d6）」
+ * を2列目（AI推奨アプローチ列）の該当する【案X】の行に付与する関数。
  */
 function applySelectedPlanMarkerToDocCell64_(cell1, c1Text, rawDecisionText) {
   cell1.setText(c1Text);
@@ -111,50 +112,72 @@ function applySelectedPlanMarkerToDocCell64_(cell1, c1Text, rawDecisionText) {
   const len = c1Text.length;
   textObj.setFontSize(0, len - 1, 8.5);
   textObj.setBold(0, len - 1, false);
-  textObj.setBackgroundColor(0, len - 1, null); // ★既存のマーカーを一旦すべてリセット（差し替え対応）
+  textObj.setBackgroundColor(0, len - 1, null);
 
-  // メモや特別時給交渉タグを除外して判定
-  const cleanDec = String(rawDecisionText || '')
-    .replace(/\s*[（\(]メモ[：:].*?[）\)]$/g, '')
-    .replace(/【特別時給.*?】/g, '')
-    .trim();
-
-  // 未選択・ステイ・全案の場合はマーカーを付けない
-  if (!cleanDec || /全案|すべて|全部|ステイ|要検討/.test(cleanDec)) {
-    return;
+  if (typeof highlightKeywordsInText_ === 'function') {
+    highlightKeywordsInText_(textObj);
   }
 
-  // 選択されている案番号（"1", "2", "3"）と、①/②の医師指定があれば抽出
-  const selectedPlanNums = new Set();
-  const subDocChoiceByPlan = {}; // planNum -> "1" | "2" | "BOTH"
+  const fullDecStr = String(rawDecisionText || '').trim();
+  if (!fullDecStr) return;
 
-  const tokens = cleanDec.split(/[,、，\/／\n・\+＋]|(?:\s+と\s+)/).map(function(t) { return t.trim(); }).filter(Boolean);
-  tokens.forEach(function(tok) {
-    const specMatch = tok.match(/^(?:【?案)?([123１２３])(?:】)?(?:\(([^)]+)\))?$/);
-    if (specMatch) {
-      const pNum = specMatch[1].replace(/[１２３]/g, function(s) { return String.fromCharCode(s.charCodeAt(0) - 0xFEE0); });
-      selectedPlanNums.add(pNum);
-      const subText = specMatch[2] ? specMatch[2].trim() : '';
-      if (subText) {
-        if (subText.includes('両方')) subDocChoiceByPlan[pNum] = 'BOTH';
-        else if (/^[①1１]/.test(subText)) subDocChoiceByPlan[pNum] = '1';
-        else if (/^[②2２]/.test(subText)) subDocChoiceByPlan[pNum] = '2';
-      }
-    } else {
-      const multiMatches = tok.match(/案([123１２３])/g);
-      if (multiMatches && tok.replace(/案[123１２３]|[\s、,・と]/g, '') === '') {
-        multiMatches.forEach(function(mm) {
-          const pNum = mm.replace('案', '').replace(/[１２３]/g, function(s) { return String.fromCharCode(s.charCodeAt(0) - 0xFEE0); });
-          selectedPlanNums.add(pNum);
+  // 1. 「→ ⭕...(案X)...：承諾」の行から、承諾（OK）済みの案番号を抽出
+  const acceptedPlanNums = new Set();
+  fullDecStr.split('\n').forEach(function(line) {
+    const s = line.trim();
+    if (s.startsWith('→') && s.includes('⭕')) {
+      const m = s.match(/\(案([123１２３])\)/g);
+      if (m) {
+        m.forEach(function(tok) {
+          const num = tok.replace(/[^123１２３]/g, '').replace(/[１２３]/g, function(ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0); });
+          if (num) acceptedPlanNums.add(num);
         });
       }
     }
   });
 
+  // 2. 1行目の確定案本体から選択されている案番号を抽出
+  const firstLine = fullDecStr.split('\n')[0]
+    .replace(/\s*[（\(]メモ[：:].*?[）\)]$/g, '')
+    .replace(/【特別時給.*?】/g, '')
+    .trim();
+
+  const selectedPlanNums = new Set();
+  const subDocChoiceByPlan = {};
+
+  if (firstLine && !/全案|すべて|全部|ステイ|要検討/.test(firstLine)) {
+    const tokens = firstLine.split(/[,、，\/／\n・\+＋]|(?:\s+と\s+)/).map(function(t) { return t.trim(); }).filter(Boolean);
+    tokens.forEach(function(tok) {
+      const specMatch = tok.match(/^(?:【?案)?([123１２３])(?:】)?(?:\(([^)]+)\))?$/);
+      if (specMatch) {
+        const pNum = specMatch[1].replace(/[１２３]/g, function(s) { return String.fromCharCode(s.charCodeAt(0) - 0xFEE0); });
+        selectedPlanNums.add(pNum);
+        const subText = specMatch[2] ? specMatch[2].trim() : '';
+        if (subText) {
+          if (subText.includes('両方')) subDocChoiceByPlan[pNum] = 'BOTH';
+          else if (/^[①1１]/.test(subText)) subDocChoiceByPlan[pNum] = '1';
+          else if (/^[②2２]/.test(subText)) subDocChoiceByPlan[pNum] = '2';
+        }
+      } else {
+        const multiMatches = tok.match(/案([123１２３])/g);
+        if (multiMatches && tok.replace(/案[123１２３]|[\s、,・と]/g, '') === '') {
+          multiMatches.forEach(function(mm) {
+            const pNum = mm.replace('案', '').replace(/[１２３]/g, function(s) { return String.fromCharCode(s.charCodeAt(0) - 0xFEE0); });
+            selectedPlanNums.add(pNum);
+          });
+        }
+      }
+    });
+  }
+
+  // 承諾（⭕）が出ている案は、仮に1行目が別の案になっていても緑マーカー対象として追加
+  acceptedPlanNums.forEach(function(num) { selectedPlanNums.add(num); });
+
   if (selectedPlanNums.size === 0) return;
 
-  // 行ごとに走査し、選ばれた【案X】の行に薄い赤色マーカー（#ffd6d6）を適用
-  const MARKER_COLOR = '#ffd6d6';
+  const COLOR_SELECTED_RED = '#ffd6d6'; // 通常選択・交渉中（薄い赤色）
+  const COLOR_ACCEPTED_GREEN = '#bbf7d0'; // ⭕承諾・OK確定（爽やかな緑色）
+
   const lines = c1Text.split('\n');
   let curOffset = 0;
 
@@ -162,7 +185,7 @@ function applySelectedPlanMarkerToDocCell64_(cell1, c1Text, rawDecisionText) {
     const lineLen = line.length;
     const lineStart = curOffset;
     const lineEnd = curOffset + lineLen - 1;
-    curOffset += lineLen + 1; // +1 は改行文字分
+    curOffset += lineLen + 1;
 
     if (lineLen <= 0) return;
 
@@ -172,11 +195,11 @@ function applySelectedPlanMarkerToDocCell64_(cell1, c1Text, rawDecisionText) {
     const pNum = m[1].replace(/[１２３]/g, function(s) { return String.fromCharCode(s.charCodeAt(0) - 0xFEE0); });
     if (!selectedPlanNums.has(pNum)) return;
 
-    // 選ばれた案の行全体に薄い赤色マーカーと太字を適用
-    textObj.setBackgroundColor(lineStart, lineEnd, MARKER_COLOR);
+    // ★OK（⭕承諾）が出ている案は緑色マーカー、それ以外の選択案は赤色マーカーを適用！
+    const targetColor = acceptedPlanNums.has(pNum) ? COLOR_ACCEPTED_GREEN : COLOR_SELECTED_RED;
+    textObj.setBackgroundColor(lineStart, lineEnd, targetColor);
     textObj.setBold(lineStart, lineEnd, true);
 
-    // もし「案1(②灘理絵先生)」のように①と②の片方だけが指定されている場合、選ばれていない方の医師名のマーカーは外してより分かりやすくする
     const subChoice = subDocChoiceByPlan[pNum];
     if (subChoice === '1' || subChoice === '2') {
       const pairRegex = /(①[^\/／\n]+?)(\s*[\/／]\s*)(②[^）\)\n]+)/;
@@ -213,7 +236,6 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
     const doc = DocumentApp.openById(docId);
     const body = doc.getBody();
 
-    // 1. 一時保存（変更分）をドキュメントの該当セルに反映
     Object.entries(draft.slots || {}).forEach(([slotKey, item]) => {
       const [cIdx, rIdx] = slotKey.split('_').map(Number);
       const el = body.getChild(cIdx);
@@ -234,8 +256,13 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
               c1 += '\n📝コメント：' + cmnt;
             }
 
+            // 既存の3列目にあった「→」調整結果行は保持したまま、1行目の確定案を更新する
+            const existingC2Lines = row.getCell(2).getText().split('\n');
+            const arrowLines = existingC2Lines.filter(function(l) { return l.trim().startsWith('→'); });
+
             const baseDec = String(item.decision || '').trim();
-            const fullDecText = (cmnt && baseDec) ? (baseDec + '（メモ：' + cmnt + '）') : baseDec;
+            const headerDecText = (cmnt && baseDec) ? (baseDec + '（メモ：' + cmnt + '）') : baseDec;
+            const fullDecText = [headerDecText].concat(arrowLines).filter(Boolean).join('\n');
 
             row.getCell(0).setText(c0Lines.join('\n'));
             row.getCell(2).setText(fullDecText);
@@ -244,14 +271,12 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
             row.getCell(2).editAsText().setFontSize(8.5).setBold(true);
             row.getCell(3).editAsText().setFontSize(8.5);
 
-            // ★2列目（推奨アプローチ列）にテキストと薄い赤色マーカーを反映
             applySelectedPlanMarkerToDocCell64_(row.getCell(1), c1, fullDecText);
           }
         }
       }
     });
 
-    // 2. ドキュメント内の全テーブルを走査し、すでに確定案が入っている行も含め全行のマーカー状態を最新化
     const numChildren = body.getNumChildren();
     for (let i = 0; i < numChildren; i++) {
       const el = body.getChild(i);

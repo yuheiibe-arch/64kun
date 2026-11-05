@@ -1,13 +1,22 @@
 /**
  * ============================================================================
  * AI会議_3_2_ドキュメント描画と通知.gs
- * （後半：Googleドキュメント描画・赤色マーカー自動反映・カレンダー添付・Slack通知）
+ * （後半：Googleドキュメント描画・⭕承諾＝緑マーカー／選択案＝赤マーカー自動反映）
  * ============================================================================
  */
 
 function renderStructuredMeetingDoc_(title, rawContext, aiData) {
-  // ドキュメントを上書きする前に、前回（昨日や月曜）のMTGドキュメントから確定案・担当者・コメントを収集
   const prevDecisionsMap = loadPreviousMeetingDecisionsMap3_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const mailHistoryIndex = (typeof buildDoctorMailHistoryIndexForResults1b2_ === 'function')
+    ? buildDoctorMailHistoryIndexForResults1b2_(ss)
+    : null;
+
+  const origSlotById = new Map();
+  (rawContext.slotsContext || []).forEach(function(s) {
+    origSlotById.set(s.slotId, s);
+  });
+
   let carriedOverCount = 0;
 
   const doc = getOrResetDailyMeetingDocInFolder_(title);
@@ -43,7 +52,7 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
       .setFontSize(10).setBold(true).setSpacingBefore(8).setSpacingAfter(3);
 
     const tableRows = [
-      ['拠点・不在時間帯', 'AIエージェント推奨アプローチ（優先順・現状メモ）', '確定案（複数可・カスタム可）', '担当者名']
+      ['拠点・不在時間帯', 'AIエージェント推奨アプローチ（優先順・現状メモ）', '確定案・調整結果（→）', '担当者名']
     ];
 
     plansByDate[dateLabel].forEach(function(p) {
@@ -55,9 +64,9 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
       }
       const col1 = cleanClinic + '\n' + (p.absenceTime || '');
 
-      // 前回ドキュメントの確定案・担当者・コメントを照合して自動引き継ぎ
       const carryKey = getSlotCarryOverKey3_(dateLabel, cleanClinic, p.absenceTime || '');
-      const carried = resolveCarriedOverDecisionForSlot3_(prevDecisionsMap.get(carryKey), p);
+      const origSlot = origSlotById.get(p.slotId) || null;
+      const carried = resolveCarriedOverDecisionForSlot3_(prevDecisionsMap.get(carryKey), p, origSlot, mailHistoryIndex);
       if (carried.decision || carried.assignee) {
         carriedOverCount++;
       }
@@ -66,8 +75,13 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
       if (p.plan1) col2Lines.push('【案1】' + p.plan1);
       if (p.plan2) col2Lines.push('【案2】' + p.plan2);
       if (p.plan3) col2Lines.push('【案3】' + p.plan3);
-      if (p.auditNote && p.auditNote !== '-') col2Lines.push('💡現状・注意：' + p.auditNote);
-      if (carried.comment) col2Lines.push('📝コメント：' + carried.comment);
+      if (p.auditNote && p.auditNote !== '-') {
+        const formattedNote = p.auditNote.startsWith('・') ? ('\n' + p.auditNote) : ('\n・' + p.auditNote);
+        col2Lines.push('💡現状・注意：' + formattedNote);
+      }
+      if (carried.comment) {
+        col2Lines.push('📝コメント：' + carried.comment);
+      }
 
       const col2 = col2Lines.join('\n') || '要個別検討';
       const defaultDec = carried.decision || '';
@@ -77,26 +91,28 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
     });
 
     const table = body.appendTable(tableRows);
-    styleReadableDocTable_(table, '#1a73e8', [115, 265, 95, 65]);
+    styleReadableDocTable_(table, '#1a73e8', [110, 250, 115, 65]);
 
-    // 引き継いだ確定案（全案以外）がある場合、2列目の該当する【案X】に薄い赤色マーカーも即時付与
+    // ★fullDecTxt（「→ ⭕...」行を含む全文）を渡すことで、承諾案は緑マーカー、通常選択案は赤マーカーで塗り分ける
     if (typeof applySelectedPlanMarkerToDocCell64_ === 'function') {
       for (let r = 1; r < table.getNumRows(); r++) {
         const row = table.getRow(r);
-        const decTxt = row.getCell(2).getText().trim();
-        if (decTxt) {
-          applySelectedPlanMarkerToDocCell64_(row.getCell(1), row.getCell(1).getText(), decTxt);
+        const fullDecTxt = row.getCell(2).getText().trim();
+        if (fullDecTxt) {
+          applySelectedPlanMarkerToDocCell64_(row.getCell(1), row.getCell(1).getText(), fullDecTxt);
         }
       }
     }
   });
 
   const metaText = [
-    '📅 作成日時：' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm') + ' ｜ 対象期間：' + formatDateWithDow_(rawContext.periodStart) + ' ～ ' + formatDateWithDow_(rawContext.periodEnd) + '（対象不在枠：' + rawContext.unfilledCount + '件 ／ 🔗前回MTGからの自動引き継ぎ：' + carriedOverCount + '枠）',
+    '📅 作成日時：' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm') + ' ｜ 対象期間：' + formatDateWithDow_(rawContext.periodStart) + ' ～ ' + formatDateWithDow_(rawContext.periodEnd) + '（対象不在枠：' + rawContext.unfilledCount + '件 ／ 🔗前回引継・調整結果反映：' + carriedOverCount + '枠）',
     '💡 手当ルール：常勤追加勤務手当（1,500円/h）＝『常勤依頼手当』シート記載医師のみ ／ 拠点移動手当（10,000円）＝一律支給（SBUのみ0円）',
-    '✍️ 確定案の引き継ぎ：前回の会議ドキュメントで決定済みの確定案・担当者・コメントは自動的に引き継がれています（候補順が変わった場合も医師名を自動追従）。新規枠や未定枠のみ選択してください。'
+    '✍️ マーカーと調整結果（→）の見方：⭕承諾（OK）となった案は【緑色マーカー】、現在選択・打診中の案は【赤色マーカー】で表示されます。❌辞退となった枠は次案を選択してください。'
   ].join('\n');
-  metaPara.setText(metaText).setFontSize(8.5).setForegroundColor('#444444').setLineSpacing(1.25).setSpacingAfter(6);
+
+  metaPara.setText(metaText);
+  metaPara.setFontSize(8.5).setForegroundColor('#444444').setLineSpacing(1.25).setSpacingAfter(6);
 
   body.appendPageBreak();
   body.appendParagraph('第2部：急募のお知らせ配信（1週間分・1ページ完全収容テンプレート）')
@@ -172,7 +188,7 @@ function styleReadableDocTable_(table, headerHexColor, colWidths) {
 }
 
 function highlightKeywordsInText_(textObj) {
-  ['【案1】', '【案2】', '【案3】', '【2診目崩し】', '【2診目崩し・要延長セット】', '【1診・併行募集】', '💡現状・注意：'].forEach(function(pat) {
+  ['【案1】', '【案2】', '【案3】', '【2診目崩し】', '【2診目崩し・要延長セット】', '【1診・併行募集】', '💡現状・注意：', '📝コメント：'].forEach(function(pat) {
     let found = textObj.findText(pat);
     while (found) {
       found.getElement().asText().setBold(found.getStartOffset(), found.getEndOffsetInclusive(), true);

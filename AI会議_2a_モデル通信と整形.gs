@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_2a_モデル通信と整形.gs
- * （不要な「複数枠で確定時は自動でおまとめ打診化」文言カット・セット提案・誤字補正版）
+ * （「💡現状・注意：」の改行箇条書き整形・不要文言カット・誤字補正版）
  * ============================================================================
  */
 
@@ -41,6 +41,9 @@ function cleanPlanTextFormatting_(text) {
     .trim();
 }
 
+/**
+ * ★改善：注意書きを「 / 」の1行繋ぎではなく、1項目ずつ改行（\n・...）して見やすく整形する関数
+ */
 function cleanAuditNoteFormatting_(noteText) {
   const raw = String(noteText || '')
     .replace(/亀原本院/g, '亀有')
@@ -50,7 +53,11 @@ function cleanAuditNoteFormatting_(noteText) {
     .trim();
   if (!raw || raw === '-' || raw === 'なし' || raw === '特になし') return '';
 
-  const sentences = raw.split(/(?:。|\s+[\/／]\s+|\n)+/).map(function(s) { return s.trim(); }).filter(Boolean);
+  const sentences = raw
+    .split(/(?:。|\s+[\/／]\s+|(?<!\d)[\/／](?!\d)|\n)+/)
+    .map(function(s) { return s.replace(/^[・\s]+/, '').trim(); })
+    .filter(Boolean);
+
   const meaningful = sentences.filter(function(s) {
     if (s.includes('一般連絡')) return false;
     if (/(通常常勤|通常勤務).*?(延長不可|早出不可|移動不可|打診不可|不可)/.test(s)) return false;
@@ -61,7 +68,8 @@ function cleanAuditNoteFormatting_(noteText) {
     return true;
   });
 
-  return meaningful.join(' / ');
+  if (meaningful.length === 0) return '';
+  return meaningful.map(function(s) { return '・' + s; }).join('\n');
 }
 
 function buildMasterNameCorrectionMap2a_(allSlots) {
@@ -178,7 +186,10 @@ function buildDeterministicSlotPlanFast_(slot, officialNameList) {
 
   if (slot.currentMemo && String(slot.currentMemo).trim() && slot.currentMemo !== '-') {
     const correctedMemo = correctDoctorNamesInMemoText_(slot.currentMemo, officialNameList);
-    auditNotes.push('【進行中メモ】' + correctedMemo);
+    // 進行中メモ自体に複数行または「 / 」区切りがある場合も、それぞれに【進行中メモ】を付けて見やすく分割
+    correctedMemo.split(/(?:\r?\n|\s+[\/／]\s+)/).map(function(m) { return m.replace(/^[・\s]+/, '').trim(); }).filter(Boolean).forEach(function(mLine) {
+      auditNotes.push('【進行中メモ】' + mLine);
+    });
   }
 
   // 1. 第1優先：自拠点の前後医による「延長・早出」
@@ -334,12 +345,11 @@ function callGeminiAgentInBatches_(rawContext, customRulesText) {
       const occurrences = (dayDocSlotMap.get(key) || []).filter(function(x) { return x.slotId !== sp.slotId; });
       if (occurrences.length > 0) {
         const otherLabels = occurrences.map(function(x) { return x.label + '[' + x.planNum + ']'; }).join('、');
-        // ★ご要望により「（複数枠で確定時は自動でおまとめ打診化）」の冗長な文言をカット
         notes.push('⚠️' + dName + '先生は同日他枠（' + otherLabels + '）でも候補');
       }
     });
 
-    sp.auditNote = cleanAuditNoteFormatting_(notes.join(' / ')) || '-';
+    sp.auditNote = cleanAuditNoteFormatting_(notes.join('\n')) || '-';
   });
 
   Logger.log('  ⚡ 全 ' + allSlotPlans.length + ' 枠のプラン＆同日重複候補チェック完了（' + (Date.now() - t0) + 'ms）');
