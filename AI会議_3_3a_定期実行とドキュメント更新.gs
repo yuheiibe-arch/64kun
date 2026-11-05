@@ -120,7 +120,7 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
         if (row.getNumCells() < 4) continue;
 
         const c0 = row.getCell(0).getText().trim();
-        const c1 = row.getCell(1).getText().trim();
+        const c1 = row.getCell(1).getText().trim().replace(/(【案[123１２３]】[^\n]+?)\1+/g, '$1');
         const c2Raw = row.getCell(2).getText().trim();
         const c2Header = c2Raw.split('\n').filter(function(l) { return !l.trim().startsWith('→'); }).join(' ').trim();
 
@@ -158,17 +158,56 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
         const resolved = resolveCarriedOverDecisionForSlot3_(prevEntry, planObj, { currentMemo: latestMemoText }, mailHistoryIndex);
         let finalDecisionText = resolved.decision;
 
-        // ★シフト応募通知メールで該当枠への応募が入っている場合、3列目に「→ ⭕〇〇：応募あり充足」を追記
+        // ★改善：シフト応募通知メールで該当枠への応募が入っている場合の統合反映ロジック
+        // （分割応募の重複排除・(案X)タグ自動付与・古い「📩返信待ち / ⚠️要確認」の上書き昇格）
         if (applyIndex && typeof findMatchingShiftApplicationsForSlot3_3d_ === 'function') {
           const cleanC = cleanClinicBaseName_(clinicTitle);
           const tmMatch = timeAndWage.match(/(\d{1,2}:\d{2}\s*[\-~～]\s*\d{1,2}:\d{2})/);
-          const matchedApps = findMatchingShiftApplicationsForSlot3_3d_(curDate, cleanC, tmMatch ? tmMatch[1] : '', applyIndex);
-          matchedApps.forEach(function(app) {
-            if (!finalDecisionText.includes(app.doctorName)) {
-              const appLine = '→ ⭕' + app.doctorName + '：応募あり充足(' + app.receivedDateShort + ')';
-              finalDecisionText = finalDecisionText ? (finalDecisionText + '\n' + appLine) : appLine;
-            }
-          });
+          const slotTimeRange = tmMatch ? tmMatch[1].replace(/\s+/g, '').replace(/[～~]/g, '-') : '';
+          const matchedApps = findMatchingShiftApplicationsForSlot3_3d_(curDate, cleanC, slotTimeRange, applyIndex);
+
+          if (matchedApps.length > 0) {
+            const appsByDoc = new Map();
+            matchedApps.forEach(function(app) {
+              const dKey = normKeyForDoc_(app.doctorName);
+              if (!dKey) return;
+              if (!appsByDoc.has(dKey)) {
+                appsByDoc.set(dKey, {
+                  doctorName: app.doctorName,
+                  receivedDateShort: app.receivedDateShort,
+                  times: app.workTime ? [app.workTime] : []
+                });
+              } else {
+                const ex = appsByDoc.get(dKey);
+                if (app.workTime && !ex.times.includes(app.workTime)) ex.times.push(app.workTime);
+              }
+            });
+
+            let decLines = finalDecisionText ? finalDecisionText.split('\n') : [];
+
+            appsByDoc.forEach(function(appGroup, dKey) {
+              let matchedPlanTag = '';
+              ['1', '2', '3'].forEach(function(pNum) {
+                if (!matchedPlanTag && planObj['plan' + pNum] && normKeyForDoc_(planObj['plan' + pNum]).includes(dKey)) {
+                  matchedPlanTag = '(案' + pNum + ')';
+                }
+              });
+
+              decLines = decLines.filter(function(line) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith('→')) return true;
+                if (normKeyForDoc_(trimmed).includes(dKey)) return false;
+                return true;
+              });
+
+              const sortedTimes = appGroup.times.sort().join('・');
+              const timeNote = (sortedTimes && sortedTimes !== slotTimeRange) ? ('[' + sortedTimes + ']') : '';
+              const appLine = '→ ⭕' + appGroup.doctorName + matchedPlanTag + '：応募あり充足' + timeNote + '(' + appGroup.receivedDateShort + ')';
+              decLines.push(appLine);
+            });
+
+            finalDecisionText = decLines.filter(Boolean).join('\n');
+          }
         }
 
         if (finalDecisionText !== c2Raw) {

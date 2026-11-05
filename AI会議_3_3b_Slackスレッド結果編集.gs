@@ -65,7 +65,10 @@ function updateExistingSlackThreadMessagesInC0AJTMLF0UD_(mailHistoryIndex) {
       const dateMatch = rawText.match(/`(\d{1,2})月(\d{1,2})日\s*[\(（][日月火水木金土][\)）]`/);
       if (!dateMatch) return;
 
-      const ymd = '2026/' + ('0' + dateMatch[1]).slice(-2) + '/' + ('0' + dateMatch[2]).slice(-2);
+      // ★修正：年またぎ（12月に翌1月のスレッドを処理する場合）でも自動で正しい年を計算する
+      const targetMonth = Number(dateMatch[1]);
+      const targetYear = (curMonth === 12 && targetMonth <= 2) ? (now.getFullYear() + 1) : now.getFullYear();
+      const ymd = targetYear + '/' + ('0' + targetMonth).slice(-2) + '/' + ('0' + dateMatch[2]).slice(-2);
       if (ymd < todayYmd) return;
 
       const built = buildUpdatedThreadMessageText3_3_(rawText, ymd, mailHistoryIndex);
@@ -124,19 +127,20 @@ function buildUpdatedThreadMessageText3_3_(rawText, ymd, mailHistoryIndex) {
   const checks = [];
   const declines = [];
 
-  // ★シフト応募通知インデックスから、当該枠（日付・拠点・時間帯）への応募があるかチェック
   const applyIndex = mailHistoryIndex ? mailHistoryIndex._applyIndex : null;
   const matchedApps = (applyIndex && typeof findMatchingShiftApplicationsForSlot3_3d_ === 'function')
     ? findMatchingShiftApplicationsForSlot3_3d_(ymd, cleanC, slotTimeRange, applyIndex)
     : [];
-  const appliedDocNames = new Set(matchedApps.map(function(a) { return a.doctorName; }));
+
+  // 異体字の揺れも含めて同一医師と判定できるように normKeyForDoc_ ベースでセット化
+  const appliedDocKeys = new Set(matchedApps.map(function(a) { return normKeyForDoc_(a.doctorName); }));
 
   docs.forEach(function(dName) {
     const surname = extractDoctorSurnameForSlack3_3_(dName);
-    const cleanD = String(dName || '').replace(/[\s\u3000]+/g, '');
+    const dKey = normKeyForDoc_(dName);
 
     // ① 交渉していた先生本人がサイトからシフト応募してくれた場合
-    if (appliedDocNames.has(cleanD)) {
+    if (appliedDocKeys.has(dKey)) {
       accepts.push('⇒' + surname + '先生 応募あり・勤務了承 ' + cleanC + timeBand + 'は充足');
       return;
     }
@@ -152,9 +156,14 @@ function buildUpdatedThreadMessageText3_3_(rawText, ymd, mailHistoryIndex) {
     }
   });
 
-  // ② 交渉していた先生以外の別医師から当該枠へシフト応募が入った場合（例: 「⇒高橋先生より応募あり、充足」）
+  // ② 交渉していた先生以外の別医師から当該枠へシフト応募が入った場合（分割応募での重複出力も防止）
+  const seenExternalAppKeys = new Set();
   matchedApps.forEach(function(app) {
-    const isAlreadyInDocs = docs.some(function(d) { return String(d).replace(/[\s\u3000]+/g, '') === app.doctorName; });
+    const appKey = normKeyForDoc_(app.doctorName);
+    if (!appKey || seenExternalAppKeys.has(appKey)) return;
+    seenExternalAppKeys.add(appKey);
+
+    const isAlreadyInDocs = docs.some(function(d) { return normKeyForDoc_(d) === appKey; });
     if (!isAlreadyInDocs) {
       const appSurname = extractDoctorSurnameForSlack3_3_(app.doctorName);
       const pendingDocs = docs.filter(function(d) {

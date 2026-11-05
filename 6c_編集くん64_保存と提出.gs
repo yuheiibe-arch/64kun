@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6c_編集くん64_保存と提出.gs
- * （OK［⭕承諾］の案は「薄い緑色マーカー #bbf7d0」、通常の選択案は「薄い赤色マーカー #ffd6d6」で色分けする版）
+ * （OK［⭕承諾・応募充足］の案は「薄い緑色マーカー #bbf7d0」、通常の選択案は「薄い赤色マーカー #ffd6d6」で色分けする版）
  * ============================================================================
  */
 
@@ -100,11 +100,13 @@ function saveHenshukunDraft(payload) {
 
 /**
  * ★改善版：確定案および調整結果（rawDecisionText）を解析し、
- * - ⭕承諾（OK）が出ている案 ➔ 「爽やかな緑色マーカー（#bbf7d0）」
+ * - ⭕承諾（OK・応募充足）が出ている案 ➔ 「爽やかな緑色マーカー（#bbf7d0）」
  * - それ以外の選択案（打診中・返信待ち等） ➔ 「薄い赤色マーカー（#ffd6d6）」
  * を2列目（AI推奨アプローチ列）の該当する【案X】の行に付与する関数。
+ * また、【案1】...【案1】...のような重複文字列があれば自動で1つにクリーニングする。
  */
-function applySelectedPlanMarkerToDocCell64_(cell1, c1Text, rawDecisionText) {
+function applySelectedPlanMarkerToDocCell64_(cell1, rawC1Text, rawDecisionText) {
+  const c1Text = String(rawC1Text || '').replace(/(【案[123１２３]】[^\n]+?)\1+/g, '$1');
   cell1.setText(c1Text);
   if (!c1Text) return;
 
@@ -121,7 +123,17 @@ function applySelectedPlanMarkerToDocCell64_(cell1, c1Text, rawDecisionText) {
   const fullDecStr = String(rawDecisionText || '').trim();
   if (!fullDecStr) return;
 
-  // 1. 「→ ⭕...(案X)...：承諾」の行から、承諾（OK）済みの案番号を抽出
+  // 各【案X】のテキストをマップ化（医師名での逆引き照合用）
+  const planLineMap = {};
+  c1Text.split('\n').forEach(function(line) {
+    const pm = line.trim().match(/^【案([123１２３])】(.*)$/);
+    if (pm) {
+      const pNum = pm[1].replace(/[１２３]/g, function(ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0); });
+      planLineMap[pNum] = pm[2].trim();
+    }
+  });
+
+  // 1. 「→ ⭕...(案X)...：承諾 / 応募あり充足」の行から、承諾（OK）済みの案番号を抽出
   const acceptedPlanNums = new Set();
   fullDecStr.split('\n').forEach(function(line) {
     const s = line.trim();
@@ -132,6 +144,19 @@ function applySelectedPlanMarkerToDocCell64_(cell1, c1Text, rawDecisionText) {
           const num = tok.replace(/[^123１２３]/g, '').replace(/[１２３]/g, function(ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0); });
           if (num) acceptedPlanNums.add(num);
         });
+      } else {
+        // もし「→ ⭕宗像恵美子：応募あり充足」のように(案X)が書かれていない場合でも、医師名が案1〜案3にあれば自動で緑マーカー対象にする
+        const docMatch = s.match(/⭕\s*([^\(（：:\s]+)/);
+        if (docMatch && typeof normKeyForDoc_ === 'function') {
+          const dKey = normKeyForDoc_(docMatch[1]);
+          if (dKey) {
+            ['1', '2', '3'].forEach(function(pNum) {
+              if (planLineMap[pNum] && normKeyForDoc_(planLineMap[pNum]).includes(dKey)) {
+                acceptedPlanNums.add(pNum);
+              }
+            });
+          }
+        }
       }
     }
   });
@@ -170,13 +195,12 @@ function applySelectedPlanMarkerToDocCell64_(cell1, c1Text, rawDecisionText) {
     });
   }
 
-  // 承諾（⭕）が出ている案は、仮に1行目が別の案になっていても緑マーカー対象として追加
   acceptedPlanNums.forEach(function(num) { selectedPlanNums.add(num); });
 
   if (selectedPlanNums.size === 0) return;
 
   const COLOR_SELECTED_RED = '#ffd6d6'; // 通常選択・交渉中（薄い赤色）
-  const COLOR_ACCEPTED_GREEN = '#bbf7d0'; // ⭕承諾・OK確定（爽やかな緑色）
+  const COLOR_ACCEPTED_GREEN = '#bbf7d0'; // ⭕承諾・応募充足確定（爽やかな緑色）
 
   const lines = c1Text.split('\n');
   let curOffset = 0;
@@ -195,7 +219,6 @@ function applySelectedPlanMarkerToDocCell64_(cell1, c1Text, rawDecisionText) {
     const pNum = m[1].replace(/[１２３]/g, function(s) { return String.fromCharCode(s.charCodeAt(0) - 0xFEE0); });
     if (!selectedPlanNums.has(pNum)) return;
 
-    // ★OK（⭕承諾）が出ている案は緑色マーカー、それ以外の選択案は赤色マーカーを適用！
     const targetColor = acceptedPlanNums.has(pNum) ? COLOR_ACCEPTED_GREEN : COLOR_SELECTED_RED;
     textObj.setBackgroundColor(lineStart, lineEnd, targetColor);
     textObj.setBold(lineStart, lineEnd, true);
@@ -249,6 +272,7 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
             c0Lines[0] = formatClinicTitle64_(c0Lines[0]);
 
             let c1 = cleanSidebarDisplayText_(row.getCell(1).getText())
+              .replace(/(【案[123１２３]】[^\n]+?)\1+/g, '$1')
               .replace(/\n*📝コメント[：:].*$/g, '')
               .trim();
             const cmnt = String(item.customComment || '').trim();
@@ -256,7 +280,6 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
               c1 += '\n📝コメント：' + cmnt;
             }
 
-            // 既存の3列目にあった「→」調整結果行は保持したまま、1行目の確定案を更新する
             const existingC2Lines = row.getCell(2).getText().split('\n');
             const arrowLines = existingC2Lines.filter(function(l) { return l.trim().startsWith('→'); });
 
