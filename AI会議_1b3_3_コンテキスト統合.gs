@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_1b3_3_コンテキスト統合.gs
- * （「野口優輔先生へ延長打診を確認後に井上信明先生へ移動打診」等のセット提案対応版）
+ * （募集枠の長時間統合に伴う個別打診候補の帯単位マッチング・要延長セット対応版）
  * ============================================================================
  */
 
@@ -10,6 +10,13 @@ function makeNormalizedSpotKey_(dateStr, rawClinicStr, absTimeStr) {
   const cleanC = cleanClinicBaseName_(rawClinicStr);
   const dept = String(rawClinicStr || '').includes('内科') ? '内科' : '小児科';
   return cleanD + '_' + cleanC + '_' + dept + '_' + String(absTimeStr || '').trim();
+}
+
+function makeSpotClinicDatePrefix1b3_(dateStr, rawClinicStr) {
+  const cleanD = normalizeDateYmd1b3_(dateStr);
+  const cleanC = cleanClinicBaseName_(rawClinicStr);
+  const dept = String(rawClinicStr || '').includes('内科') ? '内科' : '小児科';
+  return cleanD + '_' + cleanC + '_' + dept + '_';
 }
 
 function collectCompactContextForAi_(ss) {
@@ -118,6 +125,7 @@ function collectCompactContextForAi_(ss) {
         rank: r[4],
         docKey: dKey,
         doctor: dispName,
+        slotTime: tStr,
         sameDowSlotNum: sameDowSlotNum,
         totalCountNum: totalCountNum,
         trackRecordLabel: trackRecordLabel,
@@ -206,13 +214,11 @@ function collectCompactContextForAi_(ss) {
           const baseLabel = isSbu ? (dispName + '[★SBU]') : (isFt ? (dispName + '[常勤・所定休出]') : dispName);
 
           if (docCount >= 2) {
-            // ★無条件の2診目崩しか、残存医への延長・早出セット付きの2診目崩しかを判定
             const leaveEval = evaluateDoctorLeaveSourceCondition1b3_(k, s, timeInfo, pairEval, masters);
             if (leaveEval.canMove) {
               const finalLabel = leaveEval.conditionNote
                 ? (baseLabel + '｛※' + leaveEval.conditionNote + '｝')
                 : baseLabel;
-              // 延長確認が必要なセット案は、無条件の2診目崩しより少しだけ優先度スコアを下げて並べる
               const adjScore = leaveEval.conditionNote ? (baseDocScore - 8) : baseDocScore;
               movableForTwoDoc.push(finalLabel);
               if (adjScore > bestScore) bestScore = adjScore;
@@ -258,7 +264,32 @@ function collectCompactContextForAi_(ss) {
     twoDocScoredList.sort(function(a, b) { return b.score - a.score; });
     oneDocScoredList.sort(function(a, b) { return b.score - a.score; });
 
-    const rawSpots = (spotMap.get(makeNormalizedSpotKey_(dateStr, clinic, absTime)) || []).slice();
+    // ★個別打診候補の取得：募集時間が「15:00-16:00」から「15:00-18:00」へ拡張された場合でも、
+    //   同日・同拠点・同診療科で時間帯が重なる個別打診候補をすべて合流させる
+    const exactKey = makeNormalizedSpotKey_(dateStr, clinic, absTime);
+    const prefix = makeSpotClinicDatePrefix1b3_(dateStr, clinic);
+    const rawSpots = [];
+    const seenSpotDocKeys = new Set();
+
+    const addSpotList = function(list) {
+      (list || []).forEach(function(item) {
+        if (!seenSpotDocKeys.has(item.docKey)) {
+          seenSpotDocKeys.add(item.docKey);
+          rawSpots.push(item);
+        }
+      });
+    };
+
+    addSpotList(spotMap.get(exactKey));
+    for (const [k, list] of spotMap.entries()) {
+      if (k !== exactKey && k.startsWith(prefix)) {
+        const subTimeStr = k.slice(prefix.length);
+        if (isTimeRangeOverlapping1b3_(absTime, subTimeStr)) {
+          addSpotList(list);
+        }
+      }
+    }
+
     rawSpots.sort(function(a, b) {
       if (b.sameDowSlotNum !== a.sameDowSlotNum) return b.sameDowSlotNum - a.sameDowSlotNum;
       return b.totalCountNum - a.totalCountNum;

@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_1b3_1_不在枠抽出と補完.gs
- * （日付・時間帯の正規化、重複時間帯の排除、確定シフト充足済み除外、終日不在補完）
+ * （募集シフトの募集時間への自動合わせ込み・複数重複時は「長い方の枠」を採用する版）
  * ============================================================================
  */
 
@@ -46,13 +46,105 @@ function normalizeAndExpandAbsenceTime1b3_(rawTimeStr, clinicName) {
 }
 
 /**
- * 2つの時間帯文字列（例: "19:00-21:00" と "18:00-21:00"）が重なっているかを判定
+ * 2つの時間帯文字列（例: "15:00-16:00" と "15:00-18:00"）が重なっているかを判定
  */
 function isTimeRangeOverlapping1b3_(timeStr1, timeStr2) {
   if (timeStr1 === timeStr2) return true;
   const p1 = parseAbsenceTimeline_(timeStr1);
   const p2 = parseAbsenceTimeline_(timeStr2);
   return Math.max(p1.startMin, p2.startMin) < Math.min(p1.endMin, p2.endMin);
+}
+
+function formatMinToHHMM1b3_1_(totalMin) {
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return ('0' + h).slice(-2) + ':' + ('0' + m).slice(-2);
+}
+
+/**
+ * ★新設：不在時間（例：15:00-16:00）に対して、募集シフト一覧や当日シフトの状況から
+ * 実際に募集が出ている長い方の募集時間（例：15:00-18:00 や 15:00-17:00）へ拡張する関数
+ */
+function expandToLongestRecruitSlotTime1b3_(dateStr, rawClinic, absTimeStr, recruitSlotsIndex, activeShifts) {
+  const cleanC = cleanClinicBaseName_(rawClinic);
+  const deptTag = String(rawClinic || '').includes('内科') ? '内科' : '小児科';
+  const isKitakasai = cleanC.includes('北葛西');
+  const p = parseAbsenceTimeline_(absTimeStr);
+  let bestStart = p.startMin;
+  let bestEnd = p.endMin;
+
+  // 1. 募集シフトインデックス（BQ未充足・募集シート・不在枠の別行）に重なる枠があれば、最も長い範囲（和集合）を採用
+  const key = dateStr + '_' + cleanC + '_' + deptTag;
+  const candidates = (recruitSlotsIndex && recruitSlotsIndex.get(key)) || [];
+  candidates.forEach(function(candTime) {
+    const cp = parseAbsenceTimeline_(candTime);
+    // 同じ帯（午前・午後・夜間）で重なっている募集枠なら、長い方に広げる
+    if (Math.max(bestStart, cp.startMin) < Math.min(bestEnd, cp.endMin) &&
+        cp.targetBands[0] === p.targetBands[0]) {
+      bestStart = Math.min(bestStart, cp.startMin);
+      bestEnd = Math.max(bestEnd, cp.endMin);
+    }
+  });
+
+  // 2. まだ帯の途中（例：15:00-16:00 や 12:15-13:00）で1時間以下などの細切れになっている場合、
+  //    当日シフト（activeShifts）を確認し、募集枠として帯の終わり（18:00や17:00等）まで空いていればその募集枠時間に合わせる
+  const primaryBand = p.targetBands[0] || 'A';
+  const bandStart = primaryBand === 'A' ? 540 : (primaryBand === 'B' ? (isKitakasai ? 840 : 900) : 1080);
+  const bandEnd = primaryBand === 'A' ? (isKitakasai ? 750 : 780) : (primaryBand === 'B' ? 1080 : (isKitakasai ? 1200 : 1260));
+
+  if (bestStart > bandStart || bestEnd < bandEnd) {
+    const matchingShiftRows = (activeShifts || []).filter(function(s) {
+      if (normalizeDateYmd1b3_(s[0]) !== dateStr) return false;
+      if (cleanClinicBaseName_(s[2]) !== cleanC) return false;
+      const sDept = (String(s[2] || '').includes('内科') || String(s[3] || '').includes('内科')) ? '内科' : '小児科';
+      return sDept === deptTag;
+    });
+
+    if (matchingShiftRows.length > 0) {
+      const sRow = matchingShiftRows[0];
+      const docsCol = primaryBand === 'A' ? 7 : (primaryBand === 'B' ? 8 : 9);
+      const tokens = splitDoctorTokensSafely_(sRow[docsCol]);
+      const allRowHint = [sRow[7], sRow[8], sRow[9]].join(' / ');
+
+      // その帯にいる医師の開始・終了時刻を取得
+      const shiftIntervals = [];
+      tokens.forEach(function(tok) {
+        if (!tok || tok.includes('未充足')) return;
+        if (typeof parseDocTokenWorkingMinutes1b3_ === 'function') {
+          const hrs = parseDocTokenWorkingMinutes1b3_(tok, primaryBand, isKitakasai, allRowHint);
+          shiftIntervals.push({ startMin: hrs.startMin, endMin: hrs.endMin });
+        }
+      });
+
+      // 後方の拡張（例：15:00-16:00 で16:00から1人だけ医師が入る場合、次の医師が入る時刻または18:00まで募集枠として広げる）
+      if (bestEnd < bandEnd) {
+        let nextBoundary = bandEnd;
+        shiftIntervals.forEach(function(iv) {
+          if (iv.startMin > bestEnd && iv.startMin < nextBoundary) {
+            nextBoundary = iv.startMin;
+          }
+        });
+        bestEnd = nextBoundary;
+      }
+
+      // 前方の拡張（例：17:00-18:00 が不在で、15:00から募集枠が空いている場合）
+      if (bestStart > bandStart) {
+        let prevBoundary = bandStart;
+        shiftIntervals.forEach(function(iv) {
+          if (iv.endMin < bestStart && iv.endMin > prevBoundary) {
+            prevBoundary = iv.endMin;
+          }
+        });
+        bestStart = prevBoundary;
+      }
+    } else {
+      // 当日シフト行自体がない（完全空き）なら標準の帯全体（09:00-13:00 / 15:00-18:00 / 18:00-21:00）を募集枠とする
+      bestStart = Math.min(bestStart, bandStart);
+      bestEnd = Math.max(bestEnd, bandEnd);
+    }
+  }
+
+  return formatMinToHHMM1b3_1_(bestStart) + '-' + formatMinToHHMM1b3_1_(bestEnd);
 }
 
 /**
@@ -117,10 +209,42 @@ function isSlotAlreadyCoveredByActiveShift1b3_(dateStr, rawClinic, absTimeStr, a
 }
 
 /**
- * 『最新_不在枠』をベースにしつつ、重複時間帯の二重生成を防ぎながら終日不在枠等を補完する関数
+ * ★募集シフトの募集時間（重なる枠が複数ある場合は長い方）に統一して不在枠リストを構築する関数
  */
 function recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilledRows, activeShifts, spotCandidates, tomorrowYmd, targetEndYmd) {
   const combined = [];
+  const recruitSlotsIndex = new Map(); // key: "date_clinic_dept" -> [timeStr, ...]
+
+  const addRecruitIndex = function(dRaw, rawClinic, rawTime) {
+    const d = normalizeDateYmd1b3_(dRaw);
+    if (!d) return;
+    const cleanC = cleanClinicBaseName_(rawClinic);
+    if (!cleanC || cleanC.includes('バックアップ')) return;
+    const deptTag = String(rawClinic || '').includes('内科') ? '内科' : '小児科';
+    const key = d + '_' + cleanC + '_' + deptTag;
+    if (!recruitSlotsIndex.has(key)) recruitSlotsIndex.set(key, []);
+    const list = recruitSlotsIndex.get(key);
+    normalizeAndExpandAbsenceTime1b3_(rawTime, cleanC).forEach(function(t) {
+      if (t && !list.includes(t)) list.push(t);
+    });
+  };
+
+  // 募集シフト候補の時間帯をすべてインデックス化（不在枠シート・個別打診候補シート・BQシフト状況パック）
+  (rawUnfilledRows || []).forEach(function(r) { addRecruitIndex(r[0], r[1], r[2]); });
+  (spotCandidates || []).forEach(function(r) { addRecruitIndex(r[0], r[2], r[3]); });
+
+  let bqMijyusokuList = [];
+  if (typeof fetchAndDecryptBqMailForResolver_ === 'function') {
+    try {
+      const bqData = fetchAndDecryptBqMailForResolver_();
+      if (bqData) {
+        bqMijyusokuList = (bqData.mijyusoku || []).concat(bqData.boshu || []);
+        bqMijyusokuList.forEach(function(m) {
+          addRecruitIndex(m.d || m.date, m.c || m.clinic, m.t || m.time);
+        });
+      }
+    } catch (e) {}
+  }
 
   const registerRowIfTrulyUnfilled = function(rowArr, isFromPrimarySheet) {
     const d = normalizeDateYmd1b3_(rowArr[0]);
@@ -131,16 +255,30 @@ function recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilledRows, activeShifts, 
     const deptTag = rawClinic.includes('内科') ? '内科' : '小児科';
     const expandedTimes = normalizeAndExpandAbsenceTime1b3_(rowArr[2], cleanC);
 
-    expandedTimes.forEach(function(tStr) {
-      // すでに同日・同拠点・同診療科で時間帯が重なる枠（例：19:00-21:00に対する18:00-21:00）があれば追加しない
-      const alreadyHasOverlappingSlot = combined.some(function(ex) {
+    expandedTimes.forEach(function(rawTStr) {
+      // ★募集シフトの長い方の募集時間（例：15:00-16:00 ➔ 15:00-18:00）へ自動拡張
+      const tStr = expandToLongestRecruitSlotTime1b3_(d, rawClinic, rawTStr, recruitSlotsIndex, activeShifts);
+      const newTl = parseAbsenceTimeline_(tStr);
+
+      // すでに同日・同拠点・同診療科で時間帯が重なる枠があるかチェック
+      const existingIdx = combined.findIndex(function(ex) {
         if (ex[0] !== d) return false;
         if (cleanClinicBaseName_(ex[1]) !== cleanC) return false;
         const exDept = String(ex[1] || '').includes('内科') ? '内科' : '小児科';
         if (exDept !== deptTag) return false;
         return isTimeRangeOverlapping1b3_(ex[2], tStr);
       });
-      if (alreadyHasOverlappingSlot) return;
+
+      if (existingIdx !== -1) {
+        // ★もし重なる枠が既にある場合、比較して「より長い方の募集時間」に更新する！
+        const exTl = parseAbsenceTimeline_(combined[existingIdx][2]);
+        if (newTl.durationHours > exTl.durationHours) {
+          const mergedStart = Math.min(exTl.startMin, newTl.startMin);
+          const mergedEnd = Math.max(exTl.endMin, newTl.endMin);
+          combined[existingIdx][2] = formatMinToHHMM1b3_1_(mergedStart) + '-' + formatMinToHHMM1b3_1_(mergedEnd);
+        }
+        return;
+      }
 
       if (!isFromPrimarySheet && isSlotAlreadyCoveredByActiveShift1b3_(d, rawClinic, tStr, activeShifts)) {
         return;
@@ -153,34 +291,27 @@ function recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilledRows, activeShifts, 
     });
   };
 
-  // 1. 最優先：『最新_不在枠』シートにある不在枠を登録
+  // 1. 最優先：『最新_不在枠』シートにある枠を登録（募集シフトの長い時間で登録）
   (rawUnfilledRows || []).forEach(function(r) {
     registerRowIfTrulyUnfilled(r, true);
   });
 
-  // 2. 次優先：『BQシフト状況パック(mijyusoku)』から未登録の時間帯のみ補完
-  if (typeof fetchAndDecryptBqMailForResolver_ === 'function') {
-    try {
-      const bqData = fetchAndDecryptBqMailForResolver_();
-      if (bqData && Array.isArray(bqData.mijyusoku)) {
-        bqData.mijyusoku.forEach(function(m) {
-          const d = normalizeDateYmd1b3_(m.d || m.date);
-          if (!d || d < tomorrowYmd || d > targetEndYmd) return;
-          const rawC = String(m.c || m.clinic || '').trim();
-          const rawT = String(m.t || m.time || '').trim();
-          if (!rawC || !rawT || rawC.includes('バックアップ')) return;
-          const wage = String(m.w || m.wage || m.listedWage || '13,000円');
-          const spWage = String(m.sp || m.specialWage || '');
+  // 2. 次優先：『BQシフト状況パック(mijyusoku)』から未登録の枠またはより長い募集枠を反映
+  bqMijyusokuList.forEach(function(m) {
+    const d = normalizeDateYmd1b3_(m.d || m.date);
+    if (!d || d < tomorrowYmd || d > targetEndYmd) return;
+    const rawC = String(m.c || m.clinic || '').trim();
+    const rawT = String(m.t || m.time || '').trim();
+    if (!rawC || !rawT || rawC.includes('バックアップ')) return;
+    const wage = String(m.w || m.wage || m.listedWage || '13,000円');
+    const spWage = String(m.sp || m.specialWage || '');
 
-          registerRowIfTrulyUnfilled([
-            d, rawC, rawT, wage, m.prev || 'なし', m.next || 'なし', '', '', '', '', '未充足', spWage, '', ''
-          ], false);
-        });
-      }
-    } catch (e) {}
-  }
+    registerRowIfTrulyUnfilled([
+      d, rawC, rawT, wage, m.prev || 'なし', m.next || 'なし', '', '', '', '', '未充足', spWage, '', ''
+    ], false);
+  });
 
-  // 3. 最後：『最新_当日シフト』から完全0人の帯（終日不在で漏れた拠点など）のみ補完
+  // 3. 最後：『最新_当日シフト』から完全0人の帯のみ補完
   (activeShifts || []).forEach(function(s) {
     const d = normalizeDateYmd1b3_(s[0]);
     if (!d || d < tomorrowYmd || d > targetEndYmd) return;
