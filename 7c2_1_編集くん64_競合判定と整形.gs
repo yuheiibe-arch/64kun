@@ -1,14 +1,16 @@
 /**
  * ============================================================================
  * 7c2_1_編集くん64_競合判定と整形.gs
- * （パート2前半：全案以外の選択時に推奨アプローチ欄の選択案を薄い赤色マーカー表示＆ロック解除対応版）
+ * （パート2前半：「複数枠で確定時は自動でおまとめ打診化」文言カット・赤マーカー・ロック解除対応版）
  * ============================================================================
  */
 
 function getHenshukun64ScriptPart2a_() {
   return [
     'function autoFixDoctorTyposClient64(text) {',
-    '  let s = String(text || "");',
+    '  let s = String(text || "")',
+    '    .replace(/（複数枠で確定時は自動でおまとめ打診化）/g, "")',
+    '    .replace(/\\(複数枠で確定時は自動でおまとめ打診化\\)/g, "");',
     '  if (!s || !state.doctorSearchList || state.doctorSearchList.length === 0) return s;',
     '  const toKey = function(str) {',
     '    return String(str || "")',
@@ -283,7 +285,6 @@ function getHenshukun64ScriptPart2a_() {
     '  const planDetails = rowOpt ? parsePlanDetailsByNumClient64(col2Text) : {};',
     '  const multiDocMap = rowOpt ? parseMultiDoctorPlansFromCol2_64(col2Text) : {};',
     '',
-    '  // ★「全案」以外で選択されている案番号リストを取得（UI上でも薄い赤色でマーカー表示）',
     '  let highlightedPlanNums = [];',
     '  if (rowOpt) {',
     '    const baseSel = normalizeBasePresetDecision64(rowOpt.curDecision);',

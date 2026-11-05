@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_2a_モデル通信と整形.gs
- * （残存医への延長確認＋2診目崩し移動のセット提案表記・進行中メモ誤字補正・同日重複注意書き版）
+ * （不要な「複数枠で確定時は自動でおまとめ打診化」文言カット・セット提案・誤字補正版）
  * ============================================================================
  */
 
@@ -45,6 +45,8 @@ function cleanAuditNoteFormatting_(noteText) {
   const raw = String(noteText || '')
     .replace(/亀原本院/g, '亀有')
     .replace(/亀原/g, '亀有')
+    .replace(/（複数枠で確定時は自動でおまとめ打診化）/g, '')
+    .replace(/\(複数枠で確定時は自動でおまとめ打診化\)/g, '')
     .trim();
   if (!raw || raw === '-' || raw === 'なし' || raw === '特になし') return '';
 
@@ -219,7 +221,6 @@ function buildDeterministicSlotPlanFast_(slot, officialNameList) {
     if (docs.length === 1) {
       const mObj = parseMovDocObj(docs[0]);
       if (mObj.condText) {
-        // ★残存医の延長確認が必要なセット案（例：野口優輔先生へ21:00まで延長打診を確認後に井上信明先生へ移動打診）
         actions.push('【2診目崩し・要延長セット】' + cand.clinic + '（※残る' + mObj.condText + 'に、2診目：' + mObj.label + '）へ移動打診' + allowLabel);
       } else {
         actions.push('【2診目崩し】' + cand.clinic + '（2診目：' + mObj.label + '）へ移動打診' + allowLabel);
@@ -333,7 +334,8 @@ function callGeminiAgentInBatches_(rawContext, customRulesText) {
       const occurrences = (dayDocSlotMap.get(key) || []).filter(function(x) { return x.slotId !== sp.slotId; });
       if (occurrences.length > 0) {
         const otherLabels = occurrences.map(function(x) { return x.label + '[' + x.planNum + ']'; }).join('、');
-        notes.push('⚠️' + dName + '先生は同日他枠（' + otherLabels + '）でも候補（複数枠で確定時は自動でおまとめ打診化）');
+        // ★ご要望により「（複数枠で確定時は自動でおまとめ打診化）」の冗長な文言をカット
+        notes.push('⚠️' + dName + '先生は同日他枠（' + otherLabels + '）でも候補');
       }
     });
 

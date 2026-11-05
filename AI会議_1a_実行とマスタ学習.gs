@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_1a_実行とマスタ学習.gs
- * （超高速化・『交渉しやすい医師』無断行追加禁止・列ズレ自動修復版）
+ * （会議生成前のGmailキャンセル＆医師返信リアルタイム同期・『交渉しやすい医師』無断行追加禁止・列ズレ自動修復版）
  * ============================================================================
  */
 
@@ -20,6 +20,26 @@ const MTG_DOC_CONFIG = {
 };
 
 /**
+ * ★新設：会議ドキュメント生成の直前に、Gmailから最新の「医師返信メール」「シフトキャンセル承認メール」を回収してシートを最新化するヘルパー
+ */
+function syncLatestMailsBeforeMeeting1a_(ss) {
+  try {
+    const ssId = ss.getId();
+    if (typeof getQuestionEmailsFromGmail_Final === 'function') {
+      getQuestionEmailsFromGmail_Final(ssId);
+    }
+    if (typeof getAnswerEmailsFromGmail_Final === 'function') {
+      getAnswerEmailsFromGmail_Final(ssId);
+    }
+    if (typeof matchAndCreateKnowledgeBase_Final === 'function') {
+      matchAndCreateKnowledgeBase_Final(ssId);
+    }
+  } catch (e) {
+    Logger.log('⚠️ 事前メール同期スキップ: ' + e.message);
+  }
+}
+
+/**
  * 成果物プレビュー用（Slack通知なし・カレンダー添付なし）
  */
 function runPreviewMeetingDocOnly() {
@@ -33,7 +53,8 @@ function runPreviewMeetingDocOnly() {
 
   const customRulesText = loadOrInitCustomRuleSheet_(ss);
 
-  Logger.log('🧠 0/3: マスタの列ズレ修復 ＆ ナレッジシートの新しい医師返答を確認中...');
+  Logger.log('🧠 0/3: 最新メール（シフトキャンセル・医師返信）の同期 ＆ マスタ修復を実行中...');
+  syncLatestMailsBeforeMeeting1a_(ss);
   repairNegotiableAndCautionSheetsNow(ss);
   syncNewKnowledgeToAiMemo_(ss);
 
@@ -54,7 +75,7 @@ function runPreviewMeetingDocOnly() {
 }
 
 /**
- * 本番用：AIメモ自動学習 ＋ ドキュメント作成 ＋ カレンダー添付 ＋ Slack通知
+ * 本番用：最新メール同期 ＋ AIメモ自動学習 ＋ ドキュメント作成 ＋ カレンダー添付 ＋ Slack通知
  */
 function runDemoAndSubmitMeetingDoc() {
   const t0 = Date.now();
@@ -66,6 +87,7 @@ function runDemoAndSubmitMeetingDoc() {
   }
 
   const customRulesText = loadOrInitCustomRuleSheet_(ss);
+  syncLatestMailsBeforeMeeting1a_(ss);
   repairNegotiableAndCautionSheetsNow(ss);
   syncNewKnowledgeToAiMemo_(ss);
 
@@ -107,7 +129,7 @@ function syncNewKnowledgeToAiMemo_(ss) {
     const lastRow = kbSheet.getLastRow();
     if (lastRow < 2) return;
 
-    const startRow = Math.max(2, lastRow - 19); // 直近20行に絞ってさらに高速化
+    const startRow = Math.max(2, lastRow - 19);
     const numRows = lastRow - startRow + 1;
     const kbData = kbSheet.getRange(startRow, 1, numRows, 8).getDisplayValues();
     const targetItems = [];
@@ -121,7 +143,6 @@ function syncNewKnowledgeToAiMemo_(ss) {
 
       if (!docName || !bodyText) continue;
       if (flagText.includes('AIメモ反映済') || flagText.includes('自動判定済')) continue;
-      // 「★要確認」フラグがついている行のみをAI判定対象にすることで通信量を1/5に削減
       if (!flagText.includes('★要確認')) {
         kbSheet.getRange(actualRowNumber, 8).setValue((flagText ? flagText + ' / ' : '') + '自動判定済');
         continue;
@@ -153,7 +174,6 @@ function syncNewKnowledgeToAiMemo_(ss) {
       '{"decisions":[{"rowNumber":10,"shouldWrite":true,"targetSheet":"交渉注意医師","conditionType":"部分不可","ngClinic":"","aiMemoSummary":"35文字以内の簡潔な条件要約"}]}'
     ].join('\n');
 
-    // ★推論遅延のない gemini-flash-lite-latest を直接指定
     const url = 'https://' + 'generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=' + encodeURIComponent(apiKey);
     const res = UrlFetchApp.fetch(url, {
       method: 'post',

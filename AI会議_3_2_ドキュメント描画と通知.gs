@@ -1,103 +1,15 @@
 /**
  * ============================================================================
- * 3_AI会議_ドキュメント描画と通知.gs
- * （初期値「案1」固定解除・第2部のお知らせ配信1ページ完全収容・高速描画版）
+ * AI会議_3_2_ドキュメント描画と通知.gs
+ * （後半：Googleドキュメント描画・赤色マーカー自動反映・カレンダー添付・Slack通知）
  * ============================================================================
  */
 
-const DOC_OUTPUT_FOLDER_ID = '1syiypDralKBqHwCL-0R2XeJXbhxXVcLl';
-
-function formatDateWithDow_(dateStr) {
-  const s = String(dateStr || '').trim();
-  if (!s || /[\(（][日月火水木金土][\)）]/.test(s)) return s;
-  const m = s.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
-  if (!m) return s;
-  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-  if (isNaN(d.getTime())) return s;
-  const dows = ['日', '月', '火', '水', '木', '金', '土'];
-  return m[1] + '/' + ('0' + m[2]).slice(-2) + '/' + ('0' + m[3]).slice(-2) + '（' + dows[d.getDay()] + '）';
-}
-
-function getOrResetDailyMeetingDocInFolder_(title) {
-  const props = PropertiesService.getScriptProperties();
-  const propKey = 'SINGLE_MTG_DOC_ID';
-  const todayStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd');
-
-  let folder = null;
-  try {
-    folder = DriveApp.getFolderById(DOC_OUTPUT_FOLDER_ID);
-  } catch (e) {
-    Logger.log('⚠️ 指定フォルダの取得に失敗したためマイドライブ直下を使用します: ' + e.message);
-  }
-
-  let targetDoc = null;
-  let targetDocId = '';
-  const sameDayFiles = [];
-
-  if (folder) {
-    const files = folder.getFilesByType(MimeType.GOOGLE_DOCS);
-    while (files.hasNext()) {
-      const f = files.next();
-      if (f.isTrashed()) continue;
-      const name = f.getName();
-      if (name.includes('超募集対策MTG_' + todayStr)) {
-        sameDayFiles.push(f);
-      }
-    }
-  }
-
-  if (sameDayFiles.length > 0) {
-    sameDayFiles.sort(function(a, b) { return b.getLastUpdated().getTime() - a.getLastUpdated().getTime(); });
-    const keepFile = sameDayFiles[0];
-    targetDocId = keepFile.getId();
-    targetDoc = DocumentApp.openById(targetDocId);
-    targetDoc.setName(title);
-
-    for (let i = 1; i < sameDayFiles.length; i++) {
-      try { sameDayFiles[i].setTrashed(true); } catch (e) {}
-    }
-  }
-
-  if (!targetDoc) {
-    const savedId = props.getProperty(propKey);
-    if (savedId) {
-      try {
-        const savedFile = DriveApp.getFileById(savedId);
-        if (!savedFile.isTrashed() && savedFile.getName().includes('超募集対策MTG_' + todayStr)) {
-          targetDocId = savedId;
-          targetDoc = DocumentApp.openById(targetDocId);
-          targetDoc.setName(title);
-          if (folder) moveFileToFolderSafely_(savedFile, folder);
-        }
-      } catch (e) {}
-    }
-  }
-
-  if (!targetDoc) {
-    targetDoc = DocumentApp.create(title);
-    targetDocId = targetDoc.getId();
-    const newFile = DriveApp.getFileById(targetDocId);
-    if (folder) {
-      moveFileToFolderSafely_(newFile, folder);
-    }
-  }
-
-  props.setProperty(propKey, targetDocId);
-  return targetDoc;
-}
-
-function moveFileToFolderSafely_(file, targetFolder) {
-  try {
-    file.moveTo(targetFolder);
-  } catch (e) {
-    try {
-      targetFolder.addFile(file);
-      DriveApp.getRootFolder().removeFile(file);
-    } catch (e2) {}
-  }
-}
-
 function renderStructuredMeetingDoc_(title, rawContext, aiData) {
+  // ドキュメントを上書きする前に、前回（昨日や月曜）のMTGドキュメントから確定案・担当者・コメントを収集
+  const prevDecisionsMap = loadPreviousMeetingDecisionsMap3_();
+  let carriedOverCount = 0;
+
   const doc = getOrResetDailyMeetingDocInFolder_(title);
   const body = doc.getBody();
   body.setMarginTop(20).setMarginBottom(20).setMarginLeft(24).setMarginRight(24);
@@ -108,12 +20,14 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
   }
   titlePara.setHeading(DocumentApp.ParagraphHeading.HEADING2).setSpacingAfter(4);
 
-  const metaText = [
-    '📅 作成日時：' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm') + ' ｜ 対象期間：' + formatDateWithDow_(rawContext.periodStart) + ' ～ ' + formatDateWithDow_(rawContext.periodEnd) + '（対象不在枠：' + rawContext.unfilledCount + '件）',
-    '💡 手当ルール：常勤追加勤務手当（1,500円/h）＝『常勤依頼手当』シート記載医師のみ ／ 拠点移動手当（10,000円）＝一律支給（SBUのみ0円）',
-    '✍️ 確定案の書き方：初期値は未選択（空欄）です。採用する案（「案1」「案1, 案2」「全案」等）または「ステイ」を選択してください。担当者を後から決める場合は「あとで決定」を選ぶと決定済み扱いとなり、mnys側へは「未定」で送信されます。'
-  ].join('\n');
-  body.appendParagraph(metaText).setFontSize(8.5).setForegroundColor('#444444').setLineSpacing(1.25).setSpacingAfter(6);
+  const plansByDate = {};
+  (aiData.slotPlans || []).forEach(function(p) {
+    const d = p.date || '日付未定';
+    if (!plansByDate[d]) plansByDate[d] = [];
+    plansByDate[d].push(p);
+  });
+
+  const metaPara = body.appendParagraph('');
 
   if (aiData.executiveSummary) {
     const sumTable = body.appendTable([['🤖 AIエージェント総括：' + aiData.executiveSummary]]);
@@ -121,16 +35,8 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
     sumTable.getCell(0, 0).editAsText().setFontSize(9).setBold(true);
   }
 
-  // 第1部：日付ごとのアプローチ表
   body.appendParagraph('第1部：医師不在枠 アプローチプラン（日付別一覧）')
     .setHeading(DocumentApp.ParagraphHeading.HEADING3).setSpacingBefore(8).setSpacingAfter(4);
-
-  const plansByDate = {};
-  (aiData.slotPlans || []).forEach(function(p) {
-    const d = p.date || '日付未定';
-    if (!plansByDate[d]) plansByDate[d] = [];
-    plansByDate[d].push(p);
-  });
 
   Object.keys(plansByDate).sort().forEach(function(dateLabel) {
     body.appendParagraph('◆ ' + formatDateWithDow_(dateLabel))
@@ -149,25 +55,49 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
       }
       const col1 = cleanClinic + '\n' + (p.absenceTime || '');
 
+      // 前回ドキュメントの確定案・担当者・コメントを照合して自動引き継ぎ
+      const carryKey = getSlotCarryOverKey3_(dateLabel, cleanClinic, p.absenceTime || '');
+      const carried = resolveCarriedOverDecisionForSlot3_(prevDecisionsMap.get(carryKey), p);
+      if (carried.decision || carried.assignee) {
+        carriedOverCount++;
+      }
+
       const col2Lines = [];
       if (p.plan1) col2Lines.push('【案1】' + p.plan1);
       if (p.plan2) col2Lines.push('【案2】' + p.plan2);
       if (p.plan3) col2Lines.push('【案3】' + p.plan3);
       if (p.auditNote && p.auditNote !== '-') col2Lines.push('💡現状・注意：' + p.auditNote);
+      if (carried.comment) col2Lines.push('📝コメント：' + carried.comment);
 
       const col2 = col2Lines.join('\n') || '要個別検討';
+      const defaultDec = carried.decision || '';
+      const defaultAsg = carried.assignee || p.assignee || '';
 
-      // ★初期値で「案1」に固定せず、未選択（空欄）にする
-      const defaultDec = '';
-
-      tableRows.push([col1, col2, defaultDec, p.assignee || '']);
+      tableRows.push([col1, col2, defaultDec, defaultAsg]);
     });
 
     const table = body.appendTable(tableRows);
     styleReadableDocTable_(table, '#1a73e8', [115, 265, 95, 65]);
+
+    // 引き継いだ確定案（全案以外）がある場合、2列目の該当する【案X】に薄い赤色マーカーも即時付与
+    if (typeof applySelectedPlanMarkerToDocCell64_ === 'function') {
+      for (let r = 1; r < table.getNumRows(); r++) {
+        const row = table.getRow(r);
+        const decTxt = row.getCell(2).getText().trim();
+        if (decTxt) {
+          applySelectedPlanMarkerToDocCell64_(row.getCell(1), row.getCell(1).getText(), decTxt);
+        }
+      }
+    }
   });
 
-  // 第2部：急募のお知らせ配信（改ページで新ページの先頭から開始し、フォント6.5pt・行間1.0・段落余白0で7日分を確実に1ページ内に収める）
+  const metaText = [
+    '📅 作成日時：' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm') + ' ｜ 対象期間：' + formatDateWithDow_(rawContext.periodStart) + ' ～ ' + formatDateWithDow_(rawContext.periodEnd) + '（対象不在枠：' + rawContext.unfilledCount + '件 ／ 🔗前回MTGからの自動引き継ぎ：' + carriedOverCount + '枠）',
+    '💡 手当ルール：常勤追加勤務手当（1,500円/h）＝『常勤依頼手当』シート記載医師のみ ／ 拠点移動手当（10,000円）＝一律支給（SBUのみ0円）',
+    '✍️ 確定案の引き継ぎ：前回の会議ドキュメントで決定済みの確定案・担当者・コメントは自動的に引き継がれています（候補順が変わった場合も医師名を自動追従）。新規枠や未定枠のみ選択してください。'
+  ].join('\n');
+  metaPara.setText(metaText).setFontSize(8.5).setForegroundColor('#444444').setLineSpacing(1.25).setSpacingAfter(6);
+
   body.appendPageBreak();
   body.appendParagraph('第2部：急募のお知らせ配信（1週間分・1ページ完全収容テンプレート）')
     .setFontSize(9).setBold(true).setSpacingBefore(0).setSpacingAfter(1);
@@ -188,7 +118,6 @@ function renderStructuredMeetingDoc_(title, rawContext, aiData) {
     }
   }
 
-  // 第3部は別ページにして第2部の1ページ収容を邪魔しないようにする
   body.appendPageBreak();
   body.appendParagraph('第3部：【参考・サブ情報】対象期間内の12連勤NG日')
     .setHeading(DocumentApp.ParagraphHeading.HEADING3).setSpacingBefore(4).setSpacingAfter(4);
@@ -234,13 +163,16 @@ function styleReadableDocTable_(table, headerHexColor, colWidths) {
         if (c === 1) {
           highlightKeywordsInText_(textObj);
         }
+        if (c === 2) {
+          textObj.setBold(true);
+        }
       }
     }
   }
 }
 
 function highlightKeywordsInText_(textObj) {
-  ['【案1】', '【案2】', '【案3】', '【2診目崩し】', '【1診・併行募集】', '💡現状・注意：'].forEach(function(pat) {
+  ['【案1】', '【案2】', '【案3】', '【2診目崩し】', '【2診目崩し・要延長セット】', '【1診・併行募集】', '💡現状・注意：'].forEach(function(pat) {
     let found = textObj.findText(pat);
     while (found) {
       found.getElement().asText().setBold(found.getStartOffset(), found.getEndOffsetInclusive(), true);
