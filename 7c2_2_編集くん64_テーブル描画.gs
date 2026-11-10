@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 7c2_2_編集くん64_テーブル描画.gs
- * （パート2後半：個別交渉時の「💰特別時給で交渉」オプション＆既特別時給枠のロック制御版）
+ * （パート2後半：カスタム入力の再描画保護・特別時給交渉オプション＆既特別時給枠ロック制御版）
  * ============================================================================
  */
 
@@ -110,13 +110,10 @@ function getHenshukun64ScriptPart2b_() {
     '  }).join("");',
     '}',
     '',
-    '// ★個別交渉時の「💰特別時給で交渉する」チェック＆加算額選択ボックスHTMLの組み立て',
-    '// ・通常時給の枠：そのままチェックして +2,000円〜+5,000円 を選択可能',
-    '// ・既に特別時給の枠：初期状態はロック（🔒既に特別時給枠）されており、「🔓さらに加算を許可」ボタンを押すと加算選択が可能になる',
     'function buildNegotiationSpWageBoxHtml64(row) {',
     '  const curDec = String(row.curDecision || "").trim();',
     '  const baseSel = normalizeBasePresetDecision64(curDec);',
-    '  const isPitchSelected = Boolean(baseSel && !isStayLikeDecision64(baseSel));',
+    '  const isPitchSelected = Boolean(baseSel && !isStayLikeDecision64(baseSel) && !curDec.includes("医師未選択"));',
     '  const isAlreadySpSlot = String(row.timeAndWage || "").includes("特別時給");',
     '  const isExtraUnlocked = Boolean(state.unlockedExtraSpWage && state.unlockedExtraSpWage[row.slotKey]);',
     '  const negSpInfo = extractNegotiationSpWageInfo64(curDec);',
@@ -126,7 +123,6 @@ function getHenshukun64ScriptPart2b_() {
     '    return "<option value=\\"" + amt + "\\"" + (amt === negSpInfo.amount ? " selected" : "") + ">" + lbl + "</option>";',
     '  }).join("");',
     '',
-    '  // 既に特別時給の枠で、まだロック解除されていない場合',
     '  if (isAlreadySpSlot && !isExtraUnlocked) {',
     '    return "<div id=\\"negsp_wrap_" + row.slotKey + "\\" style=\\"display:" + (isPitchSelected ? "block" : "none") + ";margin-top:5px;padding:5px 7px;background:#f1f5f9;border:1.5px solid #94a3b8;border-radius:6px;\\">" +',
     '      "<div style=\\"display:flex;align-items:center;justify-content:space-between;gap:4px;\\">" +',
@@ -219,7 +215,6 @@ function getHenshukun64ScriptPart2b_() {
     '    return "<option value=\\"" + opt + "\\"" + (opt === selVal ? " selected" : "") + (isDisabled ? " disabled" : "") + ">" + label + "</option>";',
     '  }).join("");',
     '',
-    '  // ③列側にもロック解除ボタンを表示（プルダウンのすぐ下でワンクリック解除可能）',
     '  let conflictUnlockBarHtml = "";',
     '  if (hasAnyRawBlockInRow) {',
     '    if (state.unlockedConflicts[row.slotKey]) {',
@@ -301,7 +296,8 @@ function getHenshukun64ScriptPart2b_() {
     '    const isStay = vs.isStay;',
     '    const selVal = normalizeBasePresetDecision64(curDec);',
     '    const isPreset = (selVal !== "カスタム入力");',
-    '    const customVal = isPreset ? "" : strippedDec;',
+    '    // ★未入力の仮状態「カスタム入力(医師未選択)」がテキスト欄に文字として入らないよう空欄維持',
+    '    const customVal = (isPreset || strippedDec === "カスタム入力(医師未選択)") ? "" : strippedDec;',
     '    const curSpAmt = extractSpecialStayAmount64(curDec);',
     '',
     '    const built = buildDecisionOptionsAndSubBoxesHtml64(row);',

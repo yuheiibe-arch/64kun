@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 7c1_編集くん64_状態とフィルタ.gs
- * （同時間帯ロック解除「AまたはB交渉」＆ 個別交渉時の特別時給加算オプション管理対応版）
+ * （カスタム入力の選択保持・入力中フォーカス保護・同時間帯ロック解除＆特別時給加算管理対応版）
  * ============================================================================
  */
 
@@ -23,8 +23,8 @@ function getHenshukun64ScriptPart1_() {
     '  activeLocks: {},',
     '  changedSlots: {},',
     '  changedBundles: {},',
-    '  unlockedConflicts: {},', // slotKey -> true（同時間帯・移動競合をあえてロック解除して「AまたはB」交渉するフラグ）
-    '  unlockedExtraSpWage: {}', // slotKey -> true（既に特別時給の枠であえてさらに加算ロックを解除したフラグ）
+    '  unlockedConflicts: {},',
+    '  unlockedExtraSpWage: {}',
     '};',
     '',
     'const DECISION_PRESETS = ["", "案1", "案2", "案3", "案1, 案2", "案1, 案3", "案2, 案3", "全案", "バックアップ医師に勤務依頼", "ステイ", "特別時給＋ステイ", "カスタム入力"];',
@@ -49,12 +49,10 @@ function getHenshukun64ScriptPart1_() {
     '  return result;',
     '}',
     '',
-    '// ★確定案文字列から「【特別時給+2,000円交渉】」や「【特別時給さらに+2,000円加算交渉】」のタグを除去した純粋な案文字列を返す',
     'function stripNegotiationSpWageTag64(dec) {',
     '  return String(dec || "").replace(/【特別時給(?:さらに)?(\\+\\d,\\d{3}円|\\+\\d{4}円)(?:加算)?交渉】/g, "").trim();',
     '}',
     '',
-    '// ★確定案文字列に特別時給交渉タグが含まれているかを判定し、その金額（例: "+2,000円"）を抽出',
     'function extractNegotiationSpWageInfo64(dec) {',
     '  const s = String(dec || "");',
     '  const m = s.match(/【特別時給(?:さらに)?(\\+\\d,\\d{3}円|\\+\\d{4}円)(?:加算)?交渉】/);',
@@ -62,9 +60,11 @@ function getHenshukun64ScriptPart1_() {
     '  return { enabled: true, amount: SPECIAL_STAY_AMOUNTS.includes(m[1]) ? m[1] : "+2,000円" };',
     '}',
     '',
+    '// ★「カスタム入力(医師未選択)」の状態でもプルダウンが「(未選択・クリア)」に戻らないよう維持する',
     'function normalizeBasePresetDecision64(curDec) {',
     '  const s = stripNegotiationSpWageTag64(curDec);',
     '  if (!s || s === "要検討") return "";',
+    '  if (s === "カスタム入力" || s.indexOf("カスタム入力(") === 0) return "カスタム入力";',
     '  if (isSpecialStayDecision64(s)) return "特別時給＋ステイ";',
     '  if (isBackupDecision64(s)) return "バックアップ医師に勤務依頼";',
     '  const stripped = s.replace(/\\((?:①|②|医師未選択)[^)]*\\)/g, "").trim();',
@@ -293,7 +293,9 @@ function getHenshukun64ScriptPart1_() {
     '      }',
     '      renderStaffSelectors();',
     '      updateActivePlayersDisplay();',
-    '      if (syncedChanged) {',
+    '      const activeEl = document.activeElement;',
+    '      const isTypingInCustom = Boolean(activeEl && activeEl.tagName === "INPUT" && activeEl.closest(".custom-builder"));',
+    '      if (syncedChanged && !isTypingInCustom) {',
     '        renderDateTabs();',
     '        renderStageTable();',
     '        updateEditCounter();',

@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 7c2_1_編集くん64_競合判定と整形.gs
- * （パート2前半：「複数枠で確定時は自動でおまとめ打診化」文言カット・赤マーカー・ロック解除対応版）
+ * （パート2前半：異体字［﨑・髙・齋等］抽出対応・赤マーカー・ロック解除対応版）
  * ============================================================================
  */
 
@@ -21,7 +21,7 @@ function getHenshukun64ScriptPart2a_() {
     '      .replace(/[沢澤]/g, "沢").replace(/[広廣]/g, "広")',
     '      .replace(/[浜濵濱]/g, "浜").replace(/[真眞]/g, "真").replace(/[恵惠]/g, "恵");',
     '  };',
-    '  return s.replace(/([一-龠々ヶケ]{2,6})先生/g, function(full, rawName) {',
+    '  return s.replace(/([一-龠々ヶケ﨑嵜髙瀧泷邊邉齋齊澤廣國嶋嶌栁濱櫻眞惠]{2,6})先生/g, function(full, rawName) {',
     '    if (state.doctorSearchList.some(function(d) { return d.name === rawName; })) return full;',
     '    const k = toKey(rawName);',
     '    const hit = state.doctorSearchList.find(function(d) { return toKey(d.name) === k; });',
@@ -53,7 +53,7 @@ function getHenshukun64ScriptPart2a_() {
     '    const fm = text.match(/】([^\\(（\\s]+?)[（\\(](?:※|[12]診)/);',
     '    if (fm) fromClinic = fm[1].trim();',
     '    const docs = [];',
-    '    const re = /(?:①|②|③|前医の|後医の|2診目[：:]|1診[：:]|^|\\s)([一-龠々ヶケ]{2,6})先生/g;',
+    '    const re = /(?:①|②|③|前医の|後医の|2診目[：:]|1診[：:]|^|\\s)([一-龠々ヶケ﨑嵜髙瀧泷邊邉齋齊澤廣國嶋嶌栁濱櫻眞惠]{2,6})先生/g;',
     '    let dm;',
     '    while ((dm = re.exec(text.replace(/※残る.*?に、/g, ""))) !== null) {',
     '      if (dm[1] && !docs.includes(dm[1])) docs.push(dm[1]);',
@@ -95,7 +95,7 @@ function getHenshukun64ScriptPart2a_() {
     '      }',
     '    });',
     '  } else {',
-    '    const re = /(?:①|②|③|前医の|後医の|2診目[：:]|1診[：:]|^|\\s)([一-龠々ヶケ]{2,6})先生/g;',
+    '    const re = /(?:①|②|③|前医の|後医の|2診目[：:]|1診[：:]|^|\\s)([一-龠々ヶケ﨑嵜髙瀧泷邊邉齋齊澤廣國嶋嶌栁濱櫻眞惠]{2,6})先生/g;',
     '    let m;',
     '    while ((m = re.exec(dec)) !== null) {',
     '      if (m[1] && !docs.includes(m[1])) docs.push(m[1]);',
