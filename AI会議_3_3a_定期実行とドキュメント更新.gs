@@ -3,7 +3,8 @@
  * AI会議_3_3a_定期実行とドキュメント更新.gs
  * 1) 手動・定期トリガーからの実行窓口（シフト応募通知メールの差分スキャンも自動実行）
  * 2) Googleドキュメントの「→ 調整結果（シフト応募による充足含む）」＆緑/赤マーカー更新
- * 3) BQパック（bosyu）補完の終日不在枠（西新井等）も保護しつつ、確定シフト反映済の枠のみ自動削除
+ * 3) 【本来の仕様準拠】「決定済みプランかつ未充足」および「BQ募集中枠」は確実に継続表示し、
+ *    本当に充足・募集終了して解消された枠のみを安全に自動削除する版
  * ============================================================================
  */
 
@@ -50,6 +51,45 @@ function syncAdjustmentResultsToDocAndSlack3_3_(ssOpt) {
   }
 }
 
+/**
+ * BQパック（bosyu / mijyusoku）上で現在まだ「公開募集中」の枠キー集合を取得するヘルパー
+ * （2診目募集枠や『最新_不在枠』シート期間外の未来枠を「充足済み」と誤認して消さないため）
+ */
+function buildOpenBqRecruitKeySet3_3_() {
+  const openKeys = new Set();
+  if (typeof fetchAndDecryptBqMailForResolver_ !== 'function') return openKeys;
+
+  try {
+    const bqData = fetchAndDecryptBqMailForResolver_();
+    if (!bqData) return openKeys;
+
+    const list = (bqData.bosyu || []).concat(bqData.mijyusoku || []).concat(bqData.boshu || []);
+    list.forEach(function(m) {
+      const st = String(m.st || '').trim();
+      if (st && (st.includes('非掲載') || st.includes('終了') || st.includes('取消') || st.includes('キャンセル') || st.includes('充足'))) {
+        return;
+      }
+      const d = normalizeDateYmd1b3_(m.d || m.date);
+      const rawC = String(m.c || m.clinic || '').trim();
+      const rawDp = String(m.dp || m.dept || '').trim();
+      const rawT = String(m.t || m.time || '').trim();
+      if (!d || !rawC || !rawT) return;
+
+      const clinicWithDept = (rawDp.includes('内科') && !rawC.includes('内科')) ? (rawC + '（内科）') : rawC;
+      const expanded = (typeof normalizeAndExpandAbsenceTime1b3_ === 'function')
+        ? normalizeAndExpandAbsenceTime1b3_(rawT, rawC)
+        : [rawT];
+
+      expanded.forEach(function(t) {
+        if (t) openKeys.add(getSlotCarryOverKey3_(d, clinicWithDept, t));
+      });
+    });
+  } catch (e) {
+    Logger.log('⚠️ BQ公開募集枠チェックの読込スキップ: ' + e.message);
+  }
+  return openKeys;
+}
+
 function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
   const unfilledSh = ss.getSheetByName('最新_不在枠');
   const rawUnfilled = (unfilledSh && unfilledSh.getLastRow() >= 2)
@@ -61,12 +101,13 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
     ? shiftSh.getDataRange().getDisplayValues().slice(1)
     : [];
 
-  // ★終日0人不在でBQパック(bosyu)から補完された枠（例：11/12 西新井）も未充足として維持する
   const todayYmd = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd');
   const maxCheckYmd = Utilities.formatDate(new Date(Date.now() + 35 * 86400000), 'Asia/Tokyo', 'yyyy/MM/dd');
   const effectiveUnfilled = (typeof recoverMissingFullDayOrUnfilledRows1b3_ === 'function')
     ? recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilled, activeShifts, [], todayYmd, maxCheckYmd)
     : rawUnfilled;
+
+  const openBqRecruitKeys = buildOpenBqRecruitKeySet3_3_();
 
   const officialNames = [];
   if (typeof loadDoctorSearchList64_ === 'function') {
@@ -77,6 +118,12 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
 
   const activeUnfilledKeys = new Set();
   const memoBySlotKey = new Map();
+  let maxPrimaryUnfilledDate = '';
+
+  rawUnfilled.forEach(function(r) {
+    const d = normalizeDateYmd1b3_(r[0]);
+    if (d && d > maxPrimaryUnfilledDate) maxPrimaryUnfilledDate = d;
+  });
 
   effectiveUnfilled.forEach(function(r) {
     const d = normalizeDateYmd1b3_(r[0]);
@@ -140,26 +187,43 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
         const row = tbl.getRow(r);
         if (row.getNumCells() < 4) continue;
 
-        const c0 = row.getCell(0).getText().trim();
-        const rawC1 = row.getCell(1).getText().trim();
+        // 1. セル内改行(\r)を \n に正規化
+        const c0 = row.getCell(0).getText().replace(/\r\n|\r/g, '\n').trim();
+        const rawC1 = row.getCell(1).getText().replace(/\r\n|\r/g, '\n')
+          .replace(/([^\n])\s*(?=【案[123１２３]】)/g, '$1\n')
+          .replace(/([^\n])\s*(?=💡|📝|・【進行中メモ】|・⚠️)/g, '$1\n')
+          .trim();
         const c1 = (typeof dedupePlanCellLines64_ === 'function')
           ? dedupePlanCellLines64_(rawC1)
           : rawC1.replace(/(【案[123１２３]】[^\n]+?)\1+/g, '$1');
 
-        const c2Raw = row.getCell(2).getText().trim();
-        const c2Header = c2Raw.split(/\r?\n/).filter(function(l) { return !l.trim().startsWith('→'); }).join(' ').trim();
+        const c2Raw = row.getCell(2).getText().replace(/\r\n|\r/g, '\n').trim();
+        const c3Assignee = row.getCell(3).getText().replace(/\r\n|\r/g, ' ').trim();
 
-        const c0Lines = Array.from(new Set(c0.split(/\r?\n/).map(function(s) { return s.trim(); }).filter(Boolean)));
+        // 2. 過去の「→」行を綺麗に剥がして確定案ヘッダーのみを取得
+        const c2HeaderLines = [];
+        let inArrowBlock = false;
+        c2Raw.split('\n').forEach(function(l) {
+          const trimmed = l.trim();
+          if (!trimmed) return;
+          if (/^(?:→|⇒|⇨)/.test(trimmed)) {
+            inArrowBlock = true;
+            return;
+          }
+          if (!inArrowBlock) {
+            const strippedInlineArrow = trimmed.replace(/(?:→|⇒|⇨).*$/, '').trim();
+            if (strippedInlineArrow) c2HeaderLines.push(strippedInlineArrow);
+            if (/(?:→|⇒|⇨)/.test(trimmed)) inArrowBlock = true;
+          }
+        });
+        const c2Header = c2HeaderLines.join(' ').trim();
+
+        const c0Lines = Array.from(new Set(c0.split('\n').map(function(s) { return s.trim(); }).filter(Boolean)));
         const clinicTitle = c0Lines[0] || '';
         const timeAndWage = c0Lines.slice(1).join(' ');
         const carryKey = getSlotCarryOverKey3_(curDate, clinicTitle, timeAndWage);
 
-        if (activeUnfilledKeys.size > 0 && !activeUnfilledKeys.has(carryKey)) {
-          rowsToRemove.push(r);
-          removedSlotCount++;
-          continue;
-        }
-
+        // 3. 先に最新の調整結果（承諾・応募充足・返信待ち・辞退）を計算する
         const planObj = { date: curDate, clinicAndDept: clinicTitle, plan1: '', plan2: '', plan3: '' };
         const memoLinesFromCol2 = [];
 
@@ -177,11 +241,11 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
         const latestMemoText = memoBySlotKey.get(carryKey) || memoLinesFromCol2.join('\n');
         const prevEntry = {
           rawDecision: c2Header,
-          assignee: row.getCell(3).getText().trim(),
+          assignee: c3Assignee,
           prevPlanMap: { '1': planObj.plan1, '2': planObj.plan2, '3': planObj.plan3 }
         };
         const resolved = resolveCarriedOverDecisionForSlot3_(prevEntry, planObj, { currentMemo: latestMemoText }, mailHistoryIndex);
-        let finalDecisionText = resolved.decision;
+        let finalDecisionText = String(resolved.decision || '').replace(/\r\n|\r/g, '\n');
 
         if (applyIndex && typeof findMatchingShiftApplicationsForSlot3_3d_ === 'function') {
           const cleanC = cleanClinicBaseName_(clinicTitle);
@@ -233,6 +297,49 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
           }
         }
 
+        // 重複した「→」行を一意化
+        if (finalDecisionText) {
+          const seenArrow = new Set();
+          finalDecisionText = finalDecisionText.split('\n').filter(function(l) {
+            const t = l.trim();
+            if (!t.startsWith('→')) return true;
+            if (seenArrow.has(t)) return false;
+            seenArrow.add(t);
+            return true;
+          }).join('\n');
+        }
+
+        // =====================================================================
+        // ★4. 【本来の仕様】継続表示 vs 解消済み削除の厳密判定
+        // =====================================================================
+        const isPastDate = (curDate < todayYmd);
+        const isStillUnfilled =
+          activeUnfilledKeys.has(carryKey) ||
+          openBqRecruitKeys.has(carryKey) ||
+          (maxPrimaryUnfilledDate && curDate > maxPrimaryUnfilledDate && openBqRecruitKeys.size === 0);
+
+        const isFilledOrAccepted =
+          /^充足/.test(c2Header) ||
+          (finalDecisionText.includes('⭕') && (finalDecisionText.includes('承諾') || finalDecisionText.includes('充足')));
+
+        const hasDecidedPlan =
+          Boolean(c2Header && c2Header !== '要検討' && !/^充足/.test(c2Header)) ||
+          Boolean(c3Assignee && c3Assignee !== '担当者未定' && c3Assignee !== '(未定)' && c3Assignee !== '未定');
+
+        // 削除するのは「過去日」または「最新_不在枠・BQ募集枠の両方から消滅しており、かつ（未充足の決定済みプランではない or ⭕充足確定済み）」のときのみ！
+        const shouldRemoveRow = isPastDate || (
+          activeUnfilledKeys.size > 0 &&
+          !isStillUnfilled &&
+          (!hasDecidedPlan || isFilledOrAccepted)
+        );
+
+        if (shouldRemoveRow) {
+          rowsToRemove.push(r);
+          removedSlotCount++;
+          continue;
+        }
+
+        // 5. 継続表示する枠のテキスト・マーカーを更新
         if (finalDecisionText !== c2Raw || row.getCell(2).getNumChildren() > 1) {
           setCellSafelyLocal(row.getCell(2), finalDecisionText);
           row.getCell(2).editAsText().setFontSize(8.5).setBold(true);
@@ -263,5 +370,5 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
   });
 
   doc.saveAndClose();
-  Logger.log('✅ ドキュメント更新完了（最新_不在枠から解消された枠の削除数: ' + removedSlotCount + ' 枠）');
+  Logger.log('✅ ドキュメント更新完了（本当に充足・解消された枠の削除数: ' + removedSlotCount + ' 枠）');
 }
