@@ -2,8 +2,8 @@
  * ============================================================================
  * AI会議_3_3a_定期実行とドキュメント更新.gs
  * 1) 手動・定期トリガーからの実行窓口（シフト応募通知メールの差分スキャンも自動実行）
- * 2) Googleドキュメントの「→ 調整結果（シフト応募による充足含む）」＆緑/赤マーカー更新（段落ダブり防止済）
- * 3) 1日2回のデータ更新で『最新_不在枠』から消えた（確定シフト反映済の）枠をドキュメントから自動削除
+ * 2) Googleドキュメントの「→ 調整結果（シフト応募による充足含む）」＆緑/赤マーカー更新
+ * 3) BQパック（bosyu）補完の終日不在枠（西新井等）も保護しつつ、確定シフト反映済の枠のみ自動削除
  * ============================================================================
  */
 
@@ -56,6 +56,18 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
     ? unfilledSh.getDataRange().getDisplayValues().slice(1)
     : [];
 
+  const shiftSh = ss.getSheetByName('最新_当日シフト');
+  const activeShifts = (shiftSh && shiftSh.getLastRow() >= 2)
+    ? shiftSh.getDataRange().getDisplayValues().slice(1)
+    : [];
+
+  // ★終日0人不在でBQパック(bosyu)から補完された枠（例：11/12 西新井）も未充足として維持する
+  const todayYmd = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd');
+  const maxCheckYmd = Utilities.formatDate(new Date(Date.now() + 35 * 86400000), 'Asia/Tokyo', 'yyyy/MM/dd');
+  const effectiveUnfilled = (typeof recoverMissingFullDayOrUnfilledRows1b3_ === 'function')
+    ? recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilled, activeShifts, [], todayYmd, maxCheckYmd)
+    : rawUnfilled;
+
   const officialNames = [];
   if (typeof loadDoctorSearchList64_ === 'function') {
     loadDoctorSearchList64_(ss).forEach(function(d) {
@@ -66,7 +78,7 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
   const activeUnfilledKeys = new Set();
   const memoBySlotKey = new Map();
 
-  rawUnfilled.forEach(function(r) {
+  effectiveUnfilled.forEach(function(r) {
     const d = normalizeDateYmd1b3_(r[0]);
     const rawC = String(r[1] || '').trim();
     const rawT = String(r[2] || '').trim();
@@ -97,10 +109,13 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
       setDocCellTextSafely64_(cell, txt);
       return;
     }
+    const clean = String(txt || '');
     while (cell.getNumChildren() > 1) {
       cell.removeChild(cell.getChild(cell.getNumChildren() - 1));
     }
-    cell.getChild(0).asParagraph().setText(String(txt || ''));
+    const p = cell.getChild(0).asParagraph();
+    if (clean.length === 0) p.clear();
+    else p.setText(clean);
   };
 
   for (let i = 0; i < body.getNumChildren(); i++) {

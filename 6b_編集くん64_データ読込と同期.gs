@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6b_編集くん64_データ読込と同期.gs
- * （選択肢の重複自動排除 ＆ 3列目の「→ 調整結果」をプルダウン値から分離して注意欄に表示する版）
+ * （地域並び順：東京➔神奈川➔千葉・茨城➔埼玉➔大阪 ／ 案1〜案3の改行整形・重複排除版）
  * ============================================================================
  */
 
@@ -106,19 +106,26 @@ function getHenshukunInitialData() {
           const row = table.getRow(r);
           if (row.getNumCells() < 4) continue;
 
-          const col1 = cleanSidebarDisplayText_(row.getCell(0).getText().trim());
-          const rawCol2Cleaned = cleanSidebarDisplayText_(row.getCell(1).getText().trim());
+          // ★Googleドキュメント内の改行(\r)を \n に正規化してから整形することで、【案1】【案2】【案3】が1行に潰れるのを完全防止
+          const rawCell0 = row.getCell(0).getText().replace(/\r\n|\r/g, '\n').trim();
+          const rawCell1 = row.getCell(1).getText().replace(/\r\n|\r/g, '\n')
+            .replace(/([^\n])\s*(?=【案[123１２３]】)/g, '$1\n')
+            .replace(/([^\n])\s*(?=💡)/g, '$1\n')
+            .replace(/([^\n])\s*(?=・【進行中メモ】|・⚠️)/g, '$1\n')
+            .trim();
+
+          const col1 = cleanSidebarDisplayText_(rawCell0);
+          const rawCol2Cleaned = cleanSidebarDisplayText_(rawCell1);
           let col2 = (typeof dedupePlanCellLines64_ === 'function')
             ? dedupePlanCellLines64_(rawCol2Cleaned)
             : rawCol2Cleaned;
 
-          const rawDocDecFull = row.getCell(2).getText().trim();
-          const docStaff = row.getCell(3).getText().trim() || '';
+          const rawDocDecFull = row.getCell(2).getText().replace(/\r\n|\r/g, '\n').trim();
+          const docStaff = row.getCell(3).getText().replace(/\r\n|\r/g, '\n').trim() || '';
 
-          // ★3列目から「→ 調整結果」行を分離し、確定案（案1/案2/ステイ等）のみをプルダウン値として扱う
           const decHeaderLines = [];
           const decArrowLines = [];
-          rawDocDecFull.split(/\r?\n/).forEach(function(line) {
+          rawDocDecFull.split('\n').forEach(function(line) {
             const s = line.trim();
             if (!s) return;
             if (s.startsWith('→')) decArrowLines.push(s);
@@ -126,7 +133,6 @@ function getHenshukunInitialData() {
           });
           const rawDocDec = decHeaderLines.join(' ').trim();
 
-          // 編集くん64の画面上でも最新の調整状況（⭕承諾/❌辞退/📩返信待ち）がすぐ分かるよう注意欄末尾に表示
           if (decArrowLines.length > 0) {
             const statusDisplay = decArrowLines.map(function(a) {
               return '・【調整結果】' + a.replace(/^→\s*/, '');
@@ -150,7 +156,6 @@ function getHenshukunInitialData() {
 
           const slotKey = `${i}_${r}`;
           let draftItem = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
-          // 行削除でキーがズレていたドラフトは読み込まない安全ガード
           if (draftItem && draftItem.clinicTitle && draftItem.clinicTitle !== clinicTitle) {
             draftItem = null;
           }
@@ -194,9 +199,9 @@ function getHenshukunInitialData() {
             bundleKey: bKey,
             childIdx: i,
             rowIdx: r,
-            doctor: cleanSidebarDisplayText_(row.getCell(0).getText().trim()),
-            slots: row.getCell(1).getText().trim(),
-            note: row.getCell(2).getText().trim(),
+            doctor: cleanSidebarDisplayText_(row.getCell(0).getText().replace(/\r\n|\r/g, '\n').trim()),
+            slots: row.getCell(1).getText().replace(/\r\n|\r/g, '\n').trim(),
+            note: row.getCell(2).getText().replace(/\r\n|\r/g, '\n').trim(),
             origVal: docVal,
             curVal: draftVal || docVal
           });
@@ -205,7 +210,15 @@ function getHenshukunInitialData() {
     }
   }
 
-  slotRows.sort((a, b) => a.sortDate.localeCompare(b.sortDate) || a.clinicNo - b.clinicNo);
+  // ★並び順：「日付 ➔ 地域（東京➔神奈川➔千葉・茨城➔埼玉➔大阪） ➔ 拠点No ➔ 時間帯」
+  slotRows.sort(function(a, b) {
+    if (a.sortDate !== b.sortDate) return a.sortDate.localeCompare(b.sortDate);
+    const rankA = (typeof getRegionSortRank64_ === 'function') ? getRegionSortRank64_(a.clinicGroup) : 99;
+    const rankB = (typeof getRegionSortRank64_ === 'function') ? getRegionSortRank64_(b.clinicGroup) : 99;
+    if (rankA !== rankB) return rankA - rankB;
+    if (a.clinicNo !== b.clinicNo) return a.clinicNo - b.clinicNo;
+    return String(a.timeAndWage || '').localeCompare(String(b.timeAndWage || ''));
+  });
 
   const clientSessionId = Utilities.getUuid().slice(0, 8);
   const activeLocks = getActivePlayerLocks64_();

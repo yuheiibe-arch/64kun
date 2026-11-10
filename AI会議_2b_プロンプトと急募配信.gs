@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_2b_プロンプトと急募配信.gs
- * （BQシフト状況パック「bosyu」対応・重複枠は長い募集時間を採用・1P収容版）
+ * （『休館日』シート除外連動・地域順［東京➔神奈川➔千葉・茨城➔埼玉➔関西］統一・1P収容版）
  * ============================================================================
  */
 
@@ -53,6 +53,9 @@ function normalizeYmdKey_(rawDateStr) {
 
 function supplementNearTermUnfilledSlots_(existingSlots, windowStartYmd, windowEndYmd) {
   const combined = [];
+  const closedChecker = (typeof buildClosedClinicChecker1b3_ === 'function')
+    ? buildClosedClinicChecker1b3_()
+    : null;
 
   let activeShifts = [];
   try {
@@ -73,10 +76,13 @@ function supplementNearTermUnfilledSlots_(existingSlots, windowStartYmd, windowE
       ? normalizeAndExpandAbsenceTime1b3_(rawTime, cleanC)
       : [String(rawTime || '').replace(/～/g, '-').trim()];
 
-    expanded.forEach(function(t) {
+    expanded.forEach(function(rawT) {
+      if (!rawT) return;
+
+      // ★『休館日』シート判定（全日・午前・午後・午後夜間・夜間）
+      const t = closedChecker ? closedChecker.resolveOpenSlotTime(d, rawClinic, rawT, '小児科') : rawT;
       if (!t) return;
 
-      // 同日・同拠点で時間帯が重なる枠があるかチェックし、より長い募集時間の方を採用する
       const existingIdx = combined.findIndex(function(ex) {
         if (ex.date !== d || ex.clinic !== cleanC) return false;
         if (typeof isTimeRangeOverlapping1b3_ === 'function') {
@@ -89,7 +95,7 @@ function supplementNearTermUnfilledSlots_(existingSlots, windowStartYmd, windowE
         if (typeof parseAbsenceTimeline_ === 'function') {
           const exTl = parseAbsenceTimeline_(combined[existingIdx].absenceTime);
           const newTl = parseAbsenceTimeline_(t);
-          if (newTl.durationHours > exTl.durationHours) {
+          if (newTl.startMin <= exTl.startMin && newTl.endMin >= exTl.endMin && newTl.durationHours > exTl.durationHours) {
             combined[existingIdx].absenceTime = t;
           }
         }
@@ -114,29 +120,38 @@ function supplementNearTermUnfilledSlots_(existingSlots, windowStartYmd, windowE
     });
   };
 
-  // 1. 既存の不在枠（『最新_不在枠』等からすでに募集シフト時間へ拡張された枠）を登録
+  // 1. 既存の不在枠を登録
   (existingSlots || []).forEach(function(s) {
     if (s.dept && s.dept !== '小児科') return;
     addSlotItemIfTrulyUnfilled(s.date, s.clinic, s.absenceTime, s.listedWage, s.specialWage, true);
   });
 
-  // 2. 『BQシフト状況パック（bosyu / mijyusoku）』から未登録の枠・より長い募集枠を補完
+  // 2. 『BQシフト状況パック（bosyu / mijyusoku）』から終日0人拠点等の未登録枠を補完
   if (typeof fetchAndDecryptBqMailForResolver_ === 'function') {
     try {
       const bqData = fetchAndDecryptBqMailForResolver_();
       if (bqData) {
         const bqList = (bqData.bosyu || []).concat(bqData.mijyusoku || []).concat(bqData.boshu || []);
         bqList.forEach(function(m) {
+          const st = String(m.st || '').trim();
+          if (st && (st.includes('非掲載') || st.includes('終了') || st.includes('取消') || st.includes('キャンセル'))) return;
           const rawC = String(m.c || m.clinic || '').trim();
           const rawDp = String(m.dp || m.dept || '').trim();
           if (rawC.includes('内科') || rawDp.includes('内科')) return;
-          addSlotItemIfTrulyUnfilled(m.d || m.date, rawC, m.t || m.time, m.w || m.wage || m.listedWage || '13000', m.sp || m.specialWage || '', false);
+
+          let wageVal = m.uMax || '';
+          if (!wageVal && m.w) {
+            const wNum = Number(String(m.w).replace(/[^0-9]/g, '')) || 0;
+            const tl = (typeof parseAbsenceTimeline_ === 'function') ? parseAbsenceTimeline_(m.t || m.time) : { durationHours: 3 };
+            wageVal = (wNum >= 25000 && tl.durationHours > 0) ? String(Math.round(wNum / tl.durationHours)) : String(wNum || '13000');
+          }
+          addSlotItemIfTrulyUnfilled(m.d || m.date, rawC, m.t || m.time, wageVal || '13000', m.sp || m.specialWage || '', false);
         });
       }
     } catch (e) {}
   }
 
-  // 3. 『最新_当日シフト』からは、どの時間帯も登録されていない完全0人の帯のみ補完
+  // 3. 『最新_当日シフト』から完全0人の帯を補完
   activeShifts.forEach(function(row) {
     const d = normalizeYmdKey_(row[0]);
     if (!d || d < windowStartYmd || d > windowEndYmd) return;
@@ -210,7 +225,8 @@ function buildOfficialAnnouncementProposal_(slotsContext) {
     const daySlots = byDate[dateStr] || [];
     totalTargetSlotsCount += daySlots.length;
 
-    const areaOrder = ['東京', '神奈川', '埼玉', '千葉', '茨城', '関西'];
+    // ★地域順：東京 ➔ 神奈川 ➔ 千葉・茨城 ➔ 埼玉 ➔ 関西(大阪)
+    const areaOrder = ['東京', '神奈川', '千葉', '茨城', '埼玉', '関西'];
     const areaClinicMap = {};
     areaOrder.forEach(function(a) { areaClinicMap[a] = {}; });
 
@@ -272,7 +288,7 @@ function buildOfficialAnnouncementProposal_(slotsContext) {
   ].join('\n');
 
   return {
-    recommendedDateReason: '月曜・水曜の週2回配信ルール（本日を除いた明日以降1週間分・確定シフト充足済み枠および重複時間帯は除外）に基づき、' + periodStartLabel + ' ～ ' + periodEndLabel + '（計' + totalTargetSlotsCount + '枠）を1ページ内にまとめました。',
+    recommendedDateReason: '月曜・水曜の週2回配信ルール（本日を除いた明日以降1週間分・休館日・確定シフト充足済み枠および重複時間帯は除外）に基づき、' + periodStartLabel + ' ～ ' + periodEndLabel + '（計' + totalTargetSlotsCount + '枠）を1ページ内にまとめました。',
     templateText: templateText
   };
 }

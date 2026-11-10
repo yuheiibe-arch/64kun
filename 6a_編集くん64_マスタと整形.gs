@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6a_編集くん64_マスタと整形.gs
- * （モーダル大画面化1440x920・異体字/漢字ブレ強化・括弧内メモ保護分割版）
+ * （モーダル大画面化1440x920・異体字/漢字ブレ強化・地域ソート［東京➔神奈川➔千葉・茨城➔埼玉➔大阪］対応版）
  * ============================================================================
  */
 
@@ -227,6 +227,21 @@ function loadDoctorSearchList64_(ss) {
   return list;
 }
 
+/**
+ * ★地域ソート順の共通定義：
+ * 1:東京 ➔ 2:神奈川 ➔ 3:千葉・茨城（千葉3, 茨城4） ➔ 5:埼玉 ➔ 6:大阪(関西)
+ */
+function getRegionSortRank64_(groupOrArea) {
+  const g = String(groupOrArea || '').trim();
+  if (g.includes('東京')) return 1;
+  if (g.includes('神奈川')) return 2;
+  if (g.includes('千葉')) return 3;
+  if (g.includes('茨城')) return 4;
+  if (g.includes('埼玉')) return 5;
+  if (g.includes('大阪') || g.includes('関西') || g.includes('兵庫') || g.includes('京都')) return 6;
+  return 99;
+}
+
 function loadClinicAndStaffMasters64_(ss) {
   const clinicMap = new Map();
   const groupSet = new Set();
@@ -249,6 +264,15 @@ function loadClinicAndStaffMasters64_(ss) {
       if (!areaToGroups[cArea].includes(cGroup)) areaToGroups[cArea].push(cGroup);
     }
   }
+
+  // 上部の「📍 地域(複数可)」チップも「東京 ➔ 神奈川 ➔ 千葉 ➔ 茨城 ➔ 埼玉 ➔ 大阪」順に整列
+  const sortGroupsFn = function(a, b) {
+    return getRegionSortRank64_(a) - getRegionSortRank64_(b) || String(a).localeCompare(String(b), 'ja');
+  };
+  const sortedGroups = Array.from(groupSet).sort(sortGroupsFn);
+  Object.keys(areaToGroups).forEach(function(k) {
+    areaToGroups[k].sort(sortGroupsFn);
+  });
 
   const staffList = [];
   const seenStaff = new Set();
@@ -275,7 +299,7 @@ function loadClinicAndStaffMasters64_(ss) {
 
   return {
     clinicMap: clinicMap,
-    groups: Array.from(groupSet),
+    groups: sortedGroups,
     areaToGroups: areaToGroups,
     staffList: staffList,
     doctorSearchList: loadDoctorSearchList64_(ss)
