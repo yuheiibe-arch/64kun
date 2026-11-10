@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6b_編集くん64_データ読込と同期.gs
- * （A:09-13 / B:15-18 / C:18-21 の3時間帯別バックアップ医師抽出・カスタムコメント対応版）
+ * （選択肢の重複自動排除 ＆ 3列目の「→ 調整結果」をプルダウン値から分離して注意欄に表示する版）
  * ============================================================================
  */
 
@@ -28,9 +28,9 @@ function extractBackupDoctorsByDate64_(ss, doctorSearchList) {
     }
 
     const bandCols = [
-      { band: 'A', text: row[7] }, // 09:00-13:00
-      { band: 'B', text: row[8] }, // 15:00-18:00
-      { band: 'C', text: row[9] }  // 18:00-21:00
+      { band: 'A', text: row[7] },
+      { band: 'B', text: row[8] },
+      { band: 'C', text: row[9] }
     ];
 
     bandCols.forEach(function(bc) {
@@ -107,9 +107,32 @@ function getHenshukunInitialData() {
           if (row.getNumCells() < 4) continue;
 
           const col1 = cleanSidebarDisplayText_(row.getCell(0).getText().trim());
-          const col2 = cleanSidebarDisplayText_(row.getCell(1).getText().trim());
-          const rawDocDec = row.getCell(2).getText().trim();
+          const rawCol2Cleaned = cleanSidebarDisplayText_(row.getCell(1).getText().trim());
+          let col2 = (typeof dedupePlanCellLines64_ === 'function')
+            ? dedupePlanCellLines64_(rawCol2Cleaned)
+            : rawCol2Cleaned;
+
+          const rawDocDecFull = row.getCell(2).getText().trim();
           const docStaff = row.getCell(3).getText().trim() || '';
+
+          // ★3列目から「→ 調整結果」行を分離し、確定案（案1/案2/ステイ等）のみをプルダウン値として扱う
+          const decHeaderLines = [];
+          const decArrowLines = [];
+          rawDocDecFull.split(/\r?\n/).forEach(function(line) {
+            const s = line.trim();
+            if (!s) return;
+            if (s.startsWith('→')) decArrowLines.push(s);
+            else decHeaderLines.push(s);
+          });
+          const rawDocDec = decHeaderLines.join(' ').trim();
+
+          // 編集くん64の画面上でも最新の調整状況（⭕承諾/❌辞退/📩返信待ち）がすぐ分かるよう注意欄末尾に表示
+          if (decArrowLines.length > 0) {
+            const statusDisplay = decArrowLines.map(function(a) {
+              return '・【調整結果】' + a.replace(/^→\s*/, '');
+            }).join('\n');
+            col2 = col2 ? (col2 + '\n' + statusDisplay) : statusDisplay;
+          }
 
           let parsedDec = (!docStaff && (rawDocDec === '案1' || rawDocDec === '要検討')) ? '' : rawDocDec;
           let parsedComment = '';
@@ -119,14 +142,22 @@ function getHenshukunInitialData() {
             parsedComment = cmMatch[2].trim();
           }
 
-          const lines1 = col1.split('\n');
+          const lines1 = Array.from(new Set(col1.split('\n').map(s => s.trim()).filter(Boolean)));
           const rawClinicTitle = lines1[0] || '';
           const clinicTitle = formatClinicTitle64_(rawClinicTitle);
           const timeAndWage = lines1.slice(1).join(' ') || '';
           const meta = resolveClinicMeta64_(rawClinicTitle, masters.clinicMap);
 
           const slotKey = `${i}_${r}`;
-          const draftItem = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
+          let draftItem = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
+          // 行削除でキーがズレていたドラフトは読み込まない安全ガード
+          if (draftItem && draftItem.clinicTitle && draftItem.clinicTitle !== clinicTitle) {
+            draftItem = null;
+          }
+
+          const cleanDraftDec = draftItem
+            ? String(draftItem.decision || '').split(/\r?\n/).filter(l => !l.trim().startsWith('→')).join(' ').trim()
+            : parsedDec;
 
           slotRows.push({
             slotKey: slotKey,
@@ -144,7 +175,7 @@ function getHenshukunInitialData() {
             origDecision: parsedDec,
             origAssignee: docStaff,
             origComment: parsedComment,
-            curDecision: draftItem ? draftItem.decision : parsedDec,
+            curDecision: cleanDraftDec,
             curAssignee: draftItem ? draftItem.assignee : docStaff,
             customComment: (draftItem && typeof draftItem.customComment === 'string') ? draftItem.customComment : parsedComment,
             customDocs: (draftItem && Array.isArray(draftItem.customDocs)) ? draftItem.customDocs : [],

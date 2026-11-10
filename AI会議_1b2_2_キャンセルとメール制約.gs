@@ -7,10 +7,6 @@
  * ============================================================================
  */
 
-/**
- * 設計1：『シフトキャンセル履歴』シート（未同期分があればGmailからも補完）を読み込み、
- * 医師キーごとのキャンセル対象日セット Map(docKey -> Set("2026/11/15", ...)) を返す
- */
 function loadShiftCancelDatesByDoctor1b2_(ss) {
   const cancelMap = new Map();
 
@@ -40,7 +36,6 @@ function loadShiftCancelDatesByDoctor1b2_(ss) {
 
 /**
  * テキスト内から対象日付（YYYY/MM/DD）をすべて抽出するヘルパー
- * （年が省略されている「11月8日」「11/8」などは msgTimestamp の年から補完）
  */
 function extractTargetDatesFromMailText1b2_(text, msgTimestampStr) {
   const s = String(text || '');
@@ -68,7 +63,7 @@ function extractTargetDatesFromMailText1b2_(text, msgTimestampStr) {
     addYmd(Number(fm[1]), Number(fm[2]), Number(fm[3]));
   }
 
-  // 2. 月日のみ（例：11月8日(日)、8/29）※時刻（15:00等）や管理番号と誤認しないようフィルタ
+  // 2. 月日のみ（例：11月8日(日)、8/29）
   const mdRe = /(?:^|[^\d\/年])(\d{1,2})\s*(?:月\s*(\d{1,2})\s*日|\/\s*(\d{1,2})(?=[\s\(（日月火水木金土・、,のをにへ]|$))/g;
   let mm;
   while ((mm = mdRe.exec(s)) !== null) {
@@ -91,10 +86,6 @@ function extractTargetDatesFromMailText1b2_(text, msgTimestampStr) {
   return dates;
 }
 
-/**
- * 設計2：『ナレッジシート』および未マッチの『医師質問』『DS回答』を解析し、
- * 日別・医師別の時間上限（例：11/8の柿本先生は18:00まで＝18:00以降の延長・夜間NG）や単発辞退を抽出する関数
- */
 function buildDateSpecificMailConstraintsMap1b2_(ss) {
   const constraintMap = new Map();
 

@@ -2,7 +2,7 @@
  * ============================================================================
  * AI会議_3_3a_定期実行とドキュメント更新.gs
  * 1) 手動・定期トリガーからの実行窓口（シフト応募通知メールの差分スキャンも自動実行）
- * 2) Googleドキュメントの「→ 調整結果（シフト応募による充足含む）」＆緑/赤マーカー更新
+ * 2) Googleドキュメントの「→ 調整結果（シフト応募による充足含む）」＆緑/赤マーカー更新（段落ダブり防止済）
  * 3) 1日2回のデータ更新で『最新_不在枠』から消えた（確定シフト反映済の）枠をドキュメントから自動削除
  * ============================================================================
  */
@@ -20,7 +20,6 @@ function syncAdjustmentResultsToDocAndSlack3_3_(ssOpt) {
   const props = PropertiesService.getScriptProperties();
   const docId = props.getProperty('SINGLE_MTG_DOC_ID');
 
-  // 0. 「【要対応】★医師シフト応募通知★」メールの差分スキャン＆応募インデックス構築（3_3d）
   let applyIndex = null;
   if (typeof scanGmailShiftApplicationsIncremental3_3d_ === 'function') {
     try {
@@ -36,20 +35,16 @@ function syncAdjustmentResultsToDocAndSlack3_3_(ssOpt) {
     : null;
   if (!mailHistoryIndex) return;
 
-  // 応募データを mailHistoryIndex に添付して各モジュールから参照可能にする
   mailHistoryIndex._applyIndex = applyIndex;
 
-  // 1. 『交渉履歴』シート（相談日順）＆『交渉注意医師』シートの更新（3_3c）
   if (typeof syncNegotiationHistoryAndCautionSheets3_3_ === 'function') {
     syncNegotiationHistoryAndCautionSheets3_3_(ss, mailHistoryIndex);
   }
 
-  // 2. C0AJTMLF0UD の「超募集MTGログ（前半・後半）」スレッド内の既存 dskun メッセージを上書き編集（3_3b）
   if (typeof updateExistingSlackThreadMessagesInC0AJTMLF0UD_ === 'function') {
     updateExistingSlackThreadMessagesInC0AJTMLF0UD_(mailHistoryIndex);
   }
 
-  // 3. Googleドキュメントの更新（『最新_不在枠』に残っている間は緑マーカー表示、消えたら行削除）
   if (docId) {
     updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex);
   }
@@ -97,6 +92,17 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
   const elementsToRemove = [];
   let removedSlotCount = 0;
 
+  const setCellSafelyLocal = function(cell, txt) {
+    if (typeof setDocCellTextSafely64_ === 'function') {
+      setDocCellTextSafely64_(cell, txt);
+      return;
+    }
+    while (cell.getNumChildren() > 1) {
+      cell.removeChild(cell.getChild(cell.getNumChildren() - 1));
+    }
+    cell.getChild(0).asParagraph().setText(String(txt || ''));
+  };
+
   for (let i = 0; i < body.getNumChildren(); i++) {
     const el = body.getChild(i);
     if (el.getType() === DocumentApp.ElementType.PARAGRAPH) {
@@ -120,11 +126,15 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
         if (row.getNumCells() < 4) continue;
 
         const c0 = row.getCell(0).getText().trim();
-        const c1 = row.getCell(1).getText().trim().replace(/(【案[123１２３]】[^\n]+?)\1+/g, '$1');
-        const c2Raw = row.getCell(2).getText().trim();
-        const c2Header = c2Raw.split('\n').filter(function(l) { return !l.trim().startsWith('→'); }).join(' ').trim();
+        const rawC1 = row.getCell(1).getText().trim();
+        const c1 = (typeof dedupePlanCellLines64_ === 'function')
+          ? dedupePlanCellLines64_(rawC1)
+          : rawC1.replace(/(【案[123１２３]】[^\n]+?)\1+/g, '$1');
 
-        const c0Lines = c0.split('\n');
+        const c2Raw = row.getCell(2).getText().trim();
+        const c2Header = c2Raw.split(/\r?\n/).filter(function(l) { return !l.trim().startsWith('→'); }).join(' ').trim();
+
+        const c0Lines = Array.from(new Set(c0.split(/\r?\n/).map(function(s) { return s.trim(); }).filter(Boolean)));
         const clinicTitle = c0Lines[0] || '';
         const timeAndWage = c0Lines.slice(1).join(' ');
         const carryKey = getSlotCarryOverKey3_(curDate, clinicTitle, timeAndWage);
@@ -158,8 +168,6 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
         const resolved = resolveCarriedOverDecisionForSlot3_(prevEntry, planObj, { currentMemo: latestMemoText }, mailHistoryIndex);
         let finalDecisionText = resolved.decision;
 
-        // ★改善：シフト応募通知メールで該当枠への応募が入っている場合の統合反映ロジック
-        // （分割応募の重複排除・(案X)タグ自動付与・古い「📩返信待ち / ⚠️要確認」の上書き昇格）
         if (applyIndex && typeof findMatchingShiftApplicationsForSlot3_3d_ === 'function') {
           const cleanC = cleanClinicBaseName_(clinicTitle);
           const tmMatch = timeAndWage.match(/(\d{1,2}:\d{2}\s*[\-~～]\s*\d{1,2}:\d{2})/);
@@ -210,11 +218,11 @@ function updateGoogleDocAndRemoveResolvedRows3_3_(ss, docId, mailHistoryIndex) {
           }
         }
 
-        if (finalDecisionText !== c2Raw) {
-          row.getCell(2).setText(finalDecisionText);
+        if (finalDecisionText !== c2Raw || row.getCell(2).getNumChildren() > 1) {
+          setCellSafelyLocal(row.getCell(2), finalDecisionText);
           row.getCell(2).editAsText().setFontSize(8.5).setBold(true);
         }
-        if (typeof applySelectedPlanMarkerToDocCell64_ === 'function' && finalDecisionText) {
+        if (typeof applySelectedPlanMarkerToDocCell64_ === 'function' && (finalDecisionText || rawC1 !== c1 || row.getCell(1).getNumChildren() > 1)) {
           applySelectedPlanMarkerToDocCell64_(row.getCell(1), c1, finalDecisionText);
         }
       }

@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_2a_モデル通信と整形.gs
- * （「💡現状・注意：」の改行箇条書き整形・不要文言カット・誤字補正版）
+ * （「💡現状・注意：」の改行箇条書き整形・異体字［﨑・髙・齋等］抽出漏れ防止版）
  * ============================================================================
  */
 
@@ -41,9 +41,6 @@ function cleanPlanTextFormatting_(text) {
     .trim();
 }
 
-/**
- * ★改善：注意書きを「 / 」の1行繋ぎではなく、1項目ずつ改行（\n・...）して見やすく整形する関数
- */
 function cleanAuditNoteFormatting_(noteText) {
   const raw = String(noteText || '')
     .replace(/亀原本院/g, '亀有')
@@ -137,7 +134,7 @@ function correctDoctorNamesInMemoText_(memoText, officialNameList) {
   let s = String(memoText || '').trim();
   if (!s || !officialNameList || officialNameList.length === 0) return s;
 
-  return s.replace(/([一-龠々ヶケ]{2,6})先生/g, function(fullMatch, rawDocName) {
+  return s.replace(/([一-龠々ヶケ﨑嵜髙瀧泷邊邉齋齊澤廣國嶋嶌栁濱櫻眞惠]{2,6})先生/g, function(fullMatch, rawDocName) {
     if (officialNameList.includes(rawDocName)) return fullMatch;
 
     const targetKey = toPhoneticHomophoneKey2a_(rawDocName);
@@ -171,7 +168,7 @@ function extractCandidateDoctorsFromPlanText2a_(planText) {
   const s = String(planText || '').replace(/｛※.*?｝/g, '').replace(/※.*?確認後に/g, '').trim();
   if (!s) return [];
   const names = [];
-  const regex = /(?:①|②|③|前医の|後医の|2診目[：:]|1診[：:]|^|\s)([一-龠々ヶケ]{2,6})先生/g;
+  const regex = /(?:①|②|③|前医の|後医の|2診目[：:]|1診[：:]|^|\s)([一-龠々ヶケ﨑嵜髙瀧泷邊邉齋齊澤廣國嶋嶌栁濱櫻眞惠]{2,6})先生/g;
   let m;
   while ((m = regex.exec(s)) !== null) {
     const n = m[1].trim();
@@ -186,7 +183,6 @@ function buildDeterministicSlotPlanFast_(slot, officialNameList) {
 
   if (slot.currentMemo && String(slot.currentMemo).trim() && slot.currentMemo !== '-') {
     const correctedMemo = correctDoctorNamesInMemoText_(slot.currentMemo, officialNameList);
-    // 進行中メモ自体に複数行または「 / 」区切りがある場合も、それぞれに【進行中メモ】を付けて見やすく分割
     correctedMemo.split(/(?:\r?\n|\s+[\/／]\s+)/).map(function(m) { return m.replace(/^[・\s]+/, '').trim(); }).filter(Boolean).forEach(function(mLine) {
       auditNotes.push('【進行中メモ】' + mLine);
     });

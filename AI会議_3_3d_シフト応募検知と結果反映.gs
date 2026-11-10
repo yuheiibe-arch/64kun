@@ -2,9 +2,8 @@
  * ============================================================================
  * AI会議_3_3d_シフト応募検知と結果反映.gs
  * 1) Gmailの「【要対応】★医師シフト応募通知★」（スレッド形式）を最小API消費で差分検知
- * 2) 『シフト応募履歴』シートへ蓄積し、重複読み込みを完全防止（拠点名の表記ゆれ完全正規化対応）
- * 3) 交渉していた枠に応募が入った場合（本人応募／別医師応募による充足の両方）、
- *    Googleドキュメント・Slack（C0AJTMLF0UD 既存スレッド編集）・『交渉履歴』へ自動反映
+ * 2) 現在Googleドキュメントに記載されている日付範囲（最小日〜最大日）の応募のみを記録・維持
+ * 3) 交渉枠に応募が入った場合、ドキュメント・Slack（C0AJTMLF0UD）・交渉履歴へ自動反映
  * ============================================================================
  */
 
@@ -12,51 +11,149 @@ const SHIFT_APPLY_SHEET_NAME = 'シフト応募履歴';
 const PROP_KEY_LAST_APPLY_MS = 'LAST_SHIFT_APPLY_SCAN_MS_V1';
 
 /**
- * ★単体テスト・即時実行用：
- * Gmailから最新のシフト応募通知を取り込み、ドキュメント・Slack・交渉履歴へ即座に反映する関数
+ * 🔍 【作動確認デバッグ（書き込みゼロ）】
+ * 1) 現在のGoogleドキュメントの日付範囲（最小日〜最大日）を自動取得
+ * 2) Gmailの「【要対応】★医師シフト応募通知★」から、その日付範囲内の応募のみを抽出
+ * 3) ドキュメント上の不在枠と照合し、どう反映されるかをログ出力
+ */
+function debugVerifyShiftApplicationsWithinDocRange() {
+  const props = PropertiesService.getScriptProperties();
+  const docId = props.getProperty('SINGLE_MTG_DOC_ID');
+  if (!docId) {
+    Logger.log('⚠️ SINGLE_MTG_DOC_ID が設定されていません。');
+    return;
+  }
+
+  const docInfo = getActiveDocDateRangeAndSlots3_3d_(docId);
+  Logger.log('=== ① 現在のGoogleドキュメント対象範囲 ===');
+  Logger.log('・日付範囲: ' + docInfo.minDate + ' ～ ' + docInfo.maxDate + ' （計 ' + docInfo.dates.length + ' 日分）');
+  Logger.log('・ドキュメント内の現在枠数: ' + docInfo.slots.length + ' 枠');
+
+  if (!docInfo.minDate || !docInfo.maxDate) {
+    Logger.log('⚠️ ドキュメント内に日付見出し（◆ YYYY/MM/DD）が見つかりません。');
+    return;
+  }
+
+  const query = 'from:caps365.jp subject:("医師シフト応募通知") newer_than:7d';
+  const threads = GmailApp.search(query, 0, 5);
+  const allMessages = threads.length > 0 ? GmailApp.getMessagesForThreads(threads) : [];
+
+  const inRangeApps = [];
+  const seenKeys = new Set();
+  const tempApplyIndex = { bySlotKey: new Map(), byDocAndDate: new Map() };
+
+  for (let i = 0; i < threads.length; i++) {
+    const msgs = allMessages[i];
+    for (let j = msgs.length - 1; j >= 0; j--) {
+      const entries = parseShiftApplicationMessage3_3d_(msgs[j]);
+      entries.forEach(function(ent) {
+        if (ent.workDateYmd < docInfo.minDate || ent.workDateYmd > docInfo.maxDate) return;
+        if (seenKeys.has(ent.uniqueKey)) return;
+        seenKeys.add(ent.uniqueKey);
+        inRangeApps.push(ent);
+
+        const sKey = ent.workDateYmd + '|' + ent.clinic;
+        if (!tempApplyIndex.bySlotKey.has(sKey)) tempApplyIndex.bySlotKey.set(sKey, []);
+        tempApplyIndex.bySlotKey.get(sKey).push(ent);
+      });
+    }
+  }
+
+  Logger.log('\n=== ② ドキュメント日付範囲内 (' + docInfo.minDate + '～' + docInfo.maxDate + ') のシフト応募: ' + inRangeApps.length + ' 件 ===');
+  Logger.log(JSON.stringify(inRangeApps, null, 2));
+
+  const matchedResults = [];
+  docInfo.slots.forEach(function(sl) {
+    const hits = findMatchingShiftApplicationsForSlot3_3d_(sl.date, sl.cleanClinic, sl.timeRange, tempApplyIndex);
+    if (hits.length > 0) {
+      matchedResults.push({
+        docSlot: sl.date + ' 【' + sl.cleanClinic + '】 ' + sl.timeRange,
+        currentDocCol2Plans: sl.col1Snippet,
+        currentDocCol3Result: sl.col2Text,
+        matchedApplications: hits.map(function(h) {
+          return h.doctorName + '先生 (' + h.workTime + ' / 応募日時:' + h.receivedAtStr + ')';
+        }),
+        willAddDocLine: hits.map(function(h) {
+          return '→ ⭕' + h.doctorName + '：応募あり充足(' + h.receivedDateShort + ')';
+        })
+      });
+    }
+  });
+
+  Logger.log('\n=== ③ 現在ドキュメントに残っている枠とシフト応募のマッチ結果: ' + matchedResults.length + ' 枠 ===');
+  if (matchedResults.length === 0) {
+    Logger.log('👉 現在ドキュメントに残っている未充足枠と直接重なる応募はありません（既に解消済か、別枠への応募です）。');
+  } else {
+    Logger.log(JSON.stringify(matchedResults, null, 2));
+  }
+}
+
+/**
+ * 手動即時反映用関数（通常時は既存の15分トリガー runDailyTransferAndMatching から自動で呼ばれます）
  */
 function runScanShiftApplicationsAndSyncNow() {
   const ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById('1vh9hPfoaAGTZOm-GFtJQoSPgFB3GiABsbJ4ETgMqfbM');
   const newCount = scanGmailShiftApplicationsIncremental3_3d_(ss, false);
-  Logger.log('📩 新規シフト応募検知数: ' + newCount + ' 件');
+  Logger.log('📩 ドキュメント範囲内の新規シフト応募検知数: ' + newCount + ' 件');
   if (typeof syncAdjustmentResultsToDocAndSlack3_3_ === 'function') {
     syncAdjustmentResultsToDocAndSlack3_3_(ss);
   }
 }
 
 /**
- * 🔍 デバッグ確認用（ドライラン・シートやSlackへの書き込みなし）：
- * 直近7日間の「【要対応】★医師シフト応募通知★」スレッドから何が抽出され、
- * 現在の不在枠・Slackスレッドとどうマッチするかをログ出力する関数
+ * ドキュメント内の日付範囲（minDate, maxDate）と各枠情報を読み取るヘルパー
  */
-function debugDryRunShiftApplications3_3d() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById('1vh9hPfoaAGTZOm-GFtJQoSPgFB3GiABsbJ4ETgMqfbM');
-  const query = 'subject:("医師シフト応募通知" OR "シフト応募" OR "応募がありました") newer_than:7d';
-  const threads = GmailApp.search(query, 0, 30);
-  Logger.log('🔎 検索ヒットスレッド数: ' + threads.length + ' 件');
+function getActiveDocDateRangeAndSlots3_3d_(docId) {
+  const doc = DocumentApp.openById(docId);
+  const body = doc.getBody();
+  const dates = [];
+  const slots = [];
+  let curDate = '';
 
-  if (threads.length === 0) return;
-
-  const allMessages = GmailApp.getMessagesForThreads(threads);
-  const extractedList = [];
-
-  for (let i = 0; i < threads.length; i++) {
-    const msgs = allMessages[i];
-    for (let j = msgs.length - 1; j >= 0; j--) {
-      const msg = msgs[j];
-      const parsedEntries = parseShiftApplicationMessage3_3d_(msg);
-      parsedEntries.forEach(function(e) {
-        extractedList.push(e);
-      });
+  for (let i = 0; i < body.getNumChildren(); i++) {
+    const el = body.getChild(i);
+    if (el.getType() === DocumentApp.ElementType.PARAGRAPH) {
+      const dm = el.asParagraph().getText().trim().match(/^◆\s*(\d{4}\/\d{2}\/\d{2})/);
+      if (dm) {
+        curDate = dm[1];
+        if (!dates.includes(curDate)) dates.push(curDate);
+      }
+    } else if (el.getType() === DocumentApp.ElementType.TABLE && curDate) {
+      const tbl = el.asTable();
+      if (tbl.getNumRows() < 2 || !tbl.getRow(0).getCell(0).getText().includes('拠点・不在時間帯')) continue;
+      for (let r = 1; r < tbl.getNumRows(); r++) {
+        const row = tbl.getRow(r);
+        if (row.getNumCells() < 4) continue;
+        const c0Lines = row.getCell(0).getText().trim().split('\n');
+        const c1 = row.getCell(1).getText().trim();
+        const c2 = row.getCell(2).getText().trim();
+        const cleanC = (typeof cleanClinicBaseName_ === 'function')
+          ? cleanClinicBaseName_(c0Lines[0] || '')
+          : String(c0Lines[0] || '').replace(/[【】\[\]（）\(\)]/g, '').trim();
+        const tmMatch = c0Lines.slice(1).join(' ').match(/(\d{1,2}:\d{2}\s*[\-~～]\s*\d{1,2}:\d{2})/);
+        slots.push({
+          date: curDate,
+          cleanClinic: cleanC,
+          timeRange: tmMatch ? tmMatch[1].replace(/\s+/g, '') : '',
+          col1Snippet: c1.replace(/\n+/g, ' / ').slice(0, 80),
+          col2Text: c2.replace(/\n+/g, ' / ')
+        });
+      }
     }
   }
 
-  Logger.log('📋 抽出されたシフト応募データ (' + extractedList.length + ' 件):\n' + JSON.stringify(extractedList.slice(0, 25), null, 2));
+  dates.sort();
+  return {
+    minDate: dates.length > 0 ? dates[0] : '',
+    maxDate: dates.length > 0 ? dates[dates.length - 1] : '',
+    dates: dates,
+    slots: slots
+  };
 }
 
 /**
- * 1. Gmailから「【要対応】★医師シフト応募通知★」をスレッド対応・差分のみで高速スキャンし、
- *    『シフト応募履歴』シートへ記録する関数（API消費最小化設計）
+ * Gmailから「【要対応】★医師シフト応募通知★」を最新5スレッド・差分のみで高速スキャンし、
+ * 現在のGoogleドキュメント日付範囲内の応募のみを『シフト応募履歴』シートへ記録・維持する関数
  */
 function scanGmailShiftApplicationsIncremental3_3d_(ssOpt, forceLookback7Days) {
   const ss = ssOpt || SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById('1vh9hPfoaAGTZOm-GFtJQoSPgFB3GiABsbJ4ETgMqfbM');
@@ -75,25 +172,53 @@ function scanGmailShiftApplicationsIncremental3_3d_(ssOpt, forceLookback7Days) {
     sheet.setFrozenRows(1);
   }
 
-  const lastRow = sheet.getLastRow();
-  const existingKeys = new Set();
-  const existingMsgIds = new Set();
-  if (lastRow >= 2) {
-    const keyVals = sheet.getRange(2, 7, lastRow - 1, 2).getDisplayValues();
-    keyVals.forEach(function(r) {
-      if (r[0]) existingKeys.add(String(r[0]).trim());
-      if (r[1]) existingMsgIds.add(String(r[1]).trim());
-    });
+  const props = PropertiesService.getScriptProperties();
+  const docId = props.getProperty('SINGLE_MTG_DOC_ID');
+  let docRange = { minDate: '', maxDate: '' };
+  if (docId) {
+    try {
+      docRange = getActiveDocDateRangeAndSlots3_3d_(docId);
+    } catch (e) {}
   }
 
-  const props = PropertiesService.getScriptProperties();
+  const minWorkDateYmd = docRange.minDate || Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd');
+  const maxWorkDateYmd = docRange.maxDate || Utilities.formatDate(new Date(Date.now() + 21 * 86400000), 'Asia/Tokyo', 'yyyy/MM/dd');
+
+  // 既存シートの読み込み＆ドキュメント日付範囲外の古い行・長期先行の自動クリーンアップ
+  const existingKeys = new Set();
+  const existingMsgIds = new Set();
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= 2) {
+    const allVals = sheet.getRange(2, 1, lastRow - 1, headers.length).getDisplayValues();
+    const keptRows = [];
+    let removedOutOfRange = false;
+
+    allVals.forEach(function(r) {
+      const wDate = (typeof normalizeDateYmd1b3_ === 'function') ? normalizeDateYmd1b3_(r[1]) : String(r[1] || '').trim();
+      if (r[7]) existingMsgIds.add(String(r[7]).trim());
+      if (wDate >= minWorkDateYmd && wDate <= maxWorkDateYmd) {
+        keptRows.push(r);
+        if (r[6]) existingKeys.add(String(r[6]).trim());
+      } else {
+        removedOutOfRange = true;
+      }
+    });
+
+    if (removedOutOfRange) {
+      sheet.getRange(2, 1, lastRow - 1, headers.length).clearContent();
+      if (keptRows.length > 0) {
+        sheet.getRange(2, 1, keptRows.length, headers.length).setValues(keptRows);
+      }
+    }
+  }
+
   const savedLastMs = Number(props.getProperty(PROP_KEY_LAST_APPLY_MS) || 0);
   const cutoffMs = (!forceLookback7Days && savedLastMs > 0)
     ? (savedLastMs - 2 * 60 * 60 * 1000)
     : (Date.now() - 7 * 24 * 60 * 60 * 1000);
 
   const query = 'from:caps365.jp subject:("医師シフト応募通知") newer_than:7d';
-  const threads = GmailApp.search(query, 0, 25);
+  const threads = GmailApp.search(query, 0, 5);
   if (threads.length === 0) return 0;
 
   const allMessages = GmailApp.getMessagesForThreads(threads);
@@ -107,19 +232,16 @@ function scanGmailShiftApplicationsIncremental3_3d_(ssOpt, forceLookback7Days) {
       const msgMs = msg.getDate().getTime();
       if (msgMs > maxSeenMs) maxSeenMs = msgMs;
 
-      if (msgMs < cutoffMs) {
-        break;
-      }
+      if (msgMs < cutoffMs) break;
 
       const msgId = msg.getId();
-      if (existingMsgIds.has(msgId)) {
-        continue;
-      }
+      if (existingMsgIds.has(msgId)) continue;
 
       const entries = parseShiftApplicationMessage3_3d_(msg);
       existingMsgIds.add(msgId);
 
       entries.forEach(function(ent) {
+        if (ent.workDateYmd < minWorkDateYmd || ent.workDateYmd > maxWorkDateYmd) return;
         if (existingKeys.has(ent.uniqueKey)) return;
         existingKeys.add(ent.uniqueKey);
         newRows.push([
@@ -149,9 +271,6 @@ function scanGmailShiftApplicationsIncremental3_3d_(ssOpt, forceLookback7Days) {
   return newRows.length;
 }
 
-/**
- * 2. 1通の応募通知メールから応募情報（CAPSドクター365標準／共通フォーマット／MRT）を抽出する関数
- */
 function parseShiftApplicationMessage3_3d_(message) {
   const receivedDateObj = message.getDate();
   const receivedAtStr = Utilities.formatDate(receivedDateObj, 'Asia/Tokyo', 'yyyy/MM/dd HH:mm');
@@ -188,7 +307,6 @@ function parseShiftApplicationMessage3_3d_(message) {
     const tMatch = String(rawTimeStr || '').match(/(\d{1,2}:\d{2})\s*[～~〜\-]\s*(\d{1,2}:\d{2})/);
     const workTime = tMatch ? (('0' + tMatch[1]).slice(-5) + '-' + ('0' + tMatch[2]).slice(-5)) : '';
 
-    // ★修正：cleanClinicBaseName_ を使用して拠点名の表記ゆれ（新鎌ヶ谷➔新鎌ケ谷、セブンパーク天美➔天美 等）を完全正規化
     const rawTrimmed = String(rawClinicStr || '')
       .replace(/[【】\[\]（）\(\)]/g, ' ')
       .replace(/小児科|内科|耳鼻咽喉科|皮膚科|整形外科/g, '')
@@ -241,11 +359,6 @@ function parseShiftApplicationMessage3_3d_(message) {
   return results;
 }
 
-/**
- * 3. 『シフト応募履歴』シートから応募インデックスを構築する関数
- *    ・bySlotKey: "YYYY/MM/DD|拠点名" ➔ [{ doctorName, workTime, receivedDateShort, receivedAtStr, dailyWage }]
- *    ・byDocAndDate: "医師名|YYYY/MM/DD" ➔ [{ clinic, workTime, receivedDateShort }]
- */
 function buildShiftApplicationIndex3_3d_(ssOpt) {
   const ss = ssOpt || SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById('1vh9hPfoaAGTZOm-GFtJQoSPgFB3GiABsbJ4ETgMqfbM');
   const index = {
@@ -293,9 +406,6 @@ function buildShiftApplicationIndex3_3d_(ssOpt) {
   return index;
 }
 
-/**
- * 4. 2つの時間帯（例: "18:00-21:00" と "18:00-21:00" または "15:00-21:00"）が重なっているか判定するヘルパー
- */
 function isShiftTimeOverlapping3_3d_(timeRangeA, timeRangeB) {
   if (!timeRangeA || !timeRangeB) return true;
   const parseMin = function(s) {
@@ -314,9 +424,6 @@ function isShiftTimeOverlapping3_3d_(timeRangeA, timeRangeB) {
   return (overlapEnd - overlapStart) >= 60;
 }
 
-/**
- * 5. 特定の枠（日付・拠点・時間帯）に対して入ったシフト応募を取得する関数
- */
 function findMatchingShiftApplicationsForSlot3_3d_(workDateYmd, cleanClinic, targetTimeRange, applyIndex) {
   if (!applyIndex || !applyIndex.bySlotKey) return [];
   const normClinic = (typeof cleanClinicBaseName_ === 'function')

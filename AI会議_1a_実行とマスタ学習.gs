@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_1a_実行とマスタ学習.gs
- * （会議生成前のGmailキャンセル＆医師返信リアルタイム同期・『交渉しやすい医師』無断行追加禁止・列ズレ自動修復版）
+ * （会議生成前のシフト応募・キャンセル・返信リアルタイム同期・NG拠点の逆転誤登録防止・P列要約統一版）
  * ============================================================================
  */
 
@@ -20,7 +20,7 @@ const MTG_DOC_CONFIG = {
 };
 
 /**
- * ★新設：会議ドキュメント生成の直前に、Gmailから最新の「医師返信メール」「シフトキャンセル承認メール」を回収してシートを最新化するヘルパー
+ * 会議ドキュメント生成の直前に、Gmailから最新の「医師返信」「DS打診」「シフトキャンセル」「シフト応募通知」を同期するヘルパー
  */
 function syncLatestMailsBeforeMeeting1a_(ss) {
   try {
@@ -33,6 +33,9 @@ function syncLatestMailsBeforeMeeting1a_(ss) {
     }
     if (typeof matchAndCreateKnowledgeBase_Final === 'function') {
       matchAndCreateKnowledgeBase_Final(ssId);
+    }
+    if (typeof scanGmailShiftApplicationsIncremental3_3d_ === 'function') {
+      scanGmailShiftApplicationsIncremental3_3d_(ss, false);
     }
   } catch (e) {
     Logger.log('⚠️ 事前メール同期スキップ: ' + e.message);
@@ -53,7 +56,7 @@ function runPreviewMeetingDocOnly() {
 
   const customRulesText = loadOrInitCustomRuleSheet_(ss);
 
-  Logger.log('🧠 0/3: 最新メール（シフトキャンセル・医師返信）の同期 ＆ マスタ修復を実行中...');
+  Logger.log('🧠 0/3: 最新メール（シフト応募・キャンセル・医師返信）の同期 ＆ マスタ修復を実行中...');
   syncLatestMailsBeforeMeeting1a_(ss);
   repairNegotiableAndCautionSheetsNow(ss);
   syncNewKnowledgeToAiMemo_(ss);
@@ -168,8 +171,9 @@ function syncNewKnowledgeToAiMemo_(ss) {
 
     const systemPrompt = [
       'あなたはCAPSクリニックの医師マスタ管理AIです。',
-      '医師からの返信メール一覧を読み、今後の非常勤シフト打診で継続して覚えておくべきNG条件や曜日・時間帯・拠点の制約が含まれているものだけを抽出してください。',
-      '単なるその日限りの出欠連絡、来年度の常勤契約日数の相談、他病院の退職挨拶などはすべて shouldWrite: false にしてください。',
+      '医師からの返信メール一覧を読み、今後の非常勤シフト打診で継続して覚えておくべき恒久的なNG条件や曜日・時間帯・拠点の制約が含まれているものだけを抽出してください。',
+      '単なるその日限りの予定・出欠連絡、承諾連絡、来年度の常勤契約日数の相談、他病院の退職挨拶などはすべて shouldWrite: false にしてください。',
+      '注意：「武蔵境以外は不可」のように特定の拠点のみ勤務可能な場合は、ngClinic は必ず空文字("")にし、aiMemoSummary に「武蔵境以外は勤務不可」と要約してください。',
       '以下のJSON形式のみを出力してください:',
       '{"decisions":[{"rowNumber":10,"shouldWrite":true,"targetSheet":"交渉注意医師","conditionType":"部分不可","ngClinic":"","aiMemoSummary":"35文字以内の簡潔な条件要約"}]}'
     ].join('\n');
@@ -197,10 +201,8 @@ function syncNewKnowledgeToAiMemo_(ss) {
       if (!orig) return;
 
       if (d.shouldWrite && d.aiMemoSummary) {
-        const stamp = orig.date ? String(orig.date).slice(5, 10) : Utilities.formatDate(new Date(), 'Asia/Tokyo', 'MM/dd');
-        const entryText = '[' + stamp + '] ' + d.aiMemoSummary;
-
-        const updatedInNeg = upsertNegotiableSheetRowIfExist_(ss, orig.doctor, entryText);
+        const cleanSummary = String(d.aiMemoSummary).trim();
+        const updatedInNeg = upsertNegotiableSheetRowIfExist_(ss, orig.doctor, cleanSummary);
         if (!updatedInNeg) {
           const cSheet = ss.getSheetByName('交渉注意医師');
           if (cSheet) {
@@ -211,7 +213,7 @@ function syncNewKnowledgeToAiMemo_(ss) {
               conditionType: d.conditionType || '部分不可',
               ngArea: '関東',
               ngClinic: d.ngClinic || '',
-              memoText: entryText
+              memoText: cleanSummary
             });
           }
         }
@@ -293,9 +295,9 @@ function repairCautionSheetRowsNow(ssOpt) {
     const colC = String(row[2] || '').trim();
     const colE = String(row[4] || '').trim();
 
-    if ((/^\d+$/.test(colA) && colB) || colC.includes('AI自動抽出')) {
+    if ((/^\d+$/.test(colA) && colB) || colC.includes('AI自動抽出') || colB.includes('自動抽出')) {
       brokenEntries.push({
-        doctorName: colB || colA,
+        doctorName: colB.includes('自動抽出') ? colA : (colB || colA),
         memoText: colE || String(row[3] || '').trim()
       });
       rowsToDelete.push(r + 1);
@@ -324,9 +326,18 @@ function repairCautionSheetRowsNow(ssOpt) {
   Logger.log('✅ 『交渉注意医師』シートの列ズレ行を自動修復・統合しました（' + brokenEntries.length + '件）');
 }
 
+/**
+ * ★改善：
+ * 1) 「武蔵境以外は不可」「東品川のみ可能」のような文面から拠点名をNG拠点(F列)に誤登録しないよう厳格化
+ * 2) 2行目のプルダウン入力規則をコピーし、K列は空欄・P列(16列目)に簡潔な要約を記載
+ */
 function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
   const docKey = normKeyForDoc_(info.doctorName);
   if (!docKey) return;
+
+  if (sheet.getMaxColumns() < 16) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), 16 - sheet.getMaxColumns());
+  }
 
   let existingMap = existingMapOpt;
   if (!existingMap) {
@@ -341,68 +352,55 @@ function upsertCautionDoctorRowProperly_(sheet, existingMapOpt, info) {
     }
   }
 
-  const knownClinics = [
-    '東品川', '北葛西', '亀有', '代官山', '西日暮里', '錦糸町', '池袋', '紀尾井町', '吉祥寺',
-    '新百合ヶ丘', '武蔵小杉', '横浜', '相模大野', '相模原', '天王町', '川崎', 'トレッサ横浜',
-    '川口', '所沢', '草加松原', '越谷レイクタウン', '浦和美園', '朝霞台', '南浦和', '与野', '志木', '川越',
-    '柏の葉', '流山おおたかの森', '新鎌ケ谷', '市川妙典', '八千代緑が丘', '千葉ニュータウン'
-  ];
-  let detectedClinic = info.ngClinic || '';
-  if (!detectedClinic && info.memoText) {
-    detectedClinic = knownClinics.find(function(c) { return info.memoText.includes(c); }) || '';
+  // 「〇〇は不可／〇〇への移動は難」のように明確にその拠点自体がNGと書かれている場合のみNG拠点とする（「〇〇以外」「〇〇のみ」は除外）
+  let detectedClinic = String(info.ngClinic || '').trim();
+  const memoStr = String(info.memoText || '').trim();
+  if (detectedClinic && (memoStr.includes(detectedClinic + '以外') || memoStr.includes(detectedClinic + 'のみ'))) {
+    detectedClinic = '';
+  }
+  if (!detectedClinic && memoStr && !/以外|のみ|だけ/.test(memoStr)) {
+    const explicitNgMatch = memoStr.match(/(海老名|越谷レイクタウン|天王町|武蔵小杉|東品川|川口|流山おおたかの森|北葛西|亀有|西新井|新鎌ケ谷|新百合ヶ丘|相模大野|相模原|柏の葉|市川妙典)(?:は|への移動は|につきましては)[^。、]*?(?:難|不可|厳)/);
+    if (explicitNgMatch) detectedClinic = explicitNgMatch[1];
   }
 
   if (existingMap.has(docKey)) {
     const targetRow = existingMap.get(docKey);
     const currentP = String(sheet.getRange(targetRow, 16).getDisplayValue() || '').trim();
-    if (info.memoText && !currentP.includes(info.memoText)) {
-      const newP = currentP ? (currentP + ' / ' + info.memoText) : info.memoText;
+    if (memoStr && !currentP.includes(memoStr.slice(0, 15))) {
+      const newP = currentP ? (currentP + ' / ' + memoStr) : memoStr;
       sheet.getRange(targetRow, 16).setValue(newP);
     }
-    if (detectedClinic) {
-      const fVal = String(sheet.getRange(targetRow, 6).getDisplayValue() || '').trim();
-      if (!fVal) {
-        try { sheet.getRange(targetRow, 6).setValue(detectedClinic); } catch (e) {}
-      }
+    if (detectedClinic && typeof trySetNgClinicInRow3_3_ === 'function') {
+      trySetNgClinicInRow3_3_(sheet, targetRow, detectedClinic);
     }
     return;
   }
 
   const newRowIdx = sheet.getLastRow() + 1;
-  const templateRowIdx = Math.min(5, Math.max(2, sheet.getLastRow()));
-
-  if (templateRowIdx >= 2) {
-    const templateRange = sheet.getRange(templateRowIdx, 1, 1, 16);
-    const targetRange = sheet.getRange(newRowIdx, 1, 1, 16);
-    templateRange.copyTo(targetRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
+  if (sheet.getLastRow() >= 2) {
+    const templateRange = sheet.getRange(2, 1, 1, 15);
+    const targetRange = sheet.getRange(newRowIdx, 1, 1, 15);
     templateRange.copyTo(targetRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+    templateRange.copyTo(targetRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
+    targetRange.clearContent();
   }
 
   const validCond = (info.conditionType && info.conditionType.includes('絶対')) ? '絶対不可' : '部分不可';
   const validDept = (info.dept && info.dept.includes('内科')) ? '内科' : '小児科';
   const validArea = (info.ngArea && info.ngArea.includes('関西')) ? '関西' : '関東';
-  const cleanLic = (info.licenseNo && /^\d{5,7}$/.test(String(info.licenseNo).trim())) ? String(info.licenseNo).trim() : '';
+  const cleanLic = (info.licenseNo && /^\d{4,7}$/.test(String(info.licenseNo).trim())) ? String(info.licenseNo).trim() : '';
 
-  const rowValues = [
-    info.doctorName,
-    cleanLic,
-    validDept,
-    validCond,
-    validArea,
-    detectedClinic,
-    '',
-    '',
-    '',
-    '',
-    '',
-    '',
-    '',
-    '',
-    '',
-    info.memoText || ''
-  ];
+  sheet.getRange(newRowIdx, 1).setValue(info.doctorName);
+  sheet.getRange(newRowIdx, 2).setValue(cleanLic);
+  try { sheet.getRange(newRowIdx, 3).setValue(validDept); } catch (e) {}
+  try { sheet.getRange(newRowIdx, 4).setValue(validCond); } catch (e) {}
+  try { sheet.getRange(newRowIdx, 5).setValue(validArea); } catch (e) {}
+  sheet.getRange(newRowIdx, 16).setValue(memoStr); // K列は空欄にし、P列(16列目)に簡潔な要約を記載
 
-  sheet.getRange(newRowIdx, 1, 1, 16).setValues([rowValues]);
+  if (detectedClinic && typeof trySetNgClinicInRow3_3_ === 'function') {
+    trySetNgClinicInRow3_3_(sheet, newRowIdx, detectedClinic);
+  }
+
   existingMap.set(docKey, newRowIdx);
 }
 
