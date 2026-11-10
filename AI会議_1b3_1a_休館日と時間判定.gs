@@ -3,7 +3,7 @@
  * AI会議_1b3_1a_休館日と時間判定.gs（分割前半）
  * 1) 『休館日』シート（全拠点・個別拠点／全日・午前・午後・午後夜間・夜間）の除外判定
  * 2) 時間帯の正規化・帯またぎ募集枠（17:00-21:00等）の照合
- * 3) 『最新_当日シフト』との15分刻み在席カバー判定
+ * 3) 『最新_当日シフト』＋『BQ確定シフト(kakutei)』統合による2診目募集枠の完全除外判定
  * ============================================================================
  */
 
@@ -15,7 +15,6 @@ function normalizeDateYmd1b3_(rawDateStr) {
 
 /**
  * 『休館日』シートを読み込み、指定枠が休館かどうかを判定・調整するチェッカーを構築
- * シート構造：A列=日付, B列=曜日, C列=診療科, D列=拠点名(「全拠点」あり), E列=時間(午前/午後/全日/午後夜間/夜間), F列=備考
  */
 function buildClosedClinicChecker1b3_(ssOpt) {
   const ss = ssOpt || SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById('1vh9hPfoaAGTZOm-GFtJQoSPgFB3GiABsbJ4ETgMqfbM');
@@ -45,15 +44,15 @@ function buildClosedClinicChecker1b3_(ssOpt) {
         closedEnd = 1440;
       } else if (timeBandRaw === '午前') {
         closedStart = 0;
-        closedEnd = 840; // 〜14:00
+        closedEnd = 840;
       } else if (timeBandRaw === '午後夜間' || timeBandRaw === '午後・夜間') {
-        closedStart = 780; // 13:00〜24:00
+        closedStart = 780;
         closedEnd = 1440;
       } else if (timeBandRaw === '午後') {
-        closedStart = 780; // 13:00〜18:00
+        closedStart = 780;
         closedEnd = 1080;
       } else if (timeBandRaw === '夜間') {
-        closedStart = 1080; // 18:00〜24:00
+        closedStart = 1080;
         closedEnd = 1440;
       } else {
         const tm = timeBandRaw.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
@@ -153,9 +152,25 @@ function formatMinToHHMM1b3_1_(totalMin) {
 }
 
 /**
- * BQパック（bosyu＝実際の掲載募集枠）に元の不在時間を完全に内包する募集枠（5時間以内、例：17:00-21:00）が
- * 実在する場合のみその募集枠を採用し、該当がなければ『最新_不在枠』の実時間をそのまま返す関数
+ * 2診目専用のピーク短縮枠（10:00-13:00、15:00-17:00 等）を除外するため、
+ * 基本の1診目フル帯（09:00-13:00 / 15:00-18:00 / 18:00-21:00 等）かどうかを判定する関数
  */
+function isStandardFullBand1ShinSlot1b3_(absTimeStr, clinicName) {
+  const isKitakasai = String(clinicName || '').includes('北葛西');
+  const tl = parseAbsenceTimeline_(absTimeStr);
+  const s = tl.startMin;
+  const e = tl.endMin;
+
+  // 午前フル帯（09:00開始〜12:30/13:00終了）※10:00-13:00等は除外
+  if (s <= 540 && e >= (isKitakasai ? 750 : 780) && e <= 840) return true;
+  // 午後フル帯（14:00/15:00開始〜18:00終了）※15:00-17:00等は除外
+  if ((s === 840 || s === 870 || s === 900) && e === 1080) return true;
+  // 夜間フル帯（18:00開始〜20:00/21:00終了）
+  if (s === 1080 && e >= (isKitakasai ? 1200 : 1260)) return true;
+
+  return false;
+}
+
 function expandToLongestRecruitSlotTime1b3_(dateStr, rawClinic, absTimeStr, recruitSlotsIndex, activeShifts) {
   const cleanC = cleanClinicBaseName_(rawClinic);
   const deptTag = String(rawClinic || '').includes('内科') ? '内科' : '小児科';
@@ -184,68 +199,147 @@ function expandToLongestRecruitSlotTime1b3_(dateStr, rawClinic, absTimeStr, recr
 }
 
 /**
- * 『最新_当日シフト』上で対象時間帯に既に1名以上の医師が勤務しているかを15分刻みで厳密判定する関数
+ * ★新設：『最新_当日シフト』と『BQ確定シフト(kakutei)』の両方を統合し、
+ * 1診目がすでに在席している枠（＝2診目募集）を全日程で確実に除外するカバレッジ判定チェッカー
  */
-function isSlotAlreadyCoveredByActiveShift1b3_(dateStr, rawClinic, absTimeStr, activeShifts) {
-  const d = normalizeDateYmd1b3_(dateStr);
-  const cleanC = cleanClinicBaseName_(rawClinic);
-  const isKitakasai = cleanC.includes('北葛西');
-  const isInternal = String(rawClinic || '').includes('内科');
+function buildConfirmedShiftCoverageChecker1b3_(activeShifts, bqKakuteiList) {
+  const intervalsByKey = new Map();      // key: d_cleanC_dept -> [{start, end}]
+  const datesWithBandRoster = new Set(); // 時間帯付きの確定シフトが存在する日付
+  const datesWithAnyBqDoc = new Set();   // BQ確定シフトに医師名が存在する日付
+  const clinicsWithAnyDocOnDate = new Set(); // key: d_cleanC_dept（その日に1人でも確定医がいる拠点）
 
-  const matchingRows = (activeShifts || []).filter(function(s) {
-    if (normalizeDateYmd1b3_(s[0]) !== d) return false;
-    if (cleanClinicBaseName_(s[2]) !== cleanC) return false;
-    const sIsInternal = String(s[2] || '').includes('内科') || String(s[3] || '').includes('内科');
-    return sIsInternal === isInternal;
+  const addInterval = function(d, cleanC, deptTag, startMin, endMin) {
+    const key = d + '_' + cleanC + '_' + deptTag;
+    if (!intervalsByKey.has(key)) intervalsByKey.set(key, []);
+    intervalsByKey.get(key).push({ start: startMin, end: endMin });
+    clinicsWithAnyDocOnDate.add(key);
+    datesWithBandRoster.add(d);
+  };
+
+  // 1. 『最新_当日シフト』シートを登録
+  (activeShifts || []).forEach(function(row) {
+    const d = normalizeDateYmd1b3_(row[0]);
+    const cleanC = cleanClinicBaseName_(row[2]);
+    if (!d || !cleanC || cleanC.includes('バックアップ')) return;
+    const isKitakasai = cleanC.includes('北葛西');
+    const deptTag = (String(row[2] || '').includes('内科') || String(row[3] || '').includes('内科')) ? '内科' : '小児科';
+    datesWithBandRoster.add(d);
+
+    const bands = [
+      { cnt: row[4], docs: row[7], start: 540, end: isKitakasai ? 750 : 780 },
+      { cnt: row[5], docs: row[8], start: isKitakasai ? 840 : 900, end: 1080 },
+      { cnt: row[6], docs: row[9], start: 1080, end: isKitakasai ? 1200 : 1260 }
+    ];
+
+    bands.forEach(function(b) {
+      const cntVal = parseInt(String(b.cnt || '0').replace(/[^0-9]/g, ''), 10) || 0;
+      const docsStr = String(b.docs || '').trim();
+      if (cntVal === 0 || !docsStr || docsStr === '未充足' || docsStr === '-' || docsStr === 'なし') return;
+
+      splitDoctorTokensSafely_(docsStr).forEach(function(tok) {
+        if (!tok || tok.includes('未充足')) return;
+        const tm = tok.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
+        if (!tm) {
+          addInterval(d, cleanC, deptTag, b.start, b.end);
+        } else {
+          addInterval(d, cleanC, deptTag, Number(tm[1]) * 60 + Number(tm[2]), Number(tm[3]) * 60 + Number(tm[4]));
+        }
+      });
+    });
   });
 
-  if (matchingRows.length === 0) return false;
+  // 2. 『BQ確定シフト（kakutei）』を登録（『最新_当日シフト』期間外の日程でも2診目募集をブロック）
+  (bqKakuteiList || []).forEach(function(s) {
+    const st = String(s.st || s.status || '').trim();
+    if (st && (st.includes('キャンセル') || st.includes('取消') || st.includes('却下'))) return;
 
-  const timeInfo = parseAbsenceTimeline_(absTimeStr);
-  const targetBands = timeInfo.targetBands || ['A'];
-  const row = matchingRows[0];
+    const d = normalizeDateYmd1b3_(s.d || s.date);
+    const rawC = String(s.c || s.clinic || '').trim();
+    const cleanC = cleanClinicBaseName_(rawC);
+    const docName = String(s.n || s.name || '').trim();
+    if (!d || !cleanC || cleanC.includes('バックアップ') || !docName || docName === '未充足') return;
 
-  for (let i = 0; i < targetBands.length; i++) {
-    const band = targetBands[i];
-    const countCol = band === 'A' ? 4 : (band === 'B' ? 5 : 6);
-    const docsCol = band === 'A' ? 7 : (band === 'B' ? 8 : 9);
+    const deptTag = (rawC.includes('内科') || String(s.dp || s.dept || '').includes('内科')) ? '内科' : '小児科';
+    const key = d + '_' + cleanC + '_' + deptTag;
+    clinicsWithAnyDocOnDate.add(key);
+    datesWithAnyBqDoc.add(d);
 
-    const cntVal = parseInt(String(row[countCol] || '0').replace(/[^0-9]/g, ''), 10) || 0;
-    const docsStr = String(row[docsCol] || '').trim();
+    const isKitakasai = cleanC.includes('北葛西');
+    const rawT = String(s.t || s.time || s.tm || s.workTime || '').normalize('NFKC').trim();
+    if (!rawT) return;
 
-    if (cntVal === 0 || !docsStr || docsStr === '未充足' || docsStr === '-' || docsStr === 'なし') {
+    const tm = rawT.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
+    if (tm) {
+      addInterval(d, cleanC, deptTag, Number(tm[1]) * 60 + Number(tm[2]), Number(tm[3]) * 60 + Number(tm[4]));
+    } else if (rawT.includes('終日') || rawT.includes('全日')) {
+      addInterval(d, cleanC, deptTag, 540, isKitakasai ? 1200 : 1260);
+    } else if (rawT.includes('午前')) {
+      addInterval(d, cleanC, deptTag, 540, isKitakasai ? 750 : 780);
+    } else if (rawT.includes('午後')) {
+      addInterval(d, cleanC, deptTag, isKitakasai ? 840 : 900, 1080);
+    } else if (rawT.includes('夜間')) {
+      addInterval(d, cleanC, deptTag, 1080, isKitakasai ? 1200 : 1260);
+    }
+  });
+
+  const isCoveredBy15MinSlices = function(d, cleanC, deptTag, startMin, endMin) {
+    const list = intervalsByKey.get(d + '_' + cleanC + '_' + deptTag) || [];
+    if (list.length === 0) return false;
+    for (let tMin = startMin; tMin < endMin; tMin += 15) {
+      const ok = list.some(function(iv) { return iv.start <= tMin && iv.end >= (tMin + 15); });
+      if (!ok) return false;
+    }
+    return true;
+  };
+
+  const hasAnyOverlappingConfirmedDoc = function(d, cleanC, deptTag, startMin, endMin) {
+    const list = intervalsByKey.get(d + '_' + cleanC + '_' + deptTag) || [];
+    return list.some(function(iv) {
+      return Math.max(iv.start, startMin) < Math.min(iv.end, endMin);
+    });
+  };
+
+  return {
+    isSlotAlreadyCovered: function(dateStr, rawClinic, absTimeStr) {
+      const d = normalizeDateYmd1b3_(dateStr);
+      const cleanC = cleanClinicBaseName_(rawClinic);
+      const deptTag = String(rawClinic || '').includes('内科') ? '内科' : '小児科';
+      const tl = parseAbsenceTimeline_(absTimeStr);
+      return isCoveredBy15MinSlices(d, cleanC, deptTag, tl.startMin, tl.endMin);
+    },
+
+    /**
+     * 『最新_不在枠』に載っていない bosyu 枠を「終日0人等の真の医師不在枠」として補完してよいか厳密判定
+     * （2診目募集枠［10:00-13:00 / 15:00-17:00 や1診目在席枠］はすべて false で除外）
+     */
+    canSupplementFromBosyu: function(dateStr, rawClinic, absTimeStr) {
+      const d = normalizeDateYmd1b3_(dateStr);
+      const cleanC = cleanClinicBaseName_(rawClinic);
+      const deptTag = String(rawClinic || '').includes('内科') ? '内科' : '小児科';
+
+      // 1) 10:00-13:00 や 15:00-17:00 などの2診目ピーク短縮枠は無条件で除外
+      if (!isStandardFullBand1ShinSlot1b3_(absTimeStr, cleanC)) return false;
+
+      const tl = parseAbsenceTimeline_(absTimeStr);
+      const key = d + '_' + cleanC + '_' + deptTag;
+
+      // 2) 時間帯付きの確定シフトデータが存在する日：対象帯に1人でも確定医がいれば2診目募集なので除外
+      if (datesWithBandRoster.has(d)) {
+        return !hasAnyOverlappingConfirmedDoc(d, cleanC, deptTag, tl.startMin, tl.endMin);
+      }
+
+      // 3) 時間なしの確定医リストのみ存在する日：その拠点に終日1人も確定医がいない場合（終日0人拠点）のみ補完許可
+      if (datesWithAnyBqDoc.has(d)) {
+        return !clinicsWithAnyDocOnDate.has(key);
+      }
+
+      // 4) 確定シフトデータが一切存在しない日は2診目判別不能のため補完しない（『最新_不在枠』のみ使用）
       return false;
     }
+  };
+}
 
-    const bandFullStart = band === 'A' ? 540 : (band === 'B' ? 900 : 1080);
-    const bandFullEnd = band === 'A' ? 780 : (band === 'B' ? 1080 : (isKitakasai ? 1200 : 1260));
-    const reqStart = Math.max(timeInfo.startMin, bandFullStart);
-    const reqEnd = Math.min(timeInfo.endMin, bandFullEnd);
-
-    const tokens = splitDoctorTokensSafely_(docsStr);
-    const intervals = [];
-    tokens.forEach(function(tok) {
-      if (!tok || tok.includes('未充足')) return;
-      const tm = tok.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
-      if (!tm) {
-        intervals.push({ start: bandFullStart, end: bandFullEnd });
-      } else {
-        intervals.push({
-          start: Number(tm[1]) * 60 + Number(tm[2]),
-          end: Number(tm[3]) * 60 + Number(tm[4])
-        });
-      }
-    });
-
-    if (intervals.length === 0) return false;
-
-    for (let tMin = reqStart; tMin < reqEnd; tMin += 15) {
-      const sliceCovered = intervals.some(function(iv) {
-        return iv.start <= tMin && iv.end >= (tMin + 15);
-      });
-      if (!sliceCovered) return false;
-    }
-  }
-
-  return true;
+function isSlotAlreadyCoveredByActiveShift1b3_(dateStr, rawClinic, absTimeStr, activeShifts) {
+  const checker = buildConfirmedShiftCoverageChecker1b3_(activeShifts, []);
+  return checker.isSlotAlreadyCovered(dateStr, rawClinic, absTimeStr);
 }

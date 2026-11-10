@@ -1,18 +1,10 @@
 /**
  * ============================================================================
  * 6c_編集くん64_保存と提出.gs
- * （段落残りによる選択肢2重化バグ完全解消・行削除時のインデックスずれ防止・緑/赤マーカー版）
+ * （50,000文字制限回避の複数セル自動分割保存・段落2重化防止・行ズレ防止・緑/赤マーカー版）
  * ============================================================================
  */
 
-/**
- * ★重要：GoogleドキュメントのTableCellにテキストをセットする際、
- * 2段落目以降が残って選択肢が2重表示されるのを防ぐ安全なセル書き込みヘルパー
- */
-/**
- * ★修正版：空文字("")のときは p.clear() で安全にクリアし、
- * 「空のテキスト要素は挿入できません」エラーと段落ダブりの両方を防ぐセル書き込みヘルパー
- */
 function setDocCellTextSafely64_(cell, text) {
   const clean = String(text || '');
   while (cell.getNumChildren() > 1) {
@@ -35,9 +27,6 @@ function setDocCellTextSafely64_(cell, text) {
   }
 }
 
-/**
- * すでに2重化してしまった【案1】〜【案3】や注意書きを1回ずつに自動修復するヘルパー
- */
 function dedupePlanCellLines64_(rawText) {
   const normalized = String(rawText || '').replace(/(【案[123１２３]】[^\n]+?)\1+/g, '$1');
   const lines = normalized.split(/\r?\n/);
@@ -64,6 +53,26 @@ function dedupePlanCellLines64_(rawText) {
   return out.join('\n');
 }
 
+/**
+ * ScriptProperties の1キー上限（約9KB）を超えない場合のみキャッシュ保存し、
+ * 超える場合は古いプロパティを削除してシート分割セルからの読込に一本化するヘルパー
+ */
+function saveDraftToPropsSafely64_(props, key, draftObj) {
+  const jsonStr = JSON.stringify(draftObj);
+  if (jsonStr.length <= 8000) {
+    try {
+      props.setProperty(key, jsonStr);
+      return;
+    } catch (e) {}
+  }
+  try {
+    props.deleteProperty(key);
+  } catch (e2) {}
+}
+
+/**
+ * 『編集くん_一時保存』シートの E2, F2, G2... に分割保存されたJSONを自動結合して読み込む
+ */
 function loadLatestDraft64_(ss, docId) {
   const props = PropertiesService.getScriptProperties();
   const propRaw = props.getProperty(HENSHUKUN_CONFIG.DRAFT_PROP_KEY_PREFIX + docId);
@@ -73,8 +82,10 @@ function loadLatestDraft64_(ss, docId) {
 
   const sh = ss.getSheetByName(HENSHUKUN_CONFIG.DRAFT_SHEET_NAME);
   if (sh && sh.getLastRow() >= 2) {
-    const savedDocId = String(sh.getRange(2, 2).getDisplayValue() || '').trim();
-    const rawJson = String(sh.getRange(2, 5).getDisplayValue() || '').trim();
+    const maxCol = Math.max(5, sh.getLastColumn());
+    const row2 = sh.getRange(2, 1, 1, maxCol).getDisplayValues()[0];
+    const savedDocId = String(row2[1] || '').trim();
+    const rawJson = row2.slice(4).join('').trim();
     if (savedDocId === docId && rawJson) {
       try { return JSON.parse(rawJson); } catch (e) {}
     }
@@ -82,6 +93,9 @@ function loadLatestDraft64_(ss, docId) {
   return { slots: {}, bundles: {} };
 }
 
+/**
+ * ★修正：JSON文字列が1セル上限（50,000文字）を超えないよう、40,000文字単位で E2, F2, G2... へ自動分割して書き込む
+ */
 function writeDraftToSheet64_(ss, docId, draftObj, playerStaff) {
   let sh = ss.getSheetByName(HENSHUKUN_CONFIG.DRAFT_SHEET_NAME);
   if (!sh) sh = ss.insertSheet(HENSHUKUN_CONFIG.DRAFT_SHEET_NAME);
@@ -91,26 +105,45 @@ function writeDraftToSheet64_(ss, docId, draftObj, playerStaff) {
   const jsonStr = JSON.stringify(draftObj);
   const slotEntries = Object.entries(draftObj.slots || {});
 
+  const CHUNK_SIZE = 40000;
+  const chunks = [];
+  for (let i = 0; i < jsonStr.length; i += CHUNK_SIZE) {
+    chunks.push(jsonStr.slice(i, i + CHUNK_SIZE));
+  }
+  if (chunks.length === 0) chunks.push('{}');
+
   const metaHeaders = ['最終一時保存日時', '対象ドキュメントID', '最終保存プレイヤー', '一時保存枠数', '一時保存JSONデータ（システム同期・医籍番号連携用）'];
-  sh.getRange(1, 1, 1, 5).setValues([metaHeaders]).setBackground('#ffc72c').setFontWeight('bold');
-  sh.getRange(2, 1, 1, 5).setValues([[nowStr, docId, playerStaff || '未選択', slotEntries.length, jsonStr]]);
+  for (let c = 1; c < chunks.length; c++) {
+    metaHeaders.push('一時保存JSON（分割' + (c + 1) + '）');
+  }
+
+  const metaRow = [nowStr, docId, playerStaff || '未選択', slotEntries.length].concat(chunks);
+  if (sh.getMaxColumns() < metaRow.length) {
+    sh.insertColumnsAfter(sh.getMaxColumns(), metaRow.length - sh.getMaxColumns());
+  }
+
+  sh.getRange(1, 1, 1, metaHeaders.length).setValues([metaHeaders]).setBackground('#ffc72c').setFontWeight('bold');
+  sh.getRange(2, 1, 1, metaRow.length).setValues([metaRow]);
 
   const listHeaders = ['スロットキー', '日付', '拠点', '確定案（一時保存）', '特定済カスタム医師（医籍番号）', '担当者名（一時保存）', 'カスタムコメント・メモ', '更新時刻'];
+  if (sh.getMaxColumns() < 8) {
+    sh.insertColumnsAfter(sh.getMaxColumns(), 8 - sh.getMaxColumns());
+  }
   sh.getRange(4, 1, 1, 8).setValues([listHeaders]).setBackground('#0046ad').setFontColor('#ffffff').setFontWeight('bold');
 
   if (slotEntries.length > 0) {
-    const rows = slotEntries.map(([k, v]) => {
+    const rows = slotEntries.map(function([k, v]) {
       const cDocsText = Array.isArray(v.customDocs)
-        ? v.customDocs.map(d => `${d.name}(${d.licenseNo || '番号なし'}):${d.actionType || ''}`).join(' / ')
+        ? v.customDocs.map(function(d) { return d.name + '(' + (d.licenseNo || '番号なし') + '):' + (d.actionType || ''); }).join(' / ')
         : '';
       return [
         k,
         v.dateLabel || '',
         v.clinicTitle || '',
-        v.decision || '',
-        cDocsText,
+        String(v.decision || '').slice(0, 45000),
+        cDocsText.slice(0, 45000),
         v.assignee || '',
-        v.customComment || '',
+        String(v.customComment || '').slice(0, 45000),
         v.updatedTimeStr || nowStr
       ];
     });
@@ -131,11 +164,10 @@ function saveHenshukunDraft(payload) {
     const draft = loadLatestDraft64_(ss, docId);
     const timeStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'HH:mm:ss');
 
-    Object.entries(payload.changedSlots || {}).forEach(([slotKey, val]) => {
-      // 誤って「→ 調整結果」行が含まれていた場合も確実に除去して保存
+    Object.entries(payload.changedSlots || {}).forEach(function([slotKey, val]) {
       const cleanDec = String(val.decision || '')
         .split(/\r?\n/)
-        .filter(l => !l.trim().startsWith('→'))
+        .filter(function(l) { return !l.trim().startsWith('→'); })
         .join(' ')
         .trim();
 
@@ -152,12 +184,12 @@ function saveHenshukunDraft(payload) {
       };
     });
 
-    Object.entries(payload.changedBundles || {}).forEach(([bKey, val]) => {
+    Object.entries(payload.changedBundles || {}).forEach(function([bKey, val]) {
       draft.bundles[bKey] = val;
     });
 
-    props.setProperty(key, JSON.stringify(draft));
     writeDraftToSheet64_(ss, docId, draft, payload.playerStaff || '');
+    saveDraftToPropsSafely64_(props, key, draft);
 
     return { ok: true, savedAt: timeStr };
   } finally {
@@ -165,12 +197,6 @@ function saveHenshukunDraft(payload) {
   }
 }
 
-/**
- * 確定案および調整結果（rawDecisionText）を解析し、
- * - ⭕承諾（OK・応募充足）が出ている案 ➔ 「爽やかな緑色マーカー（#bbf7d0）」
- * - それ以外の選択案（打診中・返信待ち等） ➔ 「薄い赤色マーカー（#ffd6d6）」
- * を2列目の該当する【案X】に付与する関数（2段落目以降の残留バグ完全対策済）
- */
 function applySelectedPlanMarkerToDocCell64_(cell1, rawC1Text, rawDecisionText) {
   const c1Text = dedupePlanCellLines64_(rawC1Text);
   setDocCellTextSafely64_(cell1, c1Text);
@@ -232,7 +258,7 @@ function applySelectedPlanMarkerToDocCell64_(cell1, rawC1Text, rawDecisionText) 
   const selectedPlanNums = new Set();
   const subDocChoiceByPlan = {};
 
-  if (firstLine && !firstLine.startsWith('→') && !/全案|すべて|全部|ステイ|要検討/.test(firstLine)) {
+  if (firstLine && !firstLine.startsWith('→') && !/全案|すべて|全部|ステイ|要検討|医師未選択/.test(firstLine)) {
     const tokens = firstLine.split(/[,、，\/／\n・\+＋]|(?:\s+と\s+)/).map(function(t) { return t.trim(); }).filter(Boolean);
     tokens.forEach(function(tok) {
       const specMatch = tok.match(/^(?:【?案)?([123１２３])(?:】)?(?:\(([^)]+)\))?$/);
@@ -320,7 +346,6 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
     const body = doc.getBody();
     const numChildren = body.getNumChildren();
 
-    // ★15分トリガーで行削除が起きていた場合でも別枠へ誤上書きしないよう現在のドキュメント位置をマップ化
     const liveRowLookup = new Map();
     let curSortDate = '';
     for (let i = 0; i < numChildren; i++) {
@@ -345,12 +370,11 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
 
     const updatedSlotMap = {};
 
-    Object.entries(draft.slots || {}).forEach(([slotKey, item]) => {
+    Object.entries(draft.slots || {}).forEach(function([slotKey, item]) {
       const [cIdx, rIdx] = slotKey.split('_').map(Number);
       let targetRow = null;
       let actualSlotKey = slotKey;
 
-      // まず元の cIdx_rIdx の拠点名が一致するか確認
       if (cIdx < numChildren) {
         const el = body.getChild(cIdx);
         if (el && el.getType() === DocumentApp.ElementType.TABLE) {
@@ -367,7 +391,6 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
         }
       }
 
-      // もし行削除等でズレていた場合、日付＋拠点名から一意に特定できる行のみ安全にフォールバック
       if (!targetRow && item.dateLabel && item.clinicTitle) {
         const lKey = toSortDateKey64_(item.dateLabel) + '|' + item.clinicTitle;
         const cands = liveRowLookup.get(lKey) || [];
@@ -395,11 +418,15 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
       const existingC2Lines = targetRow.getCell(2).getText().split(/\r?\n/);
       const arrowLines = existingC2Lines.filter(function(l) { return l.trim().startsWith('→'); });
 
-      const baseDec = String(item.decision || '')
+      let baseDec = String(item.decision || '')
         .split(/\r?\n/)
         .filter(function(l) { return !l.trim().startsWith('→'); })
         .join(' ')
         .trim();
+      if (baseDec === 'カスタム入力(医師未選択)') {
+        baseDec = '';
+      }
+
       const headerDecText = (cmnt && baseDec) ? (baseDec + '（メモ：' + cmnt + '）') : baseDec;
       const fullDecText = [headerDecText].concat(arrowLines).filter(Boolean).join('\n');
 
@@ -414,7 +441,6 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
       applySelectedPlanMarkerToDocCell64_(targetRow.getCell(1), c1, fullDecText);
     });
 
-    // 未編集の行も含め、既存の2重化セルがあれば一括クリーンアップ＆マーカー再適用
     for (let i = 0; i < numChildren; i++) {
       const el = body.getChild(i);
       if (el.getType() !== DocumentApp.ElementType.TABLE) continue;
@@ -432,11 +458,12 @@ function commitHenshukunToDocAndSubmit(payload, shouldSubmitToMnys) {
       }
     }
 
-    // ズレ補正後のスロットキーでドラフトを更新保存
+    // ドキュメント上に実在する枠のみにスリム化して再保存
     draft.slots = updatedSlotMap;
-    props.setProperty(HENSHUKUN_CONFIG.DRAFT_PROP_KEY_PREFIX + docId, JSON.stringify(draft));
+    writeDraftToSheet64_(ss, docId, draft, payload.playerStaff || '');
+    saveDraftToPropsSafely64_(props, HENSHUKUN_CONFIG.DRAFT_PROP_KEY_PREFIX + docId, draft);
 
-    Object.entries(draft.bundles || {}).forEach(([bKey, val]) => {
+    Object.entries(draft.bundles || {}).forEach(function([bKey, val]) {
       const parts = bKey.split('_');
       const cIdx = Number(parts[1]), rIdx = Number(parts[2]);
       const el = body.getChild(cIdx);

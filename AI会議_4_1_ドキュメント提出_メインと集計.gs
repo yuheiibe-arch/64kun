@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_4_1_ドキュメント提出_メインと集計.gs
- * （常勤判定・「AまたはB選択的打診」と「複数枠おまとめ打診」の自動判別・mnys送信メイン）
+ * （50,000文字制限完全回避・常勤判定・「AまたはB選択的打診」と「複数枠おまとめ打診」自動判別・mnys送信メイン）
  * ============================================================================
  */
 
@@ -88,7 +88,7 @@ function parseTimeMinutesForBundle4_(timeStr) {
 
 /**
  * ★同一医師に複数枠を打診する際、
- * 1) 同時間帯（または別拠点直結）のロックを解除して両方選んだ場合 ➔ 「🔀【AまたはBの選択的打診】板橋(15:00-18:00) または 与野(15:00-18:00) 可能でしょうか？」
+ * 1) 同時間帯（または別拠点直結）のロックを解除して両方選んだ場合 ➔ 「🔀【AまたはBの選択的打診】」
  * 2) 時間が被っておらず両方勤務可能な場合 ➔ 「🔗【複数枠おまとめ打診】」
  * を自動判別して mnys 提出データに付与する関数
  */
@@ -109,7 +109,6 @@ function annotateBundledDoctorItemsForMnys_(items) {
       return;
     }
 
-    // 同一日に「時間帯が重なる」または「別拠点で移動時間60分未満」のペアが含まれているかをチェック
     let isEitherOrChoice = false;
     for (let i = 0; i < docItems.length; i++) {
       for (let j = i + 1; j < docItems.length; j++) {
@@ -170,6 +169,7 @@ function submitEditedDocToMnys() {
   const draftMap = (typeof loadLatestDraft64_ === 'function')
     ? loadLatestDraft64_(ss, docId)
     : { slots: {}, bundles: {} };
+  const allDraftSlotEntries = Object.values(draftMap.slots || {});
 
   const doc = DocumentApp.openById(docId);
   const body = doc.getBody();
@@ -209,14 +209,29 @@ function submitEditedDocToMnys() {
           const row = table.getRow(r);
           if (row.getNumCells() < 4) continue;
 
+          const rawC0 = row.getCell(0).getText().trim();
+          const rowClinicTitle = (typeof formatClinicTitle64_ === 'function')
+            ? formatClinicTitle64_(rawC0.split(/\r?\n/)[0] || '')
+            : (rawC0.split(/\r?\n/)[0] || '').trim();
+
           const slotKey = i + '_' + r;
-          const slotDraft = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
+          let slotDraft = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
+          if (slotDraft && slotDraft.clinicTitle && slotDraft.clinicTitle !== rowClinicTitle) {
+            slotDraft = null;
+          }
+          if (!slotDraft && allDraftSlotEntries.length > 0 && typeof toSortDateKey64_ === 'function') {
+            const matchedDrafts = allDraftSlotEntries.filter(function(d) {
+              return toSortDateKey64_(d.dateLabel) === currentDate && d.clinicTitle === rowClinicTitle;
+            });
+            if (matchedDrafts.length === 1) slotDraft = matchedDrafts[0];
+          }
+
           const customDocs = (slotDraft && Array.isArray(slotDraft.customDocs)) ? slotDraft.customDocs : [];
           const customComment = (slotDraft && slotDraft.customComment) ? String(slotDraft.customComment).trim() : '';
 
           const items = parseEditedDocTableRow_(
             currentDate,
-            row.getCell(0).getText().trim(),
+            rawC0,
             row.getCell(1).getText().trim(),
             row.getCell(2).getText().trim(),
             row.getCell(3).getText().trim(),
@@ -260,10 +275,11 @@ function submitEditedDocToMnys() {
   if (!outSheet) outSheet = ss.insertSheet('ドキュメント確定出力JSON');
   outSheet.clearContents();
   outSheet.getRange(1, 1, 1, 13).setValues([[
-    '日付', '拠点名', '診療科', '不在時間', 'アプローチ種別', '対象医師(正式名補正済)', '医籍番号', '移動元拠点', '特別時給・交渉加算', '担当者', 'コメント・おまとめ/選択打診メモ', '根拠・採用案', 'JSON出力'
+    '日付', '拠点名', '診療科', '不在時間', 'アプローチ種別', '対象医師(正式名補正済)', '医籍番号', '移動元拠点', '特別時給・交渉加算', '担当者', 'コメント・おまとめ/選択打診メモ', '根拠・採用案', 'JSON出力(1行単位)'
   ]]);
 
-  const rowsForSheet = extractedItems.map(function(it, idx) {
+  // ★1セル50,000文字制限を確実に回避するため、M列には各行ごとのJSONを出力
+  const rowsForSheet = extractedItems.map(function(it) {
     let docTag = it.target_doctor + (it.is_full_time ? '(常勤)' : '');
     if (it.is_bundled) {
       docTag += (it.bundle_mode === 'EITHER_OR') ? '[★AまたはB選択打診]' : '[★おまとめ]';
@@ -273,10 +289,19 @@ function submitEditedDocToMnys() {
       : (it.is_special_wage ? '特別時給' : '通常時給');
 
     return [
-      it.date, it.clinic_name, it.department, it.target_time, it.approach_type,
+      it.date,
+      it.clinic_name,
+      it.department,
+      it.target_time,
+      it.approach_type,
       docTag,
-      it.license_no || '', it.from_clinic, wageCellLabel,
-      it.assignee, it.memo || '', it.evidence, idx === 0 ? JSON.stringify(extractedItems, null, 2) : ''
+      it.license_no || '',
+      it.from_clinic,
+      wageCellLabel,
+      it.assignee,
+      String(it.memo || '').slice(0, 45000),
+      String(it.evidence || '').slice(0, 45000),
+      JSON.stringify(it).slice(0, 45000)
     ];
   });
   outSheet.getRange(2, 7, rowsForSheet.length, 1).setNumberFormat('@');

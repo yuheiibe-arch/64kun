@@ -1,15 +1,12 @@
 /**
  * ============================================================================
  * AI会議_1b3_1b_不在枠抽出とBQ補完.gs（分割後半）
- * 1) 『最新_不在枠』・『最新_当日シフト』0人帯・『BQパック bosyu』終日不在拠点の3段階統合
- * 2) 枠統合時の前医・後医・担当者・特別時給・進行中メモの欠落防止マージ
+ * 1) 『最新_不在枠』・『最新_当日シフト』0人帯・『BQ終日0人不在拠点』の統合（★2診目募集枠は完全除外）
+ * 2) 補完枠の時給表記を「特別時給／通常時給」に統一（数値むき出し表記の解消）
  * 3) 地域順ソート（東京 ➔ 神奈川 ➔ 千葉・茨城 ➔ 埼玉 ➔ 大阪）
  * ============================================================================
  */
 
-/**
- * 地域順ソート用ランク（1:東京 ➔ 2:神奈川 ➔ 3:千葉 ➔ 4:茨城 ➔ 5:埼玉 ➔ 6:関西）
- */
 function getRegionOrderRank1b3_(clinicName) {
   const area = inferAreaForDoc_(cleanClinicBaseName_(clinicName));
   if (area === '東京') return 1;
@@ -22,15 +19,15 @@ function getRegionOrderRank1b3_(clinicName) {
 }
 
 /**
- * BQパック（bosyu / mijyusoku）を読み込み、
- * ①募集時間帯インデックス（recruitSlotsIndex）の構築と、②終日0人拠点等の補完用行リストの生成を行うヘルパー
+ * BQパックから ①募集時間帯インデックス、②終日0人拠点の補完候補、③確定シフト一覧（kakutei）を取得
  */
 function loadBqBosyuIndexAndSupplementRows1b3_(rawUnfilledRows, tomorrowYmd, effectiveEndYmd) {
   const recruitSlotsIndex = new Map();
   const supplementRows = [];
+  let kakuteiList = [];
 
   if (typeof fetchAndDecryptBqMailForResolver_ !== 'function') {
-    return { recruitSlotsIndex: recruitSlotsIndex, supplementRows: supplementRows };
+    return { recruitSlotsIndex: recruitSlotsIndex, supplementRows: supplementRows, kakuteiList: kakuteiList };
   }
 
   let bqBosyuList = [];
@@ -38,9 +35,10 @@ function loadBqBosyuIndexAndSupplementRows1b3_(rawUnfilledRows, tomorrowYmd, eff
     const bqData = fetchAndDecryptBqMailForResolver_();
     if (bqData) {
       bqBosyuList = (bqData.bosyu || []).concat(bqData.mijyusoku || []).concat(bqData.boshu || []);
+      kakuteiList = (bqData.kakutei || []).concat(bqData.obo || []);
     }
   } catch (e) {
-    return { recruitSlotsIndex: recruitSlotsIndex, supplementRows: supplementRows };
+    return { recruitSlotsIndex: recruitSlotsIndex, supplementRows: supplementRows, kakuteiList: kakuteiList };
   }
 
   bqBosyuList.forEach(function(m) {
@@ -68,7 +66,7 @@ function loadBqBosyuIndexAndSupplementRows1b3_(rawUnfilledRows, tomorrowYmd, eff
       if (t && !list.includes(t)) list.push(t);
     });
 
-    // 2. 対象期間内であれば補完候補行を生成
+    // 2. 対象期間内であれば終日0人拠点用の補完候補行を生成（※後段で2診目募集は完全除外）
     if (d < tomorrowYmd || (effectiveEndYmd && d > effectiveEndYmd)) return;
 
     const hasMultiDept = cleanC.includes('亀有') || cleanC.includes('北葛西');
@@ -88,12 +86,12 @@ function loadBqBosyuIndexAndSupplementRows1b3_(rawUnfilledRows, tomorrowYmd, eff
     }
     if (!hourlyStr) hourlyStr = '14000';
 
+    // ★修正：特別時給でない場合は必ず「通常時給」を入れ、(14000) のような数値むき出し表記を防ぐ
     const spRaw = String(m.sp || m.specialWage || '').trim();
     const spLabel = (spRaw && spRaw !== '-' && spRaw !== 'なし' && spRaw !== 'FALSE' && !spRaw.includes('通常'))
       ? (spRaw.includes('特別時給') ? '特別時給' : spRaw)
-      : '';
+      : '通常時給';
 
-    // 他拠点の進行中メモに自拠点名が含まれている場合（例：「候補：亀有・西新井」）は引き継ぐ
     const relatedMemos = [];
     (rawUnfilledRows || []).forEach(function(ur) {
       if (normalizeDateYmd1b3_(ur[0]) !== d) return;
@@ -128,13 +126,11 @@ function loadBqBosyuIndexAndSupplementRows1b3_(rawUnfilledRows, tomorrowYmd, eff
 
   return {
     recruitSlotsIndex: recruitSlotsIndex,
-    supplementRows: supplementRows
+    supplementRows: supplementRows,
+    kakuteiList: kakuteiList
   };
 }
 
-/**
- * 不在枠のメイン統合・補完関数（『休館日』除外済・地域順ソート済）
- */
 function recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilledRows, activeShifts, spotCandidates, tomorrowYmd, targetEndYmd) {
   const combined = [];
   const closedChecker = buildClosedClinicChecker1b3_();
@@ -153,8 +149,12 @@ function recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilledRows, activeShifts, 
 
   const bqLoaded = loadBqBosyuIndexAndSupplementRows1b3_(rawUnfilledRows, tomorrowYmd, effectiveEndYmd);
   const recruitSlotsIndex = bqLoaded.recruitSlotsIndex;
+  const coverageChecker = buildConfirmedShiftCoverageChecker1b3_(activeShifts, bqLoaded.kakuteiList);
 
-  const registerRowIfTrulyUnfilled = function(rowArr, isFromPrimarySheet) {
+  const registerRowIfTrulyUnfilled = function(rowArr, sourceType) {
+    const isFromPrimarySheet = (sourceType === 'PRIMARY');
+    const isFromBosyuSupplement = (sourceType === 'BOSYU_SUP');
+
     const d = normalizeDateYmd1b3_(rowArr[0]);
     if (!d || d < tomorrowYmd) return;
     if (!isFromPrimarySheet && effectiveEndYmd && d > effectiveEndYmd) return;
@@ -170,9 +170,16 @@ function recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilledRows, activeShifts, 
         ? expandToLongestRecruitSlotTime1b3_(d, rawClinic, rawTStr, recruitSlotsIndex, activeShifts)
         : rawTStr;
 
-      // 『休館日』シートと照合（休館なら除外、部分休館なら開院時間のみに短縮）
+      // 『休館日』シート判定
       const tStr = closedChecker.resolveOpenSlotTime(d, rawClinic, candidateTime, deptTag);
       if (!tStr) return;
+
+      // ★2診目募集枠の完全ブロック判定
+      if (isFromBosyuSupplement) {
+        if (!coverageChecker.canSupplementFromBosyu(d, rawClinic, tStr)) return;
+      } else if (!isFromPrimarySheet) {
+        if (coverageChecker.isSlotAlreadyCovered(d, rawClinic, tStr)) return;
+      }
 
       const newTl = parseAbsenceTimeline_(tStr);
 
@@ -210,10 +217,6 @@ function recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilledRows, activeShifts, 
         return;
       }
 
-      if (!isFromPrimarySheet && isSlotAlreadyCoveredByActiveShift1b3_(d, rawClinic, tStr, activeShifts)) {
-        return;
-      }
-
       const copy = rowArr.slice();
       copy[0] = d;
       copy[2] = tStr;
@@ -221,9 +224,9 @@ function recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilledRows, activeShifts, 
     });
   };
 
-  // 1. 最優先：『最新_不在枠』シートにある枠を登録
+  // 1. 最優先：『最新_不在枠』シートにある本当の医師不在枠を登録
   (rawUnfilledRows || []).forEach(function(r) {
-    registerRowIfTrulyUnfilled(r, true);
+    registerRowIfTrulyUnfilled(r, 'PRIMARY');
   });
 
   // 2. 次優先：『最新_当日シフト』に拠点行があるものの特定帯が0人の枠を補完
@@ -251,20 +254,20 @@ function recoverMissingFullDayOrUnfilledRows1b3_(rawUnfilledRows, activeShifts, 
     const docsC = cntC > 0 ? String(s[9] || '') : 'なし';
 
     if (cntA === 0) {
-      registerRowIfTrulyUnfilled([d, clinicLabel, '09:00-13:00', '14,000円', 'なし', docsB, '', '', '', '', '未充足', '', '', ''], false);
+      registerRowIfTrulyUnfilled([d, clinicLabel, '09:00-13:00', '14000', 'なし', docsB, '', '', '', '', '未充足', '通常時給', '', ''], 'SHIFT_ZERO');
     }
     if (cntB === 0) {
-      registerRowIfTrulyUnfilled([d, clinicLabel, '15:00-18:00', '13,000円', docsA, docsC, '', '', '', '', '未充足', '', '', ''], false);
+      registerRowIfTrulyUnfilled([d, clinicLabel, '15:00-18:00', '13000', docsA, docsC, '', '', '', '', '未充足', '通常時給', '', ''], 'SHIFT_ZERO');
     }
     if (cntC === 0 && !dept.includes('内科')) {
       const nightTime = cleanC.includes('北葛西') ? '18:00-20:00' : '18:00-21:00';
-      registerRowIfTrulyUnfilled([d, clinicLabel, nightTime, '15,000円', docsB, 'なし', '', '', '', '', '未充足', '', '', ''], false);
+      registerRowIfTrulyUnfilled([d, clinicLabel, nightTime, '15000', docsB, 'なし', '', '', '', '', '未充足', '通常時給', '', ''], 'SHIFT_ZERO');
     }
   });
 
-  // 3. 終日0人不在等でシートに行ごと存在しない拠点（例：11/12 西新井）をBQパック「bosyu」から補完
+  // 3. 終日0人不在でシートに行自体がない拠点（例：11/12 西新井）のみを厳密補完（★2診目募集は除外）
   bqLoaded.supplementRows.forEach(function(supRow) {
-    registerRowIfTrulyUnfilled(supRow, false);
+    registerRowIfTrulyUnfilled(supRow, 'BOSYU_SUP');
   });
 
   // 4. 地域順（東京 ➔ 神奈川 ➔ 千葉・茨城 ➔ 埼玉 ➔ 大阪）でソート
