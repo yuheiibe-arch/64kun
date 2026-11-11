@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6b_編集くん64_データ読込と同期.gs
- * （地域並び順：東京➔神奈川➔千葉・茨城➔埼玉➔大阪 ／ 案1〜案3の改行整形・重複排除版）
+ * （提出済み台帳による「前回指示済フラグ」付与・地域順ソート・案1〜案3改行整形版）
  * ============================================================================
  */
 
@@ -76,6 +76,9 @@ function getHenshukunInitialData() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const masters = loadClinicAndStaffMasters64_(ss);
   const backupDocsByDate = extractBackupDoctorsByDate64_(ss, masters.doctorSearchList);
+  const submittedLedgerMap = (typeof loadSubmittedLedgerMap4_3_ === 'function')
+    ? loadSubmittedLedgerMap4_3_(ss)
+    : new Map();
 
   const doc = DocumentApp.openById(docId);
   const body = doc.getBody();
@@ -106,7 +109,6 @@ function getHenshukunInitialData() {
           const row = table.getRow(r);
           if (row.getNumCells() < 4) continue;
 
-          // ★Googleドキュメント内の改行(\r)を \n に正規化してから整形することで、【案1】【案2】【案3】が1行に潰れるのを完全防止
           const rawCell0 = row.getCell(0).getText().replace(/\r\n|\r/g, '\n').trim();
           const rawCell1 = row.getCell(1).getText().replace(/\r\n|\r/g, '\n')
             .replace(/([^\n])\s*(?=【案[123１２３]】)/g, '$1\n')
@@ -148,24 +150,34 @@ function getHenshukunInitialData() {
             parsedComment = cmMatch[2].trim();
           }
 
-          const lines1 = Array.from(new Set(col1.split('\n').map(s => s.trim()).filter(Boolean)));
+          const lines1 = Array.from(new Set(col1.split('\n').map(function(s) { return s.trim(); }).filter(Boolean)));
           const rawClinicTitle = lines1[0] || '';
           const clinicTitle = formatClinicTitle64_(rawClinicTitle);
           const timeAndWage = lines1.slice(1).join(' ') || '';
           const meta = resolveClinicMeta64_(rawClinicTitle, masters.clinicMap);
 
-          const slotKey = `${i}_${r}`;
+          const carryKey = getSlotCarryOverKey3_(sortDate, rawClinicTitle, timeAndWage);
+          const subStatus = (typeof evaluateRowSubmittedStatusFor64_ === 'function')
+            ? evaluateRowSubmittedStatusFor64_(carryKey, parsedDec, docStaff, decArrowLines, submittedLedgerMap)
+            : { isPreviouslySubmitted: false, allDeclinedRevived: false, submittedAt: '' };
+
+          if (subStatus.allDeclinedRevived) {
+            col2 += '\n・⚠️【要再選定】前回打診した医師が全員辞退のため、次案を選択してください';
+          }
+
+          const slotKey = i + '_' + r;
           let draftItem = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
           if (draftItem && draftItem.clinicTitle && draftItem.clinicTitle !== clinicTitle) {
             draftItem = null;
           }
 
           const cleanDraftDec = draftItem
-            ? String(draftItem.decision || '').split(/\r?\n/).filter(l => !l.trim().startsWith('→')).join(' ').trim()
+            ? String(draftItem.decision || '').split(/\r?\n/).filter(function(l) { return !l.trim().startsWith('→'); }).join(' ').trim()
             : parsedDec;
 
           slotRows.push({
             slotKey: slotKey,
+            carryKey: carryKey,
             childIdx: i,
             rowIdx: r,
             sortDate: sortDate,
@@ -184,14 +196,16 @@ function getHenshukunInitialData() {
             curAssignee: draftItem ? draftItem.assignee : docStaff,
             customComment: (draftItem && typeof draftItem.customComment === 'string') ? draftItem.customComment : parsedComment,
             customDocs: (draftItem && Array.isArray(draftItem.customDocs)) ? draftItem.customDocs : [],
-            hasDraft: Boolean(draftItem)
+            hasDraft: Boolean(draftItem),
+            isPreviouslySubmitted: Boolean(subStatus.isPreviouslySubmitted),
+            submittedAt: subStatus.submittedAt || ''
           });
         }
       } else if (h0.includes('対象医師')) {
         for (let r = 1; r < table.getNumRows(); r++) {
           const row = table.getRow(r);
           if (row.getNumCells() < 4) continue;
-          const bKey = `b_${i}_${r}`;
+          const bKey = 'b_' + i + '_' + r;
           const docVal = row.getCell(3).getText().trim() || '採用';
           const draftVal = (draftMap.bundles && draftMap.bundles[bKey]) ? draftMap.bundles[bKey] : null;
 
@@ -210,7 +224,6 @@ function getHenshukunInitialData() {
     }
   }
 
-  // ★並び順：「日付 ➔ 地域（東京➔神奈川➔千葉・茨城➔埼玉➔大阪） ➔ 拠点No ➔ 時間帯」
   slotRows.sort(function(a, b) {
     if (a.sortDate !== b.sortDate) return a.sortDate.localeCompare(b.sortDate);
     const rankA = (typeof getRegionSortRank64_ === 'function') ? getRegionSortRank64_(a.clinicGroup) : 99;
@@ -247,7 +260,7 @@ function getActivePlayerLocks64_() {
     const obj = JSON.parse(raw);
     const now = Date.now();
     const valid = {};
-    Object.keys(obj).forEach(sessionId => {
+    Object.keys(obj).forEach(function(sessionId) {
       if (now - obj[sessionId].ts < HENSHUKUN_CONFIG.ACTIVE_USER_TTL_SEC * 1000) {
         valid[sessionId] = obj[sessionId];
       }

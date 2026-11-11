@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_3_1_ドキュメント引継と管理.gs
- * （前半：前回MTG引継 ＋ 進行中メモからの案自動特定＆コンパクト「→ 調整結果」記載版）
+ * （提出済み台帳連動による未送信プラン100%引継・ステイ毎回見直し・全員辞退時の自動再選定化版）
  * ============================================================================
  */
 
@@ -29,8 +29,15 @@ function getSlotCarryOverKey3_(dateStr, rawClinicText, rawTimeText) {
   return [d, cleanC, dept, band].join('|');
 }
 
+function isStayDecisionForCarryOver3_1_(decStr) {
+  const s = String(decStr || '').replace(/【特別時給.*?】/g, '').trim();
+  if (!s) return false;
+  return /^(?:ステイ|募集継続・ステイ)$/.test(s) || /^特別時給.*ステイ$/.test(s) || /[＋\+]\s*ステイ$/.test(s);
+}
+
 function loadPreviousMeetingDecisionsMap3_() {
   const map = new Map();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const props = PropertiesService.getScriptProperties();
   const docIdsToScan = [];
 
@@ -49,12 +56,13 @@ function loadPreviousMeetingDecisionsMap3_() {
       }
     }
     mtgFiles.sort(function(a, b) { return b.getLastUpdated().getTime() - a.getLastUpdated().getTime(); });
-    mtgFiles.slice(0, 3).reverse().forEach(function(f) {
+    mtgFiles.slice(0, 6).reverse().forEach(function(f) {
       const id = f.getId();
       if (!docIdsToScan.includes(id)) docIdsToScan.push(id);
     });
   } catch (e) {}
 
+  // 1. 過去ドキュメントからの読み込み（ステイは見直し対象のため引き継がない）
   docIdsToScan.forEach(function(docId) {
     try {
       const d = DocumentApp.openById(docId);
@@ -77,13 +85,25 @@ function loadPreviousMeetingDecisionsMap3_() {
           for (let r = 1; r < tbl.getNumRows(); r++) {
             const row = tbl.getRow(r);
             if (row.getNumCells() < 4) continue;
-            const c0 = row.getCell(0).getText().trim();
-            const c1 = row.getCell(1).getText().trim();
-            const c2Raw = row.getCell(2).getText().trim();
-            const c2Main = c2Raw.split('\n').filter(function(l) { return !l.trim().startsWith('→'); }).join(' ').trim();
-            const c3 = row.getCell(3).getText().trim();
+            const c0 = row.getCell(0).getText().replace(/\r\n|\r/g, '\n').trim();
+            const c1 = row.getCell(1).getText().replace(/\r\n|\r/g, '\n').trim();
+            const c2Raw = row.getCell(2).getText().replace(/\r\n|\r/g, '\n').trim();
+            const c2Main = c2Raw.split('\n')
+              .filter(function(l) { return !/^(?:→|⇒|⇨)/.test(l.trim()); })
+              .map(function(l) { return l.replace(/(?:→|⇒|⇨).*$/, '').trim(); })
+              .filter(Boolean)
+              .join(' ')
+              .trim();
+            const c3 = row.getCell(3).getText().replace(/\r\n|\r/g, ' ').trim();
 
             if (!c2Main && !c3) continue;
+            // ★ルール1：ステイ・特別時給＋ステイは次回MTGで見直すため引き継がない
+            if (isStayDecisionForCarryOver3_1_(c2Main)) {
+              const c0LinesTmp = c0.split('\n');
+              const skipKey = getSlotCarryOverKey3_(curDate, c0LinesTmp[0] || '', c0LinesTmp.slice(1).join(' '));
+              map.delete(skipKey);
+              continue;
+            }
 
             const c0Lines = c0.split('\n');
             const key = getSlotCarryOverKey3_(curDate, c0Lines[0] || '', c0Lines.slice(1).join(' '));
@@ -100,7 +120,8 @@ function loadPreviousMeetingDecisionsMap3_() {
             map.set(key, {
               rawDecision: c2Main,
               assignee: c3,
-              prevPlanMap: prevPlanMap
+              prevPlanMap: prevPlanMap,
+              ledgerEntry: null
             });
           }
         }
@@ -108,18 +129,40 @@ function loadPreviousMeetingDecisionsMap3_() {
     } catch (e) {}
   });
 
+  // 2. ★最優先：『提出済みプラン台帳』の確定データをマージ（プレビュー等でDocが上書きされていても100%復元）
+  if (typeof loadSubmittedLedgerMap4_3_ === 'function' && ss) {
+    const ledgerMap = loadSubmittedLedgerMap4_3_(ss);
+    ledgerMap.forEach(function(lEntry, key) {
+      const existing = map.get(key);
+      map.set(key, {
+        rawDecision: (existing && existing.rawDecision) ? existing.rawDecision : lEntry.decisionHeader,
+        assignee: (lEntry.assignee && lEntry.assignee !== '未定') ? lEntry.assignee : ((existing && existing.assignee) || '担当者未定'),
+        prevPlanMap: (existing && existing.prevPlanMap) ? existing.prevPlanMap : {},
+        ledgerEntry: lEntry
+      });
+    });
+  }
+
   return map;
 }
 
 function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj, origSlotOpt, mailHistoryIndexOpt) {
   let dec = prevEntry ? String(prevEntry.rawDecision || '').trim() : '';
-  const assignee = prevEntry ? String(prevEntry.assignee || '').trim() : '';
-  let comment = '';
+  let assignee = prevEntry ? String(prevEntry.assignee || '').trim() : '';
+  const ledgerEntry = (prevEntry && prevEntry.ledgerEntry) ? prevEntry.ledgerEntry : null;
+  let comment = (ledgerEntry && ledgerEntry.comment) ? String(ledgerEntry.comment).trim() : '';
 
   const memoMatch = dec.match(/^(.*?)\s*[（\(]メモ[：:](.+?)[）\)]$/);
   if (memoMatch) {
     dec = memoMatch[1].trim();
-    comment = memoMatch[2].trim();
+    if (!comment) comment = memoMatch[2].trim();
+  }
+
+  // ステイ系は引き継がず見直し（空欄）にする
+  if (isStayDecisionForCarryOver3_1_(dec)) {
+    dec = '';
+    assignee = '';
+    comment = '';
   }
 
   let spTag = '';
@@ -144,14 +187,16 @@ function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj, origSlot
   let mappedDecisionBase = '';
 
   if (dec) {
-    if (/^(ステイ|特別時給.*ステイ|全案|バックアップ医師に勤務依頼)$/.test(dec) || !/案[123１２３]/.test(dec)) {
+    if (/^(全案|バックアップ医師に勤務依頼)$/.test(dec) || !/案[123１２３]/.test(dec)) {
       mappedDecisionBase = dec;
     } else {
-      const tokens = dec.split(/[,、，\/／\n・\+＋]|(?:\s+と\s+)/).map(function(t) { return t.trim(); }).filter(Boolean);
+      const tokens = (typeof splitTopLevelDecisionTokens4_2_ === 'function')
+        ? splitTopLevelDecisionTokens4_2_(dec)
+        : dec.split(/[,、，\/／\n・\+＋]|(?:\s+と\s+)/).map(function(t) { return t.trim(); }).filter(Boolean);
       const mappedTokens = [];
 
       tokens.forEach(function(tok) {
-        const m = tok.match(/^(?:【?案)?([123１２３])(?:】)?(?:\(([^)]+)\))?$/);
+        const m = tok.match(/^(?:【?案)?\s*([123１２３])(?:】)?(?:\s*[\(（]([^）\)]+)[\)）])?$/);
         if (!m) {
           mappedTokens.push(tok);
           return;
@@ -160,21 +205,18 @@ function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj, origSlot
         const subSpec = m[2] ? m[2].trim() : '';
         const oldPlanText = (prevEntry && prevEntry.prevPlanMap && prevEntry.prevPlanMap[oldNum]) ? prevEntry.prevPlanMap[oldNum] : '';
 
-        if (!oldPlanText) {
-          if (newPlans[oldNum]) mappedTokens.push(subSpec ? ('案' + oldNum + '(' + subSpec + ')') : ('案' + oldNum));
-          return;
-        }
-
-        const oldDocs = (typeof extractCandidateDoctorsFromPlanText2a_ === 'function')
+        const oldDocs = oldPlanText && typeof extractCandidateDoctorsFromPlanText2a_ === 'function'
           ? extractCandidateDoctorsFromPlanText2a_(oldPlanText)
-          : [];
+          : (ledgerEntry && Array.isArray(ledgerEntry.doctors) ? ledgerEntry.doctors : []);
 
         let matchedNewNum = '';
         if (oldDocs.length > 0) {
           ['1', '2', '3'].forEach(function(nNum) {
             if (matchedNewNum || !newPlans[nNum]) return;
             const newDocs = planDocsByNum[nNum] || [];
-            if (oldDocs.some(function(od) { return newDocs.includes(od); })) {
+            if (oldDocs.some(function(od) {
+              return newDocs.some(function(nd) { return normKeyForDoc_(nd) === normKeyForDoc_(od); });
+            })) {
               matchedNewNum = nNum;
             }
           });
@@ -183,11 +225,33 @@ function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj, origSlot
         if (matchedNewNum) {
           const mappedLabel = subSpec ? ('案' + matchedNewNum + '(' + subSpec + ')') : ('案' + matchedNewNum);
           if (!mappedTokens.includes(mappedLabel)) mappedTokens.push(mappedLabel);
+        } else if (ledgerEntry && Array.isArray(ledgerEntry.items) && ledgerEntry.items.length > 0) {
+          // ★案1〜3から外れていても、提出済み台帳に医師記録があれば白紙に戻さずカスタム指示として維持！
+          const fallbackPhrase = buildFallbackCustomPhraseFromItems4_3_(ledgerEntry.items);
+          if (fallbackPhrase && !mappedTokens.includes(fallbackPhrase)) {
+            mappedTokens.push(fallbackPhrase);
+          }
+        } else if (oldPlanText) {
+          mappedTokens.push(oldPlanText);
         }
       });
 
-      mappedDecisionBase = mappedTokens.join(', ');
+      mappedDecisionBase = mappedTokens.join(' / ');
     }
+  } else if (ledgerEntry && Array.isArray(ledgerEntry.items) && ledgerEntry.items.length > 0) {
+    // 確定案が空でも台帳に記録があれば復元
+    const lDocs = ledgerEntry.doctors || [];
+    const matchedNums = [];
+    lDocs.forEach(function(ld) {
+      ['1', '2', '3'].forEach(function(nNum) {
+        if ((planDocsByNum[nNum] || []).some(function(nd) { return normKeyForDoc_(nd) === normKeyForDoc_(ld); })) {
+          if (!matchedNums.includes(nNum)) matchedNums.push(nNum);
+        }
+      });
+    });
+    mappedDecisionBase = matchedNums.length > 0
+      ? matchedNums.map(function(n) { return '案' + n; }).join(', ')
+      : buildFallbackCustomPhraseFromItems4_3_(ledgerEntry.items);
   }
 
   const rawCurrentMemo = origSlotOpt ? String(origSlotOpt.currentMemo || '').trim() : '';
@@ -198,7 +262,6 @@ function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj, origSlot
     ? correctDoctorNamesInMemoText_(rawCurrentMemo, officialNames)
     : rawCurrentMemo;
 
-  // ★修正：「中﨑寿隆先生」の「﨑」や「髙」などCJK拡張漢字も途切れずフルネーム抽出する正規表現
   const memoDocs = [];
   if (correctedCurrentMemo && correctedCurrentMemo !== '-') {
     const memoRe = /([一-龠々ヶケ﨑嵜髙瀧泷邊邉齋齊澤廣國嶋嶌栁濱櫻眞惠]{2,6})先生/g;
@@ -233,16 +296,20 @@ function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj, origSlot
   memoDocs.forEach(function(d) {
     if (!targetDocsForResult.includes(d)) targetDocsForResult.push(d);
   });
+  if (ledgerEntry && Array.isArray(ledgerEntry.doctors)) {
+    ledgerEntry.doctors.forEach(function(d) {
+      if (d && !targetDocsForResult.includes(d)) targetDocsForResult.push(d);
+    });
+  }
 
   if (mappedDecisionBase && /案[123]/.test(mappedDecisionBase)) {
     const chosenNums = mappedDecisionBase.match(/[123]/g) || [];
     chosenNums.forEach(function(n) {
-      // 「案1(②灘理絵先生)」のように特定の1名が指定されている場合はその医師のみを追加
       const subMatch = mappedDecisionBase.match(new RegExp('案' + n + '\\(([^)]+)\\)'));
       const subSpec = subMatch ? subMatch[1].replace(/^[①②12]\s*/, '').replace(/先生$/g, '').trim() : '';
 
       (planDocsByNum[n] || []).forEach(function(d) {
-        if (subSpec && !d.includes(subSpec) && !subSpec.includes(d)) return;
+        if (subSpec && !subSpec.includes('両方') && !d.includes(subSpec) && !subSpec.includes(d)) return;
         if (!targetDocsForResult.includes(d)) {
           targetDocsForResult.push(d);
           planLabelByMemoDoc[d] = '案' + n;
@@ -252,6 +319,8 @@ function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj, origSlot
   }
 
   let resultArrowLines = [];
+  let allTargetDocsDeclined = false;
+
   if (targetDocsForResult.length > 0 && typeof evaluateDoctorAdjustmentStatusObj1b2_ === 'function' && mailHistoryIndexOpt) {
     const cleanC = cleanClinicBaseName_(currentPlanObj.clinicAndDept || '');
     const statusObjs = targetDocsForResult.map(function(docName) {
@@ -263,9 +332,16 @@ function resolveCarriedOverDecisionForSlot3_(prevEntry, currentPlanObj, origSlot
         mailHistoryIndexOpt
       );
     });
+    allTargetDocsDeclined = statusObjs.length > 0 && statusObjs.every(function(st) { return st.code === 'DECLINE'; });
     resultArrowLines = formatCompactAdjustmentLines1b2_(statusObjs);
   } else if (correctedCurrentMemo && correctedCurrentMemo !== '-' && targetDocsForResult.length === 0) {
     resultArrowLines.push('→ 📋' + correctedCurrentMemo.replace(/\r?\n/g, ' / '));
+  }
+
+  // ★前回打診した候補医師が「全員❌辞退」になっていた場合は、確定案をクリアして今回MTGの要再選定（40件側）に戻す！
+  if (allTargetDocsDeclined) {
+    mappedDecisionBase = '';
+    assignee = '';
   }
 
   let finalHeaderDec = mappedDecisionBase

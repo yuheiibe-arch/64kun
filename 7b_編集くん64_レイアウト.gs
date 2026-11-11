@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 7b_編集くん64_レイアウト.gs
- * （一括操作バーの見切れ完全解消 ＆ テーブル列幅の最適化版）
+ * （「🎯今回要対応のみ」フィルタボタン標準搭載 ＆ 一括操作バー最適化版）
  * ============================================================================
  */
 
@@ -33,6 +33,9 @@ function getHenshukun64BodyLayout_() {
     '      <button id="mode_ALL" class="btn-64 active-mode" onclick="setMacroMode(\'ALL\')">全エリア</button>',
     '      <button id="mode_関東" class="btn-64" onclick="setMacroMode(\'関東\')">🗼 関東</button>',
     '      <button id="mode_関西" class="btn-64" onclick="setMacroMode(\'関西\')">🐙 関西</button>',
+    '      <span style="margin-left:8px;border-left:1.5px solid #546e7a;padding-left:8px;display:inline-flex;align-items:center;gap:5px;">',
+    '        <button id="btnToggleSubmitted64" class="btn-64 active-mode" onclick="toggleShowSubmitted64()">🎯 今回要対応のみ表示中</button>',
+    '      </span>',
     '    </div>',
     '    <div class="mode-group">',
     '      <span class="deck-label" style="color:#84ffff;">📍 地域(複数可):</span>',
@@ -61,7 +64,7 @@ function getHenshukun64BodyLayout_() {
     '  </div>',
     '</div>',
     '',
-    '<!-- 3. ステージセレクト（折り返し表示で全日程を一覧化） -->',
+    '<!-- 3. ステージセレクト -->',
     '<div id="dateTabsBar" class="date-tabs-bar"></div>',
     '',
     '<!-- 4. メインステージ -->',
