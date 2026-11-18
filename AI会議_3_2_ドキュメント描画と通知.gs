@@ -1,299 +1,332 @@
 /**
  * ============================================================================
- * AI会議_3_2_ドキュメント描画と通知.gs
- * （後半：Googleドキュメント描画・⭕承諾＝緑マーカー／選択案＝赤マーカー自動反映）
+ * AI会議_1b3_2_移動と隣接枠判定.gs
+ * 1) BQ確定シフト(kakutei)の実勤務時刻を統合した正確な在席時間判定
+ * 2) 移動元・移動先のどちらかに15分でも「部分的医師不在」が生じる移動案を完全ブロック
+ * 3) 他帯と跨がる通し勤務（09:00-21:00 / 09:00-18:00 / 15:00-21:00等）の分断移動をブロック
  * ============================================================================
  */
 
-function renderStructuredMeetingDoc_(title, rawContext, aiData) {
-  const prevDecisionsMap = loadPreviousMeetingDecisionsMap3_();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const mailHistoryIndex = (typeof buildDoctorMailHistoryIndexForResults1b2_ === 'function')
-    ? buildDoctorMailHistoryIndexForResults1b2_(ss)
-    : null;
-
-  const origSlotById = new Map();
-  (rawContext.slotsContext || []).forEach(function(s) {
-    origSlotById.set(s.slotId, s);
-  });
-
-  let carriedOverCount = 0;
-
-  const doc = getOrResetDailyMeetingDocInFolder_(title);
-  const body = doc.getBody();
-  body.setMarginTop(20).setMarginBottom(20).setMarginLeft(24).setMarginRight(24);
-
-  const titlePara = body.appendParagraph(title);
-  while (body.getNumChildren() > 1) {
-    body.removeChild(body.getChild(0));
-  }
-  titlePara.setHeading(DocumentApp.ParagraphHeading.HEADING2).setSpacingAfter(4);
-
-  const plansByDate = {};
-  (aiData.slotPlans || []).forEach(function(p) {
-    const d = p.date || '日付未定';
-    if (!plansByDate[d]) plansByDate[d] = [];
-    plansByDate[d].push(p);
-  });
-
-  const metaPara = body.appendParagraph('');
-
-  if (aiData.executiveSummary) {
-    const sumTable = body.appendTable([['🤖 AIエージェント総括：' + aiData.executiveSummary]]);
-    sumTable.getCell(0, 0).setBackgroundColor('#eef4ff').setPaddingTop(6).setPaddingBottom(6).setPaddingLeft(8).setPaddingRight(8);
-    sumTable.getCell(0, 0).editAsText().setFontSize(9).setBold(true);
-  }
-
-  body.appendParagraph('第1部：医師不在枠 アプローチプラン（日付別一覧）')
-    .setHeading(DocumentApp.ParagraphHeading.HEADING3).setSpacingBefore(8).setSpacingAfter(4);
-
-  Object.keys(plansByDate).sort().forEach(function(dateLabel) {
-    body.appendParagraph('◆ ' + formatDateWithDow_(dateLabel))
-      .setFontSize(10).setBold(true).setSpacingBefore(8).setSpacingAfter(3);
-
-    const tableRows = [
-      ['拠点・不在時間帯', 'AIエージェント推奨アプローチ（優先順・現状メモ）', '確定案・調整結果（→）', '担当者名']
-    ];
-
-    plansByDate[dateLabel].forEach(function(p) {
-      let cleanClinic = String(p.clinicAndDept || '')
-        .replace(' (小児科)（小児科）', '（小児科）')
-        .replace(' (内科)（内科）', '（内科）');
-      if (!cleanClinic.includes('亀有') && !cleanClinic.includes('北葛西')) {
-        cleanClinic = cleanClinic.replace(/[（\(]小児科[）\)]/g, '').trim();
-      }
-      const col1 = cleanClinic + '\n' + (p.absenceTime || '');
-
-      const carryKey = getSlotCarryOverKey3_(dateLabel, cleanClinic, p.absenceTime || '');
-      const origSlot = origSlotById.get(p.slotId) || null;
-      const carried = resolveCarriedOverDecisionForSlot3_(prevDecisionsMap.get(carryKey), p, origSlot, mailHistoryIndex);
-      if (carried.decision || carried.assignee) {
-        carriedOverCount++;
-      }
-
-      const col2Lines = [];
-      if (p.plan1) col2Lines.push('【案1】' + p.plan1);
-      if (p.plan2) col2Lines.push('【案2】' + p.plan2);
-      if (p.plan3) col2Lines.push('【案3】' + p.plan3);
-      if (p.auditNote && p.auditNote !== '-') {
-        const formattedNote = p.auditNote.startsWith('・') ? ('\n' + p.auditNote) : ('\n・' + p.auditNote);
-        col2Lines.push('💡現状・注意：' + formattedNote);
-      }
-      if (carried.comment) {
-        col2Lines.push('📝コメント：' + carried.comment);
-      }
-
-      const col2 = col2Lines.join('\n') || '要個別検討';
-      const defaultDec = carried.decision || '';
-      const defaultAsg = carried.assignee || p.assignee || '';
-
-      tableRows.push([col1, col2, defaultDec, defaultAsg]);
-    });
-
-    const table = body.appendTable(tableRows);
-    styleReadableDocTable_(table, '#1a73e8', [110, 250, 115, 65]);
-
-    // ★fullDecTxt（「→ ⭕...」行を含む全文）を渡すことで、承諾案は緑マーカー、通常選択案は赤マーカーで塗り分ける
-    if (typeof applySelectedPlanMarkerToDocCell64_ === 'function') {
-      for (let r = 1; r < table.getNumRows(); r++) {
-        const row = table.getRow(r);
-        const fullDecTxt = row.getCell(2).getText().trim();
-        if (fullDecTxt) {
-          applySelectedPlanMarkerToDocCell64_(row.getCell(1), row.getCell(1).getText(), fullDecTxt);
-        }
-      }
-    }
-  });
-
-  const metaText = [
-    '📅 作成日時：' + Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm') + ' ｜ 対象期間：' + formatDateWithDow_(rawContext.periodStart) + ' ～ ' + formatDateWithDow_(rawContext.periodEnd) + '（対象不在枠：' + rawContext.unfilledCount + '件 ／ 🔗前回引継・調整結果反映：' + carriedOverCount + '枠）',
-    '💡 手当ルール：常勤追加勤務手当（1,500円/h）＝『常勤依頼手当』シート記載医師のみ ／ 拠点移動手当（10,000円）＝一律支給（SBUのみ0円）',
-    '✍️ マーカーと調整結果（→）の見方：⭕承諾（OK）となった案は【緑色マーカー】、現在選択・打診中の案は【赤色マーカー】で表示されます。❌辞退となった枠は次案を選択してください。'
-  ].join('\n');
-
-  metaPara.setText(metaText);
-  metaPara.setFontSize(8.5).setForegroundColor('#444444').setLineSpacing(1.25).setSpacingAfter(6);
-
-  body.appendPageBreak();
-  body.appendParagraph('第2部：急募のお知らせ配信（1週間分・1ページ完全収容テンプレート）')
-    .setFontSize(9).setBold(true).setSpacingBefore(0).setSpacingAfter(1);
-
-  if (aiData.announcementProposal) {
-    body.appendParagraph('📌 ' + (aiData.announcementProposal.recommendedDateReason || ''))
-      .setFontSize(7.5).setBold(true).setSpacingBefore(0).setSpacingAfter(2);
-
-    const tplTable = body.appendTable([[aiData.announcementProposal.templateText || '']]);
-    const cell = tplTable.getCell(0, 0);
-    cell.setBackgroundColor('#fff8e1').setPaddingTop(3).setPaddingBottom(3).setPaddingLeft(6).setPaddingRight(6);
-    cell.editAsText().setFontSize(6.5);
-    for (let p = 0; p < cell.getNumChildren(); p++) {
-      const ch = cell.getChild(p);
-      if (ch.getType() === DocumentApp.ElementType.PARAGRAPH) {
-        ch.asParagraph().setLineSpacing(1.0).setSpacingBefore(0).setSpacingAfter(0);
-      }
-    }
-  }
-
-  body.appendPageBreak();
-  body.appendParagraph('第3部：【参考・サブ情報】対象期間内の12連勤NG日')
-    .setHeading(DocumentApp.ParagraphHeading.HEADING3).setSpacingBefore(4).setSpacingAfter(4);
-
-  if (rawContext.streakList && rawContext.streakList.length > 0) {
-    const sRows = [['医師名', '連勤数', '対象期間（実働拠点のみ）', '追加打診NG日', '理由']];
-    rawContext.streakList.forEach(function(s) {
-      sRows.push([s.doctor + '(' + s.licenseNo + ')', s.streakDays + '日', s.period || '', s.ngDates || '-', s.note || '']);
-    });
-    styleReadableDocTable_(body.appendTable(sRows), '#c53929', [100, 45, 150, 75, 170]);
-  } else {
-    body.appendParagraph('・対象期間内に12連勤NG日が発生する医師はいません。').setFontSize(8.5);
-  }
-
-  doc.saveAndClose();
-  const file = DriveApp.getFileById(doc.getId());
-  try { file.setSharing(DriveApp.Access.DOMAIN_WITH_LINK, DriveApp.Permission.EDIT); } catch (e) {}
-  return file;
+function cleanDisplayDoctorName1b3_(rawName) {
+  return String(rawName || '')
+    .normalize('NFKC')
+    .replace(/[\(（\[【].*$/g, '')
+    .replace(/[:：].*$/, '')
+    .replace(/[\)）\]】★⚠️📩・]/g, '')
+    .replace(/先生$/g, '')
+    .replace(/[\s\u3000]+/g, '')
+    .trim();
 }
 
-function styleReadableDocTable_(table, headerHexColor, colWidths) {
-  table.setBorderColor('#cccccc').setBorderWidth(0.5);
-  const numRows = table.getNumRows();
-  const numCols = table.getRow(0).getNumCells();
+/**
+ * BQパックの確定シフト（kakutei / obo）から「日付|拠点|医師キー -> [{startMin, endMin}]」の正確な時刻辞書を構築する
+ */
+function buildBqExactShiftIntervalsMap1b3_() {
+  const map = new Map();
+  if (typeof fetchAndDecryptBqMailForResolver_ !== 'function') return map;
 
-  for (let r = 0; r < numRows; r++) {
-    const row = table.getRow(r);
-    const isHeader = (r === 0);
-    const bgHex = isHeader ? headerHexColor : (r % 2 === 1 ? '#ffffff' : '#f8f9fa');
+  try {
+    const bqData = fetchAndDecryptBqMailForResolver_();
+    if (!bqData) return map;
 
-    for (let c = 0; c < numCols; c++) {
-      const cell = row.getCell(c);
-      if (colWidths && colWidths[c]) cell.setWidth(colWidths[c]);
-      cell.setPaddingTop(4).setPaddingBottom(4).setPaddingLeft(6).setPaddingRight(6);
-      cell.setVerticalAlignment(DocumentApp.VerticalAlignment.TOP);
-      cell.setBackgroundColor(bgHex);
+    const list = (bqData.kakutei || []).concat(bqData.obo || []);
+    list.forEach(function(s) {
+      const st = String(s.st || s.status || '').trim();
+      if (st && (st.includes('キャンセル') || st.includes('取消') || st.includes('却下'))) return;
 
-      const textObj = cell.editAsText();
-      if (isHeader) {
-        textObj.setForegroundColor('#ffffff').setBold(true).setFontSize(8.5);
+      const d = normalizeDateYmd1b3_(s.d || s.date);
+      const rawC = String(s.c || s.clinic || '').trim();
+      const cleanC = cleanClinicBaseName_(rawC);
+      const docKey = normKeyForDoc_(s.n || s.name || '');
+      if (!d || !cleanC || cleanC.includes('バックアップ') || !docKey || docKey === '未充足') return;
+
+      const rawT = String(s.t || s.time || s.tm || s.workTime || '').normalize('NFKC').trim();
+      const tm = rawT.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
+      if (!tm) return;
+
+      const startMin = Number(tm[1]) * 60 + Number(tm[2]);
+      const endMin = Number(tm[3]) * 60 + Number(tm[4]);
+      if (endMin <= startMin) return;
+
+      const key = d + '|' + cleanC + '|' + docKey;
+      if (!map.has(key)) map.set(key, []);
+      const arr = map.get(key);
+      if (!arr.some(function(x) { return x.startMin === startMin && x.endMin === endMin; })) {
+        arr.push({ startMin: startMin, endMin: endMin });
+      }
+    });
+  } catch (e) {
+    Logger.log('⚠️ BQ確定シフト時刻マップ読込スキップ: ' + e.message);
+  }
+  return map;
+}
+
+/**
+ * セル文字列の時刻表記 ＋ BQ確定シフトの実時刻を統合して、対象バンド内での正確な勤務開始・終了分を返す
+ */
+function parseDocTokenWorkingMinutes1b3_(tok, bandCode, isKitakasai, allRowTextHint, bqIntervalsOpt) {
+  const defaultStart = bandCode === 'A' ? 540 : (bandCode === 'B' ? 900 : 1080);
+  const defaultEnd = bandCode === 'A' ? (isKitakasai ? 750 : 780) : (bandCode === 'B' ? 1080 : (isKitakasai ? 1200 : 1260));
+
+  const targetStr = String(tok || '');
+  let tm = targetStr.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
+
+  if (!tm && allRowTextHint) {
+    const cleanName = cleanDisplayDoctorName1b3_(tok);
+    if (cleanName) {
+      const escaped = cleanName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const hintRegex = new RegExp(escaped + '[^\\n\\/／,、]*?(\\d{1,2}):(\\d{2})\\s*[\\-〜～~]\\s*(\\d{1,2}):(\\d{2})');
+      tm = String(allRowTextHint).match(hintRegex);
+    }
+  }
+
+  if (tm) {
+    const rawStart = Number(tm[1]) * 60 + Number(tm[2]);
+    const rawEnd = Number(tm[3]) * 60 + Number(tm[4]);
+    return {
+      startMin: Math.max(defaultStart, rawStart),
+      endMin: Math.min(defaultEnd, rawEnd),
+      rawStartMin: rawStart,
+      rawEndMin: rawEnd,
+      hasCustomTime: true
+    };
+  }
+
+  // ★セルに時刻記載がない場合でも、BQ確定シフト（kakutei）に実時刻があればそれを使用する
+  if (Array.isArray(bqIntervalsOpt) && bqIntervalsOpt.length > 0) {
+    const overlapping = bqIntervalsOpt.filter(function(iv) {
+      return Math.max(iv.startMin, defaultStart) < Math.min(iv.endMin, defaultEnd);
+    });
+    if (overlapping.length > 0) {
+      const minRawStart = Math.min.apply(null, overlapping.map(function(iv) { return iv.startMin; }));
+      const maxRawEnd = Math.max.apply(null, overlapping.map(function(iv) { return iv.endMin; }));
+      return {
+        startMin: Math.max(defaultStart, minRawStart),
+        endMin: Math.min(defaultEnd, maxRawEnd),
+        rawStartMin: minRawStart,
+        rawEndMin: maxRawEnd,
+        hasCustomTime: (minRawStart > defaultStart || maxRawEnd < defaultEnd || minRawStart < defaultStart || maxRawEnd > defaultEnd)
+      };
+    }
+  }
+
+  return {
+    startMin: defaultStart,
+    endMin: defaultEnd,
+    rawStartMin: defaultStart,
+    rawEndMin: defaultEnd,
+    hasCustomTime: false
+  };
+}
+
+function evaluateValidAdjacentDocsForSlot_(docsStr, actionType, dateStr, dow, targetClinic, targetArea, timeInfo, masters) {
+  const tokens = splitDoctorTokensSafely_(docsStr);
+  const validTokens = [];
+  const validDocKeys = new Set();
+
+  tokens.forEach(function(tok) {
+    const k = normKeyForDoc_(tok);
+    const dispName = cleanDisplayDoctorName1b3_(tok);
+    if (!k || !dispName || masters.absoluteNgDocSet.has(k)) return;
+    if (masters.sbuSet.has(k)) return;
+    if (masters.streakNgMap.has(k) && masters.streakNgMap.get(k).includes(dateStr)) return;
+
+    const tm = tok.match(/(\d{1,2}):(\d{2})\s*[\-〜～]\s*(\d{1,2}):(\d{2})/);
+    if (tm) {
+      const dStart = Number(tm[1]) * 60 + Number(tm[2]);
+      const dEnd = Number(tm[3]) * 60 + Number(tm[4]);
+      if (actionType === '延長' && dEnd < timeInfo.startMin) {
+        if (!(dEnd === 780 && timeInfo.startMin === 900)) return;
+      }
+      if (actionType === '早出' && dStart > timeInfo.endMin) {
+        if (!(timeInfo.endMin === 780 && dStart === 900)) return;
+      }
+    }
+
+    if (!isDoctorCompatibleWithSlot_(k, dow, targetClinic, targetArea, timeInfo, actionType, masters, dateStr)) return;
+
+    const headPart = String(tok).replace(/\[.*$/g, '');
+    const isFt = !headPart.includes('非常勤') && headPart.includes('常勤');
+
+    if (isFt) {
+      const condStr = masters.ftAllowCondMap.get(k) || '';
+      if (masters.ftAllowDocSet.has(k) && headPart.includes('所定休出') && isFtConditionCompatibleWithTarget_(condStr, targetClinic, targetArea)) {
+        validTokens.push(dispName + '(常勤・所定休出)');
+        validDocKeys.add(k);
+      }
+      return;
+    }
+
+    validTokens.push(dispName + '(非常勤)');
+    validDocKeys.add(k);
+  });
+
+  return {
+    docs: validTokens.length > 0 ? validTokens.join(' / ') : 'なし',
+    status: validTokens.length > 0 ? (actionType + '打診可能') : '',
+    docKeySet: validDocKeys
+  };
+}
+
+function formatMinToHm1b3_(totalMin) {
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return ('0' + h).slice(-2) + ':' + ('0' + m).slice(-2);
+}
+
+/**
+ * ★厳格版：移動元・移動先のどちらにも「15分たりとも部分的医師不在（空白時間）」を作らない場合のみ canMove: true を返す
+ */
+function evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEval, masters) {
+  const targetBands = timeInfo.targetBands || ['A'];
+  const srcDate = normalizeDateYmd1b3_(srcRow[0]);
+  const srcClinic = cleanClinicBaseName_(srcRow[2]);
+  const isKitakasai = srcClinic.includes('北葛西');
+  const allRowTextHint = [srcRow[7], srcRow[8], srcRow[9]].join(' / ');
+  const bqMap = (masters && masters.bqExactIntervalsMap) ? masters.bqExactIntervalsMap : null;
+
+  const getBqIntervals = function(dKey) {
+    if (!bqMap || !srcDate || !srcClinic || !dKey) return null;
+    return bqMap.get(srcDate + '|' + srcClinic + '|' + dKey) || null;
+  };
+
+  const countByBand = {
+    'A': Number(srcRow[4] || 0),
+    'B': Number(srcRow[5] || 0),
+    'C': Number(srcRow[6] || 0)
+  };
+  const rawTokensByBand = {
+    'A': splitDoctorTokensSafely_(srcRow[7]),
+    'B': splitDoctorTokensSafely_(srcRow[8]),
+    'C': splitDoctorTokensSafely_(srcRow[9])
+  };
+  const docsByBand = {
+    'A': rawTokensByBand['A'].map(normKeyForDoc_),
+    'B': rawTokensByBand['B'].map(normKeyForDoc_),
+    'C': rawTokensByBand['C'].map(normKeyForDoc_)
+  };
+
+  // 1. 終日通し勤務（A・B・Cすべて在席）、または対象外の他帯にも勤務がある医師を分断する移動は原則ブロック
+  const inA = docsByBand['A'].includes(docKey);
+  const inB = docsByBand['B'].includes(docKey);
+  const inC = docsByBand['C'].includes(docKey);
+  if (inA && inB && inC) {
+    return { canMove: false, conditionNote: '' };
+  }
+
+  const movingBqIvs = getBqIntervals(docKey);
+  if (Array.isArray(movingBqIvs)) {
+    const spansFullDayInBq = movingBqIvs.some(function(iv) { return iv.startMin <= 600 && iv.endMin >= 1200; });
+    if (spansFullDayInBq) {
+      return { canMove: false, conditionNote: '' };
+    }
+  }
+
+  // 2. 対象バンド外（例：午前移動なのに午後・夜間も入っている等）のチェック
+  const allBands = ['A', 'B', 'C'];
+  for (let i = 0; i < allBands.length; i++) {
+    const b = allBands[i];
+    if (targetBands.includes(b)) continue;
+    if (!docsByBand[b].includes(docKey)) continue;
+
+    // B(午後)とC(夜間)が連続しているシフトの片方引き抜きは不可
+    if ((b === 'C' && targetBands.includes('B')) || (b === 'B' && targetBands.includes('C'))) {
+      return { canMove: false, conditionNote: '' };
+    }
+    // A(午前)とC(夜間)の両方に入っている場合（通し・中抜け）の片方引き抜きも不可
+    if ((b === 'C' && targetBands.includes('A')) || (b === 'A' && targetBands.includes('C'))) {
+      return { canMove: false, conditionNote: '' };
+    }
+    // A(午前)とB(午後)の両方に入っている場合は、昼休みに移動可能な近隣（SまたはAかつ移動45分以内）のみ許可
+    if ((b === 'A' && targetBands.includes('B')) || (b === 'B' && targetBands.includes('A'))) {
+      if (pairEval.estMinutes > 45 || (pairEval.rank !== 'S' && pairEval.rank !== 'A')) {
+        return { canMove: false, conditionNote: '' };
+      }
+    }
+  }
+
+  // 3. 対象バンドごとの「移動先のフルカバー」＆「移動元の部分不在ゼロ」厳密チェック
+  for (let i = 0; i < targetBands.length; i++) {
+    const tb = targetBands[i];
+    if (countByBand[tb] < 2 || !docsByBand[tb].includes(docKey)) {
+      return { canMove: false, conditionNote: '' };
+    }
+
+    const tokens = rawTokensByBand[tb];
+    const bandFullStart = tb === 'A' ? 540 : (tb === 'B' ? 900 : 1080);
+    const bandFullEnd = tb === 'A' ? (isKitakasai ? 750 : 780) : (tb === 'B' ? 1080 : (isKitakasai ? 1200 : 1260));
+
+    let movingDocTok = null;
+    const remainingTokens = [];
+    tokens.forEach(function(t) {
+      if (normKeyForDoc_(t) === docKey && !movingDocTok) {
+        movingDocTok = t;
       } else {
-        textObj.setForegroundColor('#222222').setBold(false).setFontSize(8.5);
-        if (c === 1) {
-          highlightKeywordsInText_(textObj);
-        }
-        if (c === 2) {
-          textObj.setBold(true);
-        }
+        remainingTokens.push(t);
       }
-    }
-  }
-}
-
-function highlightKeywordsInText_(textObj) {
-  ['【案1】', '【案2】', '【案3】', '【2診目崩し】', '【2診目崩し・要延長セット】', '【1診・併行募集】', '💡現状・注意：', '📝コメント：'].forEach(function(pat) {
-    let found = textObj.findText(pat);
-    while (found) {
-      found.getElement().asText().setBold(found.getStartOffset(), found.getEndOffsetInclusive(), true);
-      found = textObj.findText(pat, found);
-    }
-  });
-}
-
-function replaceAiDocLinkInDescription_(originalDesc, newDocUrl) {
-  const cleaned = String(originalDesc || '').replace(/\n*📄 【AI事前会議ドキュメント】\nhttps?:\/\/[^\s\n]+/g, '').trim();
-  return (cleaned ? cleaned + '\n\n' : '') + '📄 【AI事前会議ドキュメント】\n' + newDocUrl;
-}
-
-function attachDocToMtgCalendar_(docFile) {
-  const now = new Date();
-  const startWindow = new Date(now.getTime() - 12 * 60 * 60 * 1000);
-  const lookAhead = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-
-  if (typeof Calendar !== 'undefined' && Calendar.Events) {
-    try {
-      const events = Calendar.Events.list(MTG_DOC_CONFIG.CALENDAR_ID, {
-        q: MTG_DOC_CONFIG.EVENT_TITLE_KEYWORD,
-        timeMin: startWindow.toISOString(),
-        timeMax: lookAhead.toISOString(),
-        singleEvents: true,
-        orderBy: 'startTime'
-      });
-
-      if (events.items && events.items.length > 0) {
-        const ev = events.items[0];
-        const otherAtts = (ev.attachments || []).filter(function(a) {
-          return !String(a.title || '').includes('超募集対策MTG_') && a.fileUrl !== docFile.getUrl();
-        });
-        otherAtts.push({ fileUrl: docFile.getUrl(), title: docFile.getName(), mimeType: 'application/vnd.google-apps.document' });
-        const patched = Calendar.Events.patch(
-          { attachments: otherAtts, description: replaceAiDocLinkInDescription_(ev.description, docFile.getUrl()) },
-          MTG_DOC_CONFIG.CALENDAR_ID, ev.id, { supportsAttachments: true }
-        );
-        return patched.htmlLink || '';
-      }
-    } catch (e) {}
-  }
-
-  try {
-    const cal = CalendarApp.getCalendarById(MTG_DOC_CONFIG.CALENDAR_ID) || CalendarApp.getDefaultCalendar();
-    if (!cal) return '';
-    const calEvents = cal.getEvents(startWindow, lookAhead, { search: MTG_DOC_CONFIG.EVENT_TITLE_KEYWORD });
-    if (!calEvents || calEvents.length === 0) return '';
-    calEvents[0].setDescription(replaceAiDocLinkInDescription_(calEvents[0].getDescription(), docFile.getUrl()));
-    return 'https://' + 'calendar.google.com/calendar/r/week';
-  } catch (e2) {
-    return '';
-  }
-}
-
-function sendMeetingDocToSlack_(info) {
-  const props = PropertiesService.getScriptProperties();
-  const token = props.getProperty('SLACK_BOT_TOKEN');
-  const channel = props.getProperty('SLACK_CHANNEL_ID') || MTG_DOC_CONFIG.DEFAULT_SLACK_CHANNEL_ID;
-  if (!token) return;
-
-  const mentionText = resolveSubteamMentions_(token, ['dsshift', 'dspart']);
-  const fullText = mentionText + '\n```\n' + info.todayStr + '\n対象期間：' + info.periodStart + '～' + info.periodEnd + '\nAI自動会議終了いたしました。提出済みです。\n```';
-  const buttons = [
-    { type: 'button', text: { type: 'plain_text', text: '📄 AI会議ドキュメントを開く', emoji: true }, style: 'primary', url: info.docUrl },
-    { type: 'button', text: { type: 'plain_text', text: '📓 AIルールブック(Notebook)を開く', emoji: true }, url: MTG_DOC_CONFIG.NOTEBOOK_URL }
-  ];
-  if (info.eventUrl) {
-    buttons.push({ type: 'button', text: { type: 'plain_text', text: '📅 カレンダー予定を開く', emoji: true }, url: info.eventUrl });
-  }
-
-  UrlFetchApp.fetch('https://' + 'slack.com/api/chat.postMessage', {
-    method: 'post',
-    contentType: 'application/json; charset=utf-8',
-    headers: { Authorization: 'Bearer ' + token },
-    payload: JSON.stringify({
-      channel: channel,
-      text: fullText,
-      blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: fullText } },
-        { type: 'actions', elements: buttons }
-      ]
-    }),
-    muteHttpExceptions: true
-  });
-}
-
-function resolveSubteamMentions_(token, handles) {
-  try {
-    const res = UrlFetchApp.fetch('https://' + 'slack.com/api/usergroups.list', {
-      method: 'get',
-      headers: { Authorization: 'Bearer ' + token },
-      muteHttpExceptions: true
     });
-    const data = JSON.parse(res.getContentText());
-    if (data.ok && Array.isArray(data.usergroups)) {
-      const map = new Map();
-      data.usergroups.forEach(function(ug) {
-        if (ug.handle) map.set(ug.handle.toLowerCase(), ug.id);
-        if (ug.name) map.set(ug.name.toLowerCase(), ug.id);
-      });
-      return handles.map(function(h) {
-        return map.has(h.toLowerCase()) ? ('<!subteam^' + map.get(h.toLowerCase()) + '|@' + h + '>') : ('@' + h);
-      }).join(' ');
+
+    if (!movingDocTok || remainingTokens.length === 0) {
+      return { canMove: false, conditionNote: '' };
     }
-  } catch (e) {}
-  return handles.map(function(h) { return '@' + h; }).join(' ');
+
+    // ★チェックA：移動する医師本人が、移動先の要求時間帯（例：板橋 09:00-13:00）を1分も欠けずフルカバーしているか？
+    // （例：上春先生が11:00-13:00勤務なら rawStartMin=660 > reqStart=540 となり、09:00-11:00が不在になるためここで即ブロック！）
+    const movingHours = parseDocTokenWorkingMinutes1b3_(movingDocTok, tb, isKitakasai, allRowTextHint, movingBqIvs);
+    const reqStart = Math.max(bandFullStart, timeInfo.startMin);
+    const reqEnd = Math.min(bandFullEnd, timeInfo.endMin);
+    if (movingHours.rawStartMin > reqStart || movingHours.rawEndMin < reqEnd) {
+      return { canMove: false, conditionNote: '' };
+    }
+
+    // 移動する医師が帯を跨ぐ変則シフト（例：11:00-15:00、14:00-19:00 等）の場合も分断不可
+    if (movingHours.hasCustomTime) {
+      if (tb === 'A' && movingHours.rawEndMin > 780 && !targetBands.includes('B')) return { canMove: false, conditionNote: '' };
+      if (tb === 'B' && ((movingHours.rawStartMin < 900 && !targetBands.includes('A')) || (movingHours.rawEndMin > 1080 && !targetBands.includes('C')))) {
+        return { canMove: false, conditionNote: '' };
+      }
+      if (tb === 'C' && movingHours.rawStartMin < 1080 && !targetBands.includes('B')) return { canMove: false, conditionNote: '' };
+    }
+
+    const validRemainingTokens = remainingTokens.filter(function(remTok) {
+      const remKey = normKeyForDoc_(remTok);
+      if (tb === 'A' && docsByBand['A'].includes(remKey) && docsByBand['B'].includes(remKey) && docsByBand['C'].includes(remKey)) {
+        const remIvs = getBqIntervals(remKey);
+        const startsAtNineInBq = Array.isArray(remIvs) && remIvs.some(function(iv) { return iv.startMin <= 540; });
+        if (!/09:00|9:00/.test(remTok) && !startsAtNineInBq) return false;
+      }
+      return true;
+    });
+
+    if (validRemainingTokens.length === 0) {
+      return { canMove: false, conditionNote: '' };
+    }
+
+    // ★チェックB：移動元の拠点（例：南浦和）で、残る医師だけでバンド全域（09:00-13:00等）を15分刻みすべて隙間なくカバーできているか？
+    // 15分でも医師0人の時間帯（部分的医師不在）が生じる場合は、即座に canMove: false で除外する！
+    for (let tMin = bandFullStart; tMin < bandFullEnd; tMin += 15) {
+      const coveredAtT = validRemainingTokens.some(function(remTok) {
+        const remKey = normKeyForDoc_(remTok);
+        const remHours = parseDocTokenWorkingMinutes1b3_(remTok, tb, isKitakasai, allRowTextHint, getBqIntervals(remKey));
+        if (!remHours.hasCustomTime && tb === 'C' && docsByBand['B'].includes(remKey) && !docsByBand['A'].includes(remKey)) {
+          return remHours.startMin <= tMin && 1200 >= (tMin + 15);
+        }
+        return remHours.startMin <= tMin && remHours.endMin >= (tMin + 15);
+      });
+
+      if (!coveredAtT) {
+        return { canMove: false, conditionNote: '' };
+      }
+    }
+  }
+
+  return {
+    canMove: true,
+    conditionNote: ''
+  };
+}
+
+function canDoctorLeaveSourceWithoutCreatingAbsence_(docKey, srcRow, timeInfo, pairEval, masters) {
+  const res = evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEval, masters);
+  return res.canMove;
 }

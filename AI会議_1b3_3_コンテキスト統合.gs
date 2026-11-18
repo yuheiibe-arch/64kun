@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_1b3_3_コンテキスト統合.gs
- * （日別メール制約＆キャンセル日ブロック反映・安全な全枠出力版）
+ * （BQ実勤務時刻による部分不在ゼロ厳格チェック・日別メール制約＆キャンセル日ブロック・【1診・併行募集】完全廃止版）
  * ============================================================================
  */
 
@@ -76,6 +76,11 @@ function collectCompactContextForAi_(ss) {
 
   const dominantMatrix = loadDominantMatrixFromDoc_();
   const masters = buildMasterAndConfirmedShiftIndex_(ss, activeShifts, streakWarnings);
+
+  // ★BQ確定シフト(kakutei)の実勤務時刻マップを統合（時刻省略による部分不在の見逃しを防止）
+  masters.bqExactIntervalsMap = (typeof buildBqExactShiftIntervalsMap1b3_ === 'function')
+    ? buildBqExactShiftIntervalsMap1b3_()
+    : new Map();
 
   const latestReplyMap = new Map();
   kbRows.forEach(function(r) {
@@ -153,9 +158,7 @@ function collectCompactContextForAi_(ss) {
 
     const dayShifts = activeShifts.filter(function(s) { return String(s[0] || '').trim() === dateStr; });
     const twoDocScoredList = [];
-    const oneDocScoredList = [];
     const seenTwoDoc = new Set();
-    const seenOneDoc = new Set();
     let backupDocs = '';
 
     if (!isInternalMed) {
@@ -180,11 +183,12 @@ function collectCompactContextForAi_(ss) {
         const docsCol = primaryBand === 'A' ? 7 : (primaryBand === 'B' ? 8 : 9);
         const docCount = Number(s[countCol] || 0);
         const rawDocsStr = String(s[docsCol] || '');
-        if (!rawDocsStr || rawDocsStr === '未充足' || docCount < 1) return;
+
+        // ★2診以上の拠点のみ対象（1診拠点からの【1診・併行募集】および終日医の分断引き抜きは完全除外）
+        if (!rawDocsStr || rawDocsStr === '未充足' || docCount < 2) return;
 
         const tokens = splitDoctorTokensSafely_(rawDocsStr);
         const movableForTwoDoc = [];
-        const movableForOneDoc = [];
         let bestScore = 0;
 
         tokens.forEach(function(tok) {
@@ -213,23 +217,11 @@ function collectCompactContextForAi_(ss) {
           const baseDocScore = pairEval.score + (isSbu ? 15 : (isNeg ? 10 : 0));
           const baseLabel = isSbu ? (dispName + '[★SBU]') : (isFt ? (dispName + '[常勤・所定休出]') : dispName);
 
-          if (docCount >= 2) {
-            const leaveEval = evaluateDoctorLeaveSourceCondition1b3_(k, s, timeInfo, pairEval, masters);
-            if (leaveEval.canMove) {
-              const finalLabel = leaveEval.conditionNote
-                ? (baseLabel + '｛※' + leaveEval.conditionNote + '｝')
-                : baseLabel;
-              const adjScore = leaveEval.conditionNote ? (baseDocScore - 8) : baseDocScore;
-              movableForTwoDoc.push(finalLabel);
-              if (adjScore > bestScore) bestScore = adjScore;
-            }
-          } else if (docCount === 1 && isSpecialMovable) {
-            const isKitakasai = cleanSrcClinic.includes('北葛西');
-            const docHours = parseDocTokenWorkingMinutes1b3_(tok, primaryBand, isKitakasai, [s[7], s[8], s[9]].join(' / '));
-            if (docHours.rawStartMin <= timeInfo.startMin && docHours.rawEndMin >= timeInfo.endMin) {
-              movableForOneDoc.push(baseLabel);
-              if (baseDocScore > bestScore) bestScore = baseDocScore;
-            }
+          // ★移動元・移動先の双方で15分たりとも部分不在が生じない場合のみ採用
+          const leaveEval = evaluateDoctorLeaveSourceCondition1b3_(k, s, timeInfo, pairEval, masters);
+          if (leaveEval.canMove && !leaveEval.conditionNote) {
+            movableForTwoDoc.push(baseLabel);
+            if (baseDocScore > bestScore) bestScore = baseDocScore;
           }
         });
 
@@ -245,24 +237,11 @@ function collectCompactContextForAi_(ss) {
               movableDoctors: movableForTwoDoc
             }
           });
-        } else if (movableForOneDoc.length > 0 && !seenOneDoc.has(cleanSrcClinic)) {
-          seenOneDoc.add(cleanSrcClinic);
-          oneDocScoredList.push({
-            score: bestScore,
-            item: {
-              clinic: cleanSrcClinic,
-              area: sArea,
-              priorityRank: pairEval.rank,
-              estMinutes: pairEval.estMinutes,
-              movableDoctors: movableForOneDoc
-            }
-          });
         }
       });
     }
 
     twoDocScoredList.sort(function(a, b) { return b.score - a.score; });
-    oneDocScoredList.sort(function(a, b) { return b.score - a.score; });
 
     const exactKey = makeNormalizedSpotKey_(dateStr, clinic, absTime);
     const prefix = makeSpotClinicDatePrefix1b3_(dateStr, clinic);
@@ -357,7 +336,7 @@ function collectCompactContextForAi_(ss) {
       currentMemo: u[12] || '',
       backupDocs: backupDocs,
       twoDocBreakdownCandidates: twoDocScoredList.slice(0, 4).map(function(x) { return x.item; }),
-      oneDocParallelCandidates: oneDocScoredList.slice(0, 3).map(function(x) { return x.item; }),
+      oneDocParallelCandidates: [],
       kinmukunCandidates: verifiedSpots.slice(0, 4)
     };
   });
