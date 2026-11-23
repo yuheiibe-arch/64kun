@@ -1,7 +1,9 @@
 /**
  * ============================================================================
  * AI会議_1b3_2_移動と隣接枠判定.gs
- * （日別メール制約［11/8柿本先生の18時まで等］＆残存医の延長打診＋2診目移動打診セット対応版）
+ * 1) BQ確定シフト(kakutei)の実勤務時刻を統合した正確な在席時間判定
+ * 2) 移動元・移動先のどちらかに15分でも「部分的医師不在」が生じる移動案を完全ブロック
+ * 3) 他帯と跨がる通し勤務（09:00-21:00 / 09:00-18:00 / 15:00-21:00等）の分断移動をブロック
  * ============================================================================
  */
 
@@ -16,11 +18,57 @@ function cleanDisplayDoctorName1b3_(rawName) {
     .trim();
 }
 
-function parseDocTokenWorkingMinutes1b3_(tok, bandCode, isKitakasai, allRowTextHint) {
-  const defaultStart = bandCode === 'A' ? 540 : (bandCode === 'B' ? 900 : 1080);
-  const defaultEnd = bandCode === 'A' ? 780 : (bandCode === 'B' ? 1080 : (isKitakasai ? 1200 : 1260));
+/**
+ * BQパックの確定シフト（kakutei / obo）から「日付|拠点|医師キー -> [{startMin, endMin}]」の正確な時刻辞書を構築する
+ */
+function buildBqExactShiftIntervalsMap1b3_() {
+  const map = new Map();
+  if (typeof fetchAndDecryptBqMailForResolver_ !== 'function') return map;
 
-  let targetStr = String(tok || '');
+  try {
+    const bqData = fetchAndDecryptBqMailForResolver_();
+    if (!bqData) return map;
+
+    const list = (bqData.kakutei || []).concat(bqData.obo || []);
+    list.forEach(function(s) {
+      const st = String(s.st || s.status || '').trim();
+      if (st && (st.includes('キャンセル') || st.includes('取消') || st.includes('却下'))) return;
+
+      const d = normalizeDateYmd1b3_(s.d || s.date);
+      const rawC = String(s.c || s.clinic || '').trim();
+      const cleanC = cleanClinicBaseName_(rawC);
+      const docKey = normKeyForDoc_(s.n || s.name || '');
+      if (!d || !cleanC || cleanC.includes('バックアップ') || !docKey || docKey === '未充足') return;
+
+      const rawT = String(s.t || s.time || s.tm || s.workTime || '').normalize('NFKC').trim();
+      const tm = rawT.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
+      if (!tm) return;
+
+      const startMin = Number(tm[1]) * 60 + Number(tm[2]);
+      const endMin = Number(tm[3]) * 60 + Number(tm[4]);
+      if (endMin <= startMin) return;
+
+      const key = d + '|' + cleanC + '|' + docKey;
+      if (!map.has(key)) map.set(key, []);
+      const arr = map.get(key);
+      if (!arr.some(function(x) { return x.startMin === startMin && x.endMin === endMin; })) {
+        arr.push({ startMin: startMin, endMin: endMin });
+      }
+    });
+  } catch (e) {
+    Logger.log('⚠️ BQ確定シフト時刻マップ読込スキップ: ' + e.message);
+  }
+  return map;
+}
+
+/**
+ * セル文字列の時刻表記 ＋ BQ確定シフトの実時刻を統合して、対象バンド内での正確な勤務開始・終了分を返す
+ */
+function parseDocTokenWorkingMinutes1b3_(tok, bandCode, isKitakasai, allRowTextHint, bqIntervalsOpt) {
+  const defaultStart = bandCode === 'A' ? 540 : (bandCode === 'B' ? 900 : 1080);
+  const defaultEnd = bandCode === 'A' ? (isKitakasai ? 750 : 780) : (bandCode === 'B' ? 1080 : (isKitakasai ? 1200 : 1260));
+
+  const targetStr = String(tok || '');
   let tm = targetStr.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
 
   if (!tm && allRowTextHint) {
@@ -32,25 +80,42 @@ function parseDocTokenWorkingMinutes1b3_(tok, bandCode, isKitakasai, allRowTextH
     }
   }
 
-  if (!tm) {
+  if (tm) {
+    const rawStart = Number(tm[1]) * 60 + Number(tm[2]);
+    const rawEnd = Number(tm[3]) * 60 + Number(tm[4]);
     return {
-      startMin: defaultStart,
-      endMin: defaultEnd,
-      rawStartMin: defaultStart,
-      rawEndMin: defaultEnd,
-      hasCustomTime: false
+      startMin: Math.max(defaultStart, rawStart),
+      endMin: Math.min(defaultEnd, rawEnd),
+      rawStartMin: rawStart,
+      rawEndMin: rawEnd,
+      hasCustomTime: true
     };
   }
 
-  const rawStart = Number(tm[1]) * 60 + Number(tm[2]);
-  const rawEnd = Number(tm[3]) * 60 + Number(tm[4]);
+  // ★セルに時刻記載がない場合でも、BQ確定シフト（kakutei）に実時刻があればそれを使用する
+  if (Array.isArray(bqIntervalsOpt) && bqIntervalsOpt.length > 0) {
+    const overlapping = bqIntervalsOpt.filter(function(iv) {
+      return Math.max(iv.startMin, defaultStart) < Math.min(iv.endMin, defaultEnd);
+    });
+    if (overlapping.length > 0) {
+      const minRawStart = Math.min.apply(null, overlapping.map(function(iv) { return iv.startMin; }));
+      const maxRawEnd = Math.max.apply(null, overlapping.map(function(iv) { return iv.endMin; }));
+      return {
+        startMin: Math.max(defaultStart, minRawStart),
+        endMin: Math.min(defaultEnd, maxRawEnd),
+        rawStartMin: minRawStart,
+        rawEndMin: maxRawEnd,
+        hasCustomTime: (minRawStart > defaultStart || maxRawEnd < defaultEnd || minRawStart < defaultStart || maxRawEnd > defaultEnd)
+      };
+    }
+  }
 
   return {
-    startMin: Math.max(defaultStart, rawStart),
-    endMin: Math.min(defaultEnd, rawEnd),
-    rawStartMin: rawStart,
-    rawEndMin: rawEnd,
-    hasCustomTime: true
+    startMin: defaultStart,
+    endMin: defaultEnd,
+    rawStartMin: defaultStart,
+    rawEndMin: defaultEnd,
+    hasCustomTime: false
   };
 }
 
@@ -78,7 +143,6 @@ function evaluateValidAdjacentDocsForSlot_(docsStr, actionType, dateStr, dow, ta
       }
     }
 
-    // ★dateStr を渡して「11/8の柿本先生は18時までなら可能（＝18時以降の延長不可）」を確実にチェック！
     if (!isDoctorCompatibleWithSlot_(k, dow, targetClinic, targetArea, timeInfo, actionType, masters, dateStr)) return;
 
     const headPart = String(tok).replace(/\[.*$/g, '');
@@ -110,12 +174,21 @@ function formatMinToHm1b3_(totalMin) {
   return ('0' + h).slice(-2) + ':' + ('0' + m).slice(-2);
 }
 
+/**
+ * ★厳格版：移動元・移動先のどちらにも「15分たりとも部分的医師不在（空白時間）」を作らない場合のみ canMove: true を返す
+ */
 function evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEval, masters) {
   const targetBands = timeInfo.targetBands || ['A'];
   const srcDate = normalizeDateYmd1b3_(srcRow[0]);
   const srcClinic = cleanClinicBaseName_(srcRow[2]);
   const isKitakasai = srcClinic.includes('北葛西');
   const allRowTextHint = [srcRow[7], srcRow[8], srcRow[9]].join(' / ');
+  const bqMap = (masters && masters.bqExactIntervalsMap) ? masters.bqExactIntervalsMap : null;
+
+  const getBqIntervals = function(dKey) {
+    if (!bqMap || !srcDate || !srcClinic || !dKey) return null;
+    return bqMap.get(srcDate + '|' + srcClinic + '|' + dKey) || null;
+  };
 
   const countByBand = {
     'A': Number(srcRow[4] || 0),
@@ -133,6 +206,7 @@ function evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEv
     'C': rawTokensByBand['C'].map(normKeyForDoc_)
   };
 
+  // 1. 終日通し勤務（A・B・Cすべて在席）、または対象外の他帯にも勤務がある医師を分断する移動は原則ブロック
   const inA = docsByBand['A'].includes(docKey);
   const inB = docsByBand['B'].includes(docKey);
   const inC = docsByBand['C'].includes(docKey);
@@ -140,8 +214,38 @@ function evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEv
     return { canMove: false, conditionNote: '' };
   }
 
-  const conditionNotes = [];
+  const movingBqIvs = getBqIntervals(docKey);
+  if (Array.isArray(movingBqIvs)) {
+    const spansFullDayInBq = movingBqIvs.some(function(iv) { return iv.startMin <= 600 && iv.endMin >= 1200; });
+    if (spansFullDayInBq) {
+      return { canMove: false, conditionNote: '' };
+    }
+  }
 
+  // 2. 対象バンド外（例：午前移動なのに午後・夜間も入っている等）のチェック
+  const allBands = ['A', 'B', 'C'];
+  for (let i = 0; i < allBands.length; i++) {
+    const b = allBands[i];
+    if (targetBands.includes(b)) continue;
+    if (!docsByBand[b].includes(docKey)) continue;
+
+    // B(午後)とC(夜間)が連続しているシフトの片方引き抜きは不可
+    if ((b === 'C' && targetBands.includes('B')) || (b === 'B' && targetBands.includes('C'))) {
+      return { canMove: false, conditionNote: '' };
+    }
+    // A(午前)とC(夜間)の両方に入っている場合（通し・中抜け）の片方引き抜きも不可
+    if ((b === 'C' && targetBands.includes('A')) || (b === 'A' && targetBands.includes('C'))) {
+      return { canMove: false, conditionNote: '' };
+    }
+    // A(午前)とB(午後)の両方に入っている場合は、昼休みに移動可能な近隣（SまたはAかつ移動45分以内）のみ許可
+    if ((b === 'A' && targetBands.includes('B')) || (b === 'B' && targetBands.includes('A'))) {
+      if (pairEval.estMinutes > 45 || (pairEval.rank !== 'S' && pairEval.rank !== 'A')) {
+        return { canMove: false, conditionNote: '' };
+      }
+    }
+  }
+
+  // 3. 対象バンドごとの「移動先のフルカバー」＆「移動元の部分不在ゼロ」厳密チェック
   for (let i = 0; i < targetBands.length; i++) {
     const tb = targetBands[i];
     if (countByBand[tb] < 2 || !docsByBand[tb].includes(docKey)) {
@@ -150,7 +254,7 @@ function evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEv
 
     const tokens = rawTokensByBand[tb];
     const bandFullStart = tb === 'A' ? 540 : (tb === 'B' ? 900 : 1080);
-    const bandFullEnd = tb === 'A' ? 780 : (tb === 'B' ? 1080 : (isKitakasai ? 1200 : 1260));
+    const bandFullEnd = tb === 'A' ? (isKitakasai ? 750 : 780) : (tb === 'B' ? 1080 : (isKitakasai ? 1200 : 1260));
 
     let movingDocTok = null;
     const remainingTokens = [];
@@ -166,23 +270,30 @@ function evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEv
       return { canMove: false, conditionNote: '' };
     }
 
-    const movingHours = parseDocTokenWorkingMinutes1b3_(movingDocTok, tb, isKitakasai, allRowTextHint);
+    // ★チェックA：移動する医師本人が、移動先の要求時間帯（例：板橋 09:00-13:00）を1分も欠けずフルカバーしているか？
+    // （例：上春先生が11:00-13:00勤務なら rawStartMin=660 > reqStart=540 となり、09:00-11:00が不在になるためここで即ブロック！）
+    const movingHours = parseDocTokenWorkingMinutes1b3_(movingDocTok, tb, isKitakasai, allRowTextHint, movingBqIvs);
     const reqStart = Math.max(bandFullStart, timeInfo.startMin);
     const reqEnd = Math.min(bandFullEnd, timeInfo.endMin);
     if (movingHours.rawStartMin > reqStart || movingHours.rawEndMin < reqEnd) {
       return { canMove: false, conditionNote: '' };
     }
 
+    // 移動する医師が帯を跨ぐ変則シフト（例：11:00-15:00、14:00-19:00 等）の場合も分断不可
     if (movingHours.hasCustomTime) {
-      if (tb === 'A' && movingHours.rawEndMin > 780) return { canMove: false, conditionNote: '' };
-      if (tb === 'B' && (movingHours.rawStartMin < 900 || movingHours.rawEndMin > 1080)) return { canMove: false, conditionNote: '' };
-      if (tb === 'C' && movingHours.rawStartMin < 1080) return { canMove: false, conditionNote: '' };
+      if (tb === 'A' && movingHours.rawEndMin > 780 && !targetBands.includes('B')) return { canMove: false, conditionNote: '' };
+      if (tb === 'B' && ((movingHours.rawStartMin < 900 && !targetBands.includes('A')) || (movingHours.rawEndMin > 1080 && !targetBands.includes('C')))) {
+        return { canMove: false, conditionNote: '' };
+      }
+      if (tb === 'C' && movingHours.rawStartMin < 1080 && !targetBands.includes('B')) return { canMove: false, conditionNote: '' };
     }
 
     const validRemainingTokens = remainingTokens.filter(function(remTok) {
       const remKey = normKeyForDoc_(remTok);
       if (tb === 'A' && docsByBand['A'].includes(remKey) && docsByBand['B'].includes(remKey) && docsByBand['C'].includes(remKey)) {
-        if (!/09:00|9:00/.test(remTok)) return false;
+        const remIvs = getBqIntervals(remKey);
+        const startsAtNineInBq = Array.isArray(remIvs) && remIvs.some(function(iv) { return iv.startMin <= 540; });
+        if (!/09:00|9:00/.test(remTok) && !startsAtNineInBq) return false;
       }
       return true;
     });
@@ -191,13 +302,12 @@ function evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEv
       return { canMove: false, conditionNote: '' };
     }
 
-    let uncoveredStartMin = null;
-    let uncoveredEndMin = null;
-
+    // ★チェックB：移動元の拠点（例：南浦和）で、残る医師だけでバンド全域（09:00-13:00等）を15分刻みすべて隙間なくカバーできているか？
+    // 15分でも医師0人の時間帯（部分的医師不在）が生じる場合は、即座に canMove: false で除外する！
     for (let tMin = bandFullStart; tMin < bandFullEnd; tMin += 15) {
       const coveredAtT = validRemainingTokens.some(function(remTok) {
         const remKey = normKeyForDoc_(remTok);
-        const remHours = parseDocTokenWorkingMinutes1b3_(remTok, tb, isKitakasai, allRowTextHint);
+        const remHours = parseDocTokenWorkingMinutes1b3_(remTok, tb, isKitakasai, allRowTextHint, getBqIntervals(remKey));
         if (!remHours.hasCustomTime && tb === 'C' && docsByBand['B'].includes(remKey) && !docsByBand['A'].includes(remKey)) {
           return remHours.startMin <= tMin && 1200 >= (tMin + 15);
         }
@@ -205,66 +315,6 @@ function evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEv
       });
 
       if (!coveredAtT) {
-        if (uncoveredStartMin === null) uncoveredStartMin = tMin;
-        uncoveredEndMin = tMin + 15;
-      }
-    }
-
-    if (uncoveredStartMin !== null) {
-      const gapDuration = uncoveredEndMin - uncoveredStartMin;
-      if (gapDuration > 90) {
-        return { canMove: false, conditionNote: '' };
-      }
-
-      let bridgeDocFound = null;
-      validRemainingTokens.forEach(function(remTok) {
-        if (bridgeDocFound) return;
-        const remKey = normKeyForDoc_(remTok);
-        const remDisp = cleanDisplayDoctorName1b3_(remTok);
-        if (!remKey || !remDisp) return;
-        if (masters && masters.absoluteNgDocSet && masters.absoluteNgDocSet.has(remKey)) return;
-
-        // 残存医がその日にメール等で延長不可になっていないかも確認
-        if (masters && masters.dateMailConstraintsMap && srcDate) {
-          const dc = masters.dateMailConstraintsMap.get(srcDate + '_' + remKey);
-          if (dc && (dc.noExtend || bandFullEnd > dc.maxEndMin)) return;
-        }
-
-        const isFt = !remTok.includes('非常勤') && remTok.includes('常勤') && !remTok.includes('所定休出');
-        if (isFt) return;
-
-        const remHours = parseDocTokenWorkingMinutes1b3_(remTok, tb, isKitakasai, allRowTextHint);
-        const effectiveEnd = (!remHours.hasCustomTime && tb === 'C' && docsByBand['B'].includes(remKey) && !docsByBand['A'].includes(remKey))
-          ? 1200
-          : remHours.endMin;
-
-        if (uncoveredEndMin === bandFullEnd && effectiveEnd === uncoveredStartMin) {
-          bridgeDocFound = remDisp + '先生へ' + formatMinToHm1b3_(bandFullEnd) + 'まで延長打診を確認後';
-        } else if (uncoveredStartMin === bandFullStart && remHours.startMin === uncoveredEndMin && !(docsByBand['A'].includes(remKey) && docsByBand['B'].includes(remKey) && docsByBand['C'].includes(remKey))) {
-          bridgeDocFound = remDisp + '先生へ' + formatMinToHm1b3_(bandFullStart) + 'から早出打診を確認後';
-        }
-      });
-
-      if (!bridgeDocFound) {
-        return { canMove: false, conditionNote: '' };
-      }
-      conditionNotes.push(bridgeDocFound);
-    }
-  }
-
-  const allBands = ['A', 'B', 'C'];
-  for (let i = 0; i < allBands.length; i++) {
-    const b = allBands[i];
-    if (targetBands.includes(b)) continue;
-    if (!docsByBand[b].includes(docKey)) continue;
-
-    if ((b === 'C' && targetBands.includes('B')) || (b === 'B' && targetBands.includes('C'))) {
-      return { canMove: false, conditionNote: '' };
-    }
-
-    if ((b === 'A' && targetBands.includes('B')) || (b === 'B' && targetBands.includes('A'))) {
-      if (countByBand[b] < 2) return { canMove: false, conditionNote: '' };
-      if (pairEval.estMinutes > 60 || (pairEval.rank !== 'S' && pairEval.rank !== 'A')) {
         return { canMove: false, conditionNote: '' };
       }
     }
@@ -272,11 +322,11 @@ function evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEv
 
   return {
     canMove: true,
-    conditionNote: conditionNotes.join('・')
+    conditionNote: ''
   };
 }
 
 function canDoctorLeaveSourceWithoutCreatingAbsence_(docKey, srcRow, timeInfo, pairEval, masters) {
   const res = evaluateDoctorLeaveSourceCondition1b3_(docKey, srcRow, timeInfo, pairEval, masters);
-  return res.canMove && !res.conditionNote;
+  return res.canMove;
 }
