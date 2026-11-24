@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6a_編集くん64_マスタと整形.gs
- * （モーダル大画面化1440x920・異体字/漢字ブレ強化・地域ソート［東京➔神奈川➔千葉・茨城➔埼玉➔大阪］対応版）
+ * （モーダル大画面化1440x920・マスタ30分キャッシュ高速化・異体字強化・地域ソート対応・完全版）
  * ============================================================================
  */
 
@@ -228,7 +228,7 @@ function loadDoctorSearchList64_(ss) {
 }
 
 /**
- * ★地域ソート順の共通定義：
+ * 地域ソート順の共通定義：
  * 1:東京 ➔ 2:神奈川 ➔ 3:千葉・茨城（千葉3, 茨城4） ➔ 5:埼玉 ➔ 6:大阪(関西)
  */
 function getRegionSortRank64_(groupOrArea) {
@@ -243,6 +243,23 @@ function getRegionSortRank64_(groupOrArea) {
 }
 
 function loadClinicAndStaffMasters64_(ss) {
+  const cache = CacheService.getScriptCache();
+  const cachedMetaRaw = cache.get('HENSHUKUN_CLINIC_STAFF_META_V1');
+
+  if (cachedMetaRaw) {
+    try {
+      const parsed = JSON.parse(cachedMetaRaw);
+      const restoredMap = new Map(parsed.clinicEntries || []);
+      return {
+        clinicMap: restoredMap,
+        groups: parsed.groups || [],
+        areaToGroups: parsed.areaToGroups || { '関東': [], '関西': [] },
+        staffList: parsed.staffList || [],
+        doctorSearchList: loadDoctorSearchList64_(ss)
+      };
+    } catch (e) {}
+  }
+
   const clinicMap = new Map();
   const groupSet = new Set();
   const areaToGroups = { '関東': [], '関西': [] };
@@ -265,7 +282,6 @@ function loadClinicAndStaffMasters64_(ss) {
     }
   }
 
-  // 上部の「📍 地域(複数可)」チップも「東京 ➔ 神奈川 ➔ 千葉 ➔ 茨城 ➔ 埼玉 ➔ 大阪」順に整列
   const sortGroupsFn = function(a, b) {
     return getRegionSortRank64_(a) - getRegionSortRank64_(b) || String(a).localeCompare(String(b), 'ja');
   };
@@ -296,6 +312,15 @@ function loadClinicAndStaffMasters64_(ss) {
     } catch (e) {}
   }
   staffList.sort(function(a, b) { return a.localeCompare(b, 'ja'); });
+
+  try {
+    cache.put('HENSHUKUN_CLINIC_STAFF_META_V1', JSON.stringify({
+      clinicEntries: Array.from(clinicMap.entries()),
+      groups: sortedGroups,
+      areaToGroups: areaToGroups,
+      staffList: staffList
+    }), 1800);
+  } catch (e) {}
 
   return {
     clinicMap: clinicMap,

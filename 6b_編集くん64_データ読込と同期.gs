@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 6b_編集くん64_データ読込と同期.gs
- * （2重連結文字の自動整形・時間帯一致ドラフト突合・8KB超キャッシュ同期・前回指示済フラグ付与版）
+ * （BQ＋当日シフトからのバックアップ医師完全抽出・2重連結整形・時間帯一致ドラフト突合版）
  * ============================================================================
  */
 
@@ -24,62 +24,100 @@ function dedupeRepeatedDecisionHeader64_(text) {
 
 function extractBackupDoctorsByDate64_(ss, doctorSearchList) {
   const backupDocsByDate = {};
-  const sh = ss.getSheetByName('最新_当日シフト');
-  if (!sh || sh.getLastRow() < 2) return backupDocsByDate;
-
   const docLicMap = new Map();
   (doctorSearchList || []).forEach(function(d) {
     if (d.norm && d.licenseNo) docLicMap.set(d.norm, d.licenseNo);
   });
 
-  const vals = sh.getDataRange().getDisplayValues();
-  for (let r = 1; r < vals.length; r++) {
-    const row = vals[r];
-    const clinicRaw = String(row[2] || '').trim();
-    if (!clinicRaw.includes('バックアップ')) continue;
+  const registerBackupDoc = function(sortDate, band, rawDocName, explicitLic) {
+    if (!sortDate || sortDate === '9999/99/99' || !band) return;
+    const cleanName = String(rawDocName || '')
+      .replace(/[\(（\[【].*$/g, '')
+      .replace(/[:：].*$/, '')
+      .replace(/[\)）\]】★⚠️📩・]/g, '')
+      .replace(/先生$/g, '')
+      .replace(/[\s\u3000]+/g, '')
+      .trim();
+    if (!cleanName || cleanName === '未充足' || cleanName === 'なし' || cleanName === '-') return;
 
-    const sortDate = toSortDateKey64_(row[0]);
-    if (!sortDate || sortDate === '9999/99/99') continue;
+    const norm = toSearchNorm64_(cleanName);
+    if (!norm) return;
+
     if (!backupDocsByDate[sortDate]) {
       backupDocsByDate[sortDate] = { A: [], B: [], C: [] };
     }
+    const bandList = backupDocsByDate[sortDate][band];
+    if (!bandList) return;
 
-    const bandCols = [
-      { band: 'A', text: row[7] },
-      { band: 'B', text: row[8] },
-      { band: 'C', text: row[9] }
-    ];
-
-    bandCols.forEach(function(bc) {
-      const tokens = (typeof splitDoctorTokensSafely_ === 'function')
-        ? splitDoctorTokensSafely_(bc.text)
-        : String(bc.text || '').split(/[,、，\/]+/);
-
-      tokens.forEach(function(tok) {
-        const cleanName = String(tok || '')
-          .replace(/[\(（\[【].*$/g, '')
-          .replace(/[:：].*$/, '')
-          .replace(/[\)）\]】★⚠️📩・]/g, '')
-          .replace(/先生$/g, '')
-          .replace(/[\s\u3000]+/g, '')
-          .trim();
-        if (!cleanName || cleanName === '未充足' || cleanName === 'なし' || cleanName === '-') return;
-
-        const norm = toSearchNorm64_(cleanName);
-        if (!norm) return;
-
-        const bandList = backupDocsByDate[sortDate][bc.band];
-        const exists = bandList.some(function(d) { return d.norm === norm; });
-        if (!exists) {
-          bandList.push({
-            name: cleanName,
-            norm: norm,
-            licenseNo: docLicMap.get(norm) || ''
-          });
-        }
+    const exists = bandList.some(function(d) { return d.norm === norm; });
+    if (!exists) {
+      bandList.push({
+        name: cleanName,
+        norm: norm,
+        licenseNo: explicitLic || docLicMap.get(norm) || ''
       });
-    });
+    }
+  };
+
+  // 1. 『最新_当日シフト』シートからバックアップ枠を抽出
+  const sh = ss.getSheetByName('最新_当日シフト');
+  if (sh && sh.getLastRow() >= 2) {
+    const vals = sh.getDataRange().getDisplayValues();
+    for (let r = 1; r < vals.length; r++) {
+      const row = vals[r];
+      const clinicRaw = String(row[2] || '').trim();
+      if (!clinicRaw.includes('バックアップ')) continue;
+
+      const sortDate = toSortDateKey64_(row[0]);
+      if (!sortDate || sortDate === '9999/99/99') continue;
+
+      const bandCols = [
+        { band: 'A', text: row[7] },
+        { band: 'B', text: row[8] },
+        { band: 'C', text: row[9] }
+      ];
+
+      bandCols.forEach(function(bc) {
+        const tokens = (typeof splitDoctorTokensSafely_ === 'function')
+          ? splitDoctorTokensSafely_(bc.text)
+          : String(bc.text || '').split(/[,、，\/]+/);
+        tokens.forEach(function(tok) {
+          registerBackupDoc(sortDate, bc.band, tok, '');
+        });
+      });
+    }
   }
+
+  // 2. BQ確定シフト（kakutei）からもバックアップ枠を補完抽出（シート側で除外されている場合の保険）
+  if (typeof fetchAndDecryptBqMailForResolver_ === 'function') {
+    try {
+      const bqData = fetchAndDecryptBqMailForResolver_();
+      if (bqData && Array.isArray(bqData.kakutei)) {
+        bqData.kakutei.forEach(function(s) {
+          const st = String(s.st || s.status || '').trim();
+          if (st && (st.includes('キャンセル') || st.includes('取消') || st.includes('却下'))) return;
+          const cRaw = String(s.c || s.clinic || '').trim();
+          if (!cRaw.includes('バックアップ')) return;
+
+          const sortDate = toSortDateKey64_(s.d || s.date);
+          if (!sortDate || sortDate === '9999/99/99') return;
+
+          const rawT = String(s.t || s.iv || s.time || s.workTime || '').normalize('NFKC').trim();
+          const tm = rawT.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
+          if (!tm) return;
+
+          const startMin = Number(tm[1]) * 60 + Number(tm[2]);
+          const endMin = Number(tm[3]) * 60 + Number(tm[4]);
+          const lic = String(s.id || '').trim();
+
+          if (startMin < 780 && endMin > 540) registerBackupDoc(sortDate, 'A', s.n || s.name, lic);
+          if (startMin < 1080 && endMin > 900) registerBackupDoc(sortDate, 'B', s.n || s.name, lic);
+          if (startMin < 1260 && endMin > 1080) registerBackupDoc(sortDate, 'C', s.n || s.name, lic);
+        });
+      }
+    } catch (e) {}
+  }
+
   return backupDocsByDate;
 }
 
