@@ -1,8 +1,7 @@
 /**
  * ============================================================================
  * 7c1_2_編集くん64_初期化とフィルタ制御.gs（7c1系 2分割の2）
- * ・初期データ読込（initStudio64・エラー可視化ガード付）・ハートビート同期・作業者ロック管理
- * ・3択表示フィルタ［📋全枠 / 🎯要対応のみ / 📨前回指示済］・並び順切替・地域チップ・日付タブ制御
+ * ・保存/反映通信中のハートビート自動一時停止ガード（state.isBusySaving）搭載版
  * ============================================================================
  */
 
@@ -19,6 +18,7 @@ function getHenshukun64ScriptPart1b_() {
     '};',
     '',
     'function reloadAllData() {',
+    '  if (state.isBusySaving) return;',
     '  setStatus("⏳ データを読み込んでいます...", "#ffc72c");',
     '  google.script.run',
     '    .withSuccessHandler(initStudio64)',
@@ -148,9 +148,11 @@ function getHenshukun64ScriptPart1b_() {
     '}',
     '',
     'function sendHeartbeat64() {',
-    '  if (!state.sessionId) return;',
+    '  // ★保存・ドキュメント反映・提出の通信中はハートビートをスキップしてリソース競合をゼロにする',
+    '  if (!state.sessionId || state.isBusySaving) return;',
     '  google.script.run',
     '    .withSuccessHandler(function(res) {',
+    '      if (state.isBusySaving) return;',
     '      if (!res.ok && res.conflictStaff) {',
     '        alert("⚠️ 「" + res.conflictStaff + "」さんは現在別画面で作業中のためブロックされています！");',
     '        state.myStaff = "";',

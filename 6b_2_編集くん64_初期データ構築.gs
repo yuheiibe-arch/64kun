@@ -1,125 +1,10 @@
 /**
  * ============================================================================
- * 6b_編集くん64_データ読込と同期.gs
- * （BQ＋当日シフトからのバックアップ医師完全抽出・2重連結整形・時間帯一致ドラフト突合版）
+ * 6b_2_編集くん64_初期データ構築.gs（6b系 3分割の2）
+ * ・Googleドキュメント走査・募集枠時間反映・提出済み台帳照合・一時保存ドラフト突合
+ * ・地域順ソート（東京➔神奈川➔千葉➔茨城➔埼玉➔大阪）＆初期データ返却（getHenshukunInitialData）
  * ============================================================================
  */
-
-function extractSlotTimeRange64_(str) {
-  const m = String(str || '').match(/(\d{1,2}:\d{2}\s*[\-〜～~]\s*\d{1,2}:\d{2})/);
-  return m ? m[1].replace(/\s+/g, '').replace(/[〜～~]/g, '-') : String(str || '').trim();
-}
-
-function dedupeRepeatedDecisionHeader64_(text) {
-  let s = String(text || '').trim();
-  if (!s || s.length < 6) return s;
-  const half = Math.floor(s.length / 2);
-  if (s.length % 2 === 0 && s.slice(0, half) === s.slice(half)) {
-    return s.slice(0, half).trim();
-  }
-  const spaceDup = s.match(/^(.{4,}?)\s+\1$/);
-  if (spaceDup) return spaceDup[1].trim();
-  return s;
-}
-
-function extractBackupDoctorsByDate64_(ss, doctorSearchList) {
-  const backupDocsByDate = {};
-  const docLicMap = new Map();
-  (doctorSearchList || []).forEach(function(d) {
-    if (d.norm && d.licenseNo) docLicMap.set(d.norm, d.licenseNo);
-  });
-
-  const registerBackupDoc = function(sortDate, band, rawDocName, explicitLic) {
-    if (!sortDate || sortDate === '9999/99/99' || !band) return;
-    const cleanName = String(rawDocName || '')
-      .replace(/[\(（\[【].*$/g, '')
-      .replace(/[:：].*$/, '')
-      .replace(/[\)）\]】★⚠️📩・]/g, '')
-      .replace(/先生$/g, '')
-      .replace(/[\s\u3000]+/g, '')
-      .trim();
-    if (!cleanName || cleanName === '未充足' || cleanName === 'なし' || cleanName === '-') return;
-
-    const norm = toSearchNorm64_(cleanName);
-    if (!norm) return;
-
-    if (!backupDocsByDate[sortDate]) {
-      backupDocsByDate[sortDate] = { A: [], B: [], C: [] };
-    }
-    const bandList = backupDocsByDate[sortDate][band];
-    if (!bandList) return;
-
-    const exists = bandList.some(function(d) { return d.norm === norm; });
-    if (!exists) {
-      bandList.push({
-        name: cleanName,
-        norm: norm,
-        licenseNo: explicitLic || docLicMap.get(norm) || ''
-      });
-    }
-  };
-
-  // 1. 『最新_当日シフト』シートからバックアップ枠を抽出
-  const sh = ss.getSheetByName('最新_当日シフト');
-  if (sh && sh.getLastRow() >= 2) {
-    const vals = sh.getDataRange().getDisplayValues();
-    for (let r = 1; r < vals.length; r++) {
-      const row = vals[r];
-      const clinicRaw = String(row[2] || '').trim();
-      if (!clinicRaw.includes('バックアップ')) continue;
-
-      const sortDate = toSortDateKey64_(row[0]);
-      if (!sortDate || sortDate === '9999/99/99') continue;
-
-      const bandCols = [
-        { band: 'A', text: row[7] },
-        { band: 'B', text: row[8] },
-        { band: 'C', text: row[9] }
-      ];
-
-      bandCols.forEach(function(bc) {
-        const tokens = (typeof splitDoctorTokensSafely_ === 'function')
-          ? splitDoctorTokensSafely_(bc.text)
-          : String(bc.text || '').split(/[,、，\/]+/);
-        tokens.forEach(function(tok) {
-          registerBackupDoc(sortDate, bc.band, tok, '');
-        });
-      });
-    }
-  }
-
-  // 2. BQ確定シフト（kakutei）からもバックアップ枠を補完抽出（シート側で除外されている場合の保険）
-  if (typeof fetchAndDecryptBqMailForResolver_ === 'function') {
-    try {
-      const bqData = fetchAndDecryptBqMailForResolver_();
-      if (bqData && Array.isArray(bqData.kakutei)) {
-        bqData.kakutei.forEach(function(s) {
-          const st = String(s.st || s.status || '').trim();
-          if (st && (st.includes('キャンセル') || st.includes('取消') || st.includes('却下'))) return;
-          const cRaw = String(s.c || s.clinic || '').trim();
-          if (!cRaw.includes('バックアップ')) return;
-
-          const sortDate = toSortDateKey64_(s.d || s.date);
-          if (!sortDate || sortDate === '9999/99/99') return;
-
-          const rawT = String(s.t || s.iv || s.time || s.workTime || '').normalize('NFKC').trim();
-          const tm = rawT.match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
-          if (!tm) return;
-
-          const startMin = Number(tm[1]) * 60 + Number(tm[2]);
-          const endMin = Number(tm[3]) * 60 + Number(tm[4]);
-          const lic = String(s.id || '').trim();
-
-          if (startMin < 780 && endMin > 540) registerBackupDoc(sortDate, 'A', s.n || s.name, lic);
-          if (startMin < 1080 && endMin > 900) registerBackupDoc(sortDate, 'B', s.n || s.name, lic);
-          if (startMin < 1260 && endMin > 1080) registerBackupDoc(sortDate, 'C', s.n || s.name, lic);
-        });
-      }
-    } catch (e) {}
-  }
-
-  return backupDocsByDate;
-}
 
 function getHenshukunInitialData() {
   const props = PropertiesService.getScriptProperties();
@@ -130,7 +15,10 @@ function getHenshukunInitialData() {
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const masters = loadClinicAndStaffMasters64_(ss);
-  const backupDocsByDate = extractBackupDoctorsByDate64_(ss, masters.doctorSearchList);
+  const bkAndRecruit = extractBackupAndRecruitSlots64_(ss, masters.doctorSearchList);
+  const backupDocsByDate = bkAndRecruit.backupDocsByDate;
+  const recruitSlotsMap = bkAndRecruit.recruitSlotsMap;
+
   const submittedLedgerMap = (typeof loadSubmittedLedgerMap4_3_ === 'function')
     ? loadSubmittedLedgerMap4_3_(ss)
     : new Map();
@@ -209,9 +97,17 @@ function getHenshukunInitialData() {
           const lines1 = Array.from(new Set(col1.split('\n').map(function(s) { return s.trim(); }).filter(Boolean)));
           const rawClinicTitle = lines1[0] || '';
           const clinicTitle = formatClinicTitle64_(rawClinicTitle);
-          const timeAndWage = lines1.slice(1).join(' ') || '';
-          const rowTimeRange = extractSlotTimeRange64_(timeAndWage);
+          const origTimeAndWage = lines1.slice(1).join(' ') || '';
+          const rowTimeRange = extractSlotTimeRange64_(origTimeAndWage);
           const meta = resolveClinicMeta64_(rawClinicTitle, masters.clinicMap);
+
+          const recruitResolved = resolveRecruitDisplayTimeAndWage64_(
+            sortDate, meta.name, rawClinicTitle, origTimeAndWage, recruitSlotsMap
+          );
+          const timeAndWage = recruitResolved.displayTimeAndWage;
+          if (recruitResolved.rawAbsenceNote && !col2.includes('📌募集枠:')) {
+            col2 = col2 ? (col2 + '\n' + recruitResolved.rawAbsenceNote) : recruitResolved.rawAbsenceNote;
+          }
 
           const carryKey = getSlotCarryOverKey3_(sortDate, rawClinicTitle, timeAndWage);
           const subStatus = (typeof evaluateRowSubmittedStatusFor64_ === 'function')
@@ -226,7 +122,8 @@ function getHenshukunInitialData() {
           let draftItem = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
           if (draftItem) {
             const clinicMismatch = draftItem.clinicTitle && draftItem.clinicTitle !== clinicTitle;
-            const timeMismatch = draftItem.timeAndWage && rowTimeRange && extractSlotTimeRange64_(draftItem.timeAndWage) !== rowTimeRange;
+            const draftRange = extractSlotTimeRange64_(draftItem.timeAndWage);
+            const timeMismatch = draftRange && rowTimeRange && !isTimeRangeOverlapping64_(draftRange, rowTimeRange);
             if (clinicMismatch || timeMismatch) {
               draftItem = null;
             }
@@ -236,8 +133,9 @@ function getHenshukunInitialData() {
             const fallbackHits = allDraftSlotEntries.filter(function(d) {
               if (!d.dateLabel || toSortDateKey64_(d.dateLabel) !== sortDate) return false;
               if (d.clinicTitle !== clinicTitle) return false;
-              if (d.timeAndWage && rowTimeRange) {
-                return extractSlotTimeRange64_(d.timeAndWage) === rowTimeRange;
+              const dRange = extractSlotTimeRange64_(d.timeAndWage);
+              if (dRange && rowTimeRange) {
+                return isTimeRangeOverlapping64_(dRange, rowTimeRange);
               }
               return true;
             });
@@ -329,55 +227,5 @@ function getHenshukunInitialData() {
     slotRows: slotRows,
     bundleRows: bundleRows,
     activeLocks: activeLocks
-  };
-}
-
-function getActivePlayerLocks64_() {
-  const cache = CacheService.getScriptCache();
-  const raw = cache.get(HENSHUKUN_CONFIG.ACTIVE_USERS_CACHE_KEY);
-  if (!raw) return {};
-  try {
-    const obj = JSON.parse(raw);
-    const now = Date.now();
-    const valid = {};
-    Object.keys(obj).forEach(function(sessionId) {
-      if (now - obj[sessionId].ts < HENSHUKUN_CONFIG.ACTIVE_USER_TTL_SEC * 1000) {
-        valid[sessionId] = obj[sessionId];
-      }
-    });
-    return valid;
-  } catch (e) {
-    return {};
-  }
-}
-
-function heartbeatHenshukunPlayer(sessionId, staffName) {
-  const cache = CacheService.getScriptCache();
-  const locks = getActivePlayerLocks64_();
-
-  if (staffName) {
-    for (const [sid, info] of Object.entries(locks)) {
-      if (sid !== sessionId && info.staff === staffName) {
-        return { ok: false, conflictStaff: staffName, activeLocks: locks };
-      }
-    }
-    locks[sessionId] = { staff: staffName, ts: Date.now() };
-  } else {
-    delete locks[sessionId];
-  }
-
-  cache.put(HENSHUKUN_CONFIG.ACTIVE_USERS_CACHE_KEY, JSON.stringify(locks), 120);
-
-  const props = PropertiesService.getScriptProperties();
-  const docId = props.getProperty('SINGLE_MTG_DOC_ID');
-  let latestDraft = null;
-  if (docId) {
-    latestDraft = loadLatestDraft64_(SpreadsheetApp.getActiveSpreadsheet(), docId);
-  }
-
-  return {
-    ok: true,
-    activeLocks: locks,
-    latestDraft: latestDraft
   };
 }
