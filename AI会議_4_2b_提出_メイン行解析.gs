@@ -2,7 +2,7 @@
  * ============================================================================
  * AI会議_4_2b_提出_メイン行解析.gs（3分割の2）
  * ・不在枠テーブル1行分の提出データ生成（parseEditedDocTableRow_）
- * ・承諾/充足枠スキップ・辞退医除外・バックアップ医割当・案1〜3＆カスタム結合対応
+ * ・★対策案A：医師名なしの「個別打診（下流で候補自動抽出）」を正式提出アイテムとして出力
  * ============================================================================
  */
 
@@ -71,7 +71,6 @@ function resolveChosenActionStrings4_2_(dec, strippedDec, planMap) {
   tokens.forEach(function(tok) {
     if (isStayOrSkipDecision4_2_(tok)) return;
 
-    // 1) 「案1」「案2(① / ②両方)」「案2（②灘理絵先生）」の厳密一致
     const specMatch = tok.match(/^(?:【?案)?\s*([123１２３])(?:】)?(?:\s*[（\(]([^）\)]+)[）\)])?$/);
     if (specMatch) {
       const num = specMatch[1].replace(/[１２３]/g, function(s) { return String.fromCharCode(s.charCodeAt(0) - 0xFEE0); });
@@ -89,7 +88,6 @@ function resolveChosenActionStrings4_2_(dec, strippedDec, planMap) {
       return;
     }
 
-    // 2) 「案1案2」のように連続表記されたケース
     const multiNums = tok.match(/案\s*([123１２３])/g);
     if (multiNums && tok.replace(/案\s*[123１２３]|[\s、,・と]/g, '') === '') {
       multiNums.forEach(function(mn) {
@@ -99,7 +97,6 @@ function resolveChosenActionStrings4_2_(dec, strippedDec, planMap) {
       return;
     }
 
-    // 3) 「案3 花輪和先生へ相談」「案 2向瀬先生へ延長打診」のように案番号＋テキストが書かれたケース
     const planWithCustom = tok.match(/^(?:【?案\s*([123１２３])】?)\s*(.+)$/);
     if (planWithCustom) {
       const pNum = planWithCustom[1].replace(/[１２３]/g, function(s) { return String.fromCharCode(s.charCodeAt(0) - 0xFEE0); });
@@ -112,7 +109,6 @@ function resolveChosenActionStrings4_2_(dec, strippedDec, planMap) {
       return;
     }
 
-    // 4) 純粋なカスタム手入力
     chosenActionStrings.push({ label: 'カスタム指示', text: tok, specifiedDoc: '' });
   });
 
@@ -132,7 +128,6 @@ function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assi
   const arrowLines = separated.arrowLines;
   let commentText = String(customComment || '').replace(/\r\n|\r/g, ' ').trim();
 
-  // 既に「⭕承諾」または「⭕応募あり充足」となっている枠は再打診不要のためスキップ
   const isSlotAlreadyAccepted = arrowLines.some(function(l) {
     return l.includes('⭕') && (l.includes('承諾') || l.includes('充足'));
   });
@@ -140,7 +135,6 @@ function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assi
     return [];
   }
 
-  // この枠で「❌辞退」となっている医師キーを収集
   const declinedDocKeys = new Set();
   arrowLines.forEach(function(l) {
     if (!l.includes('❌') && !l.includes('辞退')) return;
@@ -194,6 +188,29 @@ function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assi
 
   if (dec.indexOf('バックアップ医師に勤務依頼') === 0) {
     return [buildBackupSubmitItem4_2_(Object.assign({}, backupBaseParams, { extraNote: '' }))];
+  }
+
+  // ★対策案A：「個別打診（下流で候補自動抽出）」が選択または入力された場合、target_doctor: '' で下流へ送信する
+  if (/^(?:個別打診|個別アプローチ)(?:[\s（\(].*?[）\)])?$/.test(dec)) {
+    return [{
+      date: dateStr,
+      clinic_name: clinicName,
+      raw_clinic_name: clinicName,
+      department: dept,
+      target_time: targetTime,
+      time_category: '',
+      approach_type: '個別アプローチ',
+      target_doctor: '',
+      license_no: '',
+      is_full_time: false,
+      from_clinic: '',
+      is_special_wage: isSpecialWage,
+      special_wage_addon: spWageAddonLabel,
+      assignee: cleanAssignee,
+      memo: commentText,
+      comment: commentText,
+      evidence: '[ドキュメント確定:個別打診(候補自動抽出)] ' + clinicName + ' ' + targetTime + memoSuffix
+    }];
   }
 
   const strippedDec = dec.replace(/[（\(][^）\)]*[）\)]/g, '').trim();
@@ -283,14 +300,18 @@ function parseEditedDocTableRow_(dateStr, col1Text, col2Text, decisionText, assi
     }
 
     parsedList.forEach(function(p) {
-      if (!p.doctorName && (actionObj.label === 'カスタム指示' || actionObj.label.includes('カスタム'))) return;
+      // カスタム入力でも「個別打診／個別アプローチ」と書かれている場合は医師名空欄（候補自動抽出）として通す
+      const isExplicitIndividualAuto = !p.doctorName && /個別|別アプローチ/.test(workingText);
+      if (!p.doctorName && !isExplicitIndividualAuto && (actionObj.label === 'カスタム指示' || actionObj.label.includes('カスタム'))) {
+        return;
+      }
       if (p.doctorName && typeof normKeyForDoc_ === 'function' && declinedDocKeys.has(normKeyForDoc_(p.doctorName))) return;
 
       const isFt = isFullTimeChecker ? isFullTimeChecker(p.doctorName, p.licenseNo, workingText) : false;
       results.push({
         date: dateStr, clinic_name: clinicName, raw_clinic_name: clinicName,
         department: dept, target_time: targetTime, time_category: '',
-        approach_type: p.approachType, target_doctor: p.doctorName, license_no: p.licenseNo || '',
+        approach_type: p.approachType, target_doctor: p.doctorName || '', license_no: p.licenseNo || '',
         is_full_time: isFt, from_clinic: p.fromClinic,
         is_special_wage: isSpecialWage, special_wage_addon: spWageAddonLabel,
         assignee: cleanAssignee, memo: autoCondMemo, comment: autoCondMemo,

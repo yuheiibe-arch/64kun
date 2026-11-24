@@ -1,9 +1,26 @@
 /**
  * ============================================================================
  * 6b_編集くん64_データ読込と同期.gs
- * （提出済み台帳による「前回指示済フラグ」付与・地域順ソート・案1〜案3改行整形版）
+ * （2重連結文字の自動整形・時間帯一致ドラフト突合・8KB超キャッシュ同期・前回指示済フラグ付与版）
  * ============================================================================
  */
+
+function extractSlotTimeRange64_(str) {
+  const m = String(str || '').match(/(\d{1,2}:\d{2}\s*[\-〜～~]\s*\d{1,2}:\d{2})/);
+  return m ? m[1].replace(/\s+/g, '').replace(/[〜～~]/g, '-') : String(str || '').trim();
+}
+
+function dedupeRepeatedDecisionHeader64_(text) {
+  let s = String(text || '').trim();
+  if (!s || s.length < 6) return s;
+  const half = Math.floor(s.length / 2);
+  if (s.length % 2 === 0 && s.slice(0, half) === s.slice(half)) {
+    return s.slice(0, half).trim();
+  }
+  const spaceDup = s.match(/^(.{4,}?)\s+\1$/);
+  if (spaceDup) return spaceDup[1].trim();
+  return s;
+}
 
 function extractBackupDoctorsByDate64_(ss, doctorSearchList) {
   const backupDocsByDate = {};
@@ -85,6 +102,7 @@ function getHenshukunInitialData() {
   const numChildren = body.getNumChildren();
 
   const draftMap = loadLatestDraft64_(ss, docId);
+  const allDraftSlotEntries = Object.values(draftMap.slots || {});
 
   let currentDateRaw = '';
   const slotRows = [];
@@ -133,7 +151,7 @@ function getHenshukunInitialData() {
             if (s.startsWith('→')) decArrowLines.push(s);
             else decHeaderLines.push(s);
           });
-          const rawDocDec = decHeaderLines.join(' ').trim();
+          const rawDocDec = dedupeRepeatedDecisionHeader64_(decHeaderLines.join(' ').trim());
 
           if (decArrowLines.length > 0) {
             const statusDisplay = decArrowLines.map(function(a) {
@@ -146,7 +164,7 @@ function getHenshukunInitialData() {
           let parsedComment = '';
           const cmMatch = parsedDec.match(/^(.*?)\s*[（\(]メモ[：:](.+?)[）\)]$/);
           if (cmMatch) {
-            parsedDec = cmMatch[1].trim();
+            parsedDec = dedupeRepeatedDecisionHeader64_(cmMatch[1].trim());
             parsedComment = cmMatch[2].trim();
           }
 
@@ -154,6 +172,7 @@ function getHenshukunInitialData() {
           const rawClinicTitle = lines1[0] || '';
           const clinicTitle = formatClinicTitle64_(rawClinicTitle);
           const timeAndWage = lines1.slice(1).join(' ') || '';
+          const rowTimeRange = extractSlotTimeRange64_(timeAndWage);
           const meta = resolveClinicMeta64_(rawClinicTitle, masters.clinicMap);
 
           const carryKey = getSlotCarryOverKey3_(sortDate, rawClinicTitle, timeAndWage);
@@ -167,13 +186,33 @@ function getHenshukunInitialData() {
 
           const slotKey = i + '_' + r;
           let draftItem = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
-          if (draftItem && draftItem.clinicTitle && draftItem.clinicTitle !== clinicTitle) {
-            draftItem = null;
+          if (draftItem) {
+            const clinicMismatch = draftItem.clinicTitle && draftItem.clinicTitle !== clinicTitle;
+            const timeMismatch = draftItem.timeAndWage && rowTimeRange && extractSlotTimeRange64_(draftItem.timeAndWage) !== rowTimeRange;
+            if (clinicMismatch || timeMismatch) {
+              draftItem = null;
+            }
+          }
+
+          if (!draftItem && allDraftSlotEntries.length > 0) {
+            const fallbackHits = allDraftSlotEntries.filter(function(d) {
+              if (!d.dateLabel || toSortDateKey64_(d.dateLabel) !== sortDate) return false;
+              if (d.clinicTitle !== clinicTitle) return false;
+              if (d.timeAndWage && rowTimeRange) {
+                return extractSlotTimeRange64_(d.timeAndWage) === rowTimeRange;
+              }
+              return true;
+            });
+            if (fallbackHits.length === 1) {
+              draftItem = fallbackHits[0];
+            }
           }
 
           const cleanDraftDec = draftItem
-            ? String(draftItem.decision || '').split(/\r?\n/).filter(function(l) { return !l.trim().startsWith('→'); }).join(' ').trim()
+            ? dedupeRepeatedDecisionHeader64_(String(draftItem.decision || '').split(/\r?\n/).filter(function(l) { return !l.trim().startsWith('→'); }).join(' ').trim())
             : parsedDec;
+          const cleanDraftAsg = draftItem ? String(draftItem.assignee || '') : docStaff;
+          const cleanDraftCmnt = (draftItem && typeof draftItem.customComment === 'string') ? draftItem.customComment : parsedComment;
 
           slotRows.push({
             slotKey: slotKey,
@@ -192,9 +231,12 @@ function getHenshukunInitialData() {
             origDecision: parsedDec,
             origAssignee: docStaff,
             origComment: parsedComment,
+            draftDecision: cleanDraftDec,
+            draftAssignee: cleanDraftAsg,
+            draftComment: cleanDraftCmnt,
             curDecision: cleanDraftDec,
-            curAssignee: draftItem ? draftItem.assignee : docStaff,
-            customComment: (draftItem && typeof draftItem.customComment === 'string') ? draftItem.customComment : parsedComment,
+            curAssignee: cleanDraftAsg,
+            customComment: cleanDraftCmnt,
             customDocs: (draftItem && Array.isArray(draftItem.customDocs)) ? draftItem.customDocs : [],
             hasDraft: Boolean(draftItem),
             isPreviouslySubmitted: Boolean(subStatus.isPreviouslySubmitted),
@@ -290,11 +332,14 @@ function heartbeatHenshukunPlayer(sessionId, staffName) {
 
   const props = PropertiesService.getScriptProperties();
   const docId = props.getProperty('SINGLE_MTG_DOC_ID');
-  const draftJson = docId ? props.getProperty(HENSHUKUN_CONFIG.DRAFT_PROP_KEY_PREFIX + docId) : null;
+  let latestDraft = null;
+  if (docId) {
+    latestDraft = loadLatestDraft64_(SpreadsheetApp.getActiveSpreadsheet(), docId);
+  }
 
   return {
     ok: true,
     activeLocks: locks,
-    latestDraft: draftJson ? JSON.parse(draftJson) : null
+    latestDraft: latestDraft
   };
 }

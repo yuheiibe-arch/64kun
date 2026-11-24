@@ -1,13 +1,12 @@
 /**
  * ============================================================================
  * 7c3_1_編集くん64_医師検索と行編集.gs
- * （パート3前半：ロック解除トグル・医師検索サジェスト・カスタム入力直結・行編集イベント）
+ * （パート3前半：timeAndWage記録・一時保存行の手動クリア時ゾンビ復活防止・医師検索サジェスト版）
  * ============================================================================
  */
 
 function getHenshukun64ScriptPart3a_() {
   return [
-    '// ★同時間帯・移動競合のロック解除トグル（「AまたはB可能でしょうか？」の選択的交渉を許可）',
     'function toggleConflictUnlock64(slotKey) {',
     '  if (!state.unlockedConflicts) state.unlockedConflicts = {};',
     '  state.unlockedConflicts[slotKey] = !state.unlockedConflicts[slotKey];',
@@ -23,13 +22,11 @@ function getHenshukun64ScriptPart3a_() {
     '  }',
     '}',
     '',
-    '// ★既に特別時給の枠で「さらに加算」のロックを解除・再ロックするトグル',
     'function toggleExtraSpWageUnlock64(slotKey) {',
     '  if (!state.unlockedExtraSpWage) state.unlockedExtraSpWage = {};',
     '  state.unlockedExtraSpWage[slotKey] = !state.unlockedExtraSpWage[slotKey];',
     '  const row = state.slotRows.find(function(r) { return r.slotKey === slotKey; });',
     '  if (row && !state.unlockedExtraSpWage[slotKey]) {',
-    '    // ロックに戻した場合は特別時給交渉タグを外す',
     '    row.curDecision = stripNegotiationSpWageTag64(row.curDecision);',
     '  }',
     '  renderStageTable();',
@@ -74,7 +71,6 @@ function getHenshukun64ScriptPart3a_() {
     '    return;',
     '  }',
     '',
-    '  // ★onmousedown + event.preventDefault() で検索欄のフォーカス外れによるクリック空振りを防止',
     '  drop.innerHTML = matches.map(function(d) {',
     '    const licBadge = d.licenseNo ? "医籍: " + d.licenseNo : "番号未登録";',
     '    const tagBadge = d.tag ? " [" + d.tag + "]" : "";',
@@ -100,7 +96,6 @@ function getHenshukun64ScriptPart3a_() {
     '    state.unlockedConflicts[slotKey] = true;',
     '  }',
     '',
-    '  // ★医師を選択した際、プルダウンを「カスタム入力」・カスタム欄を表示状態に固定したまま反映',
     '  const selEl = document.getElementById("sel_" + slotKey);',
     '  const cbox = document.getElementById("cbox_" + slotKey);',
     '  if (selEl) selEl.value = "カスタム入力";',
@@ -196,7 +191,6 @@ function getHenshukun64ScriptPart3a_() {
     '  if (sel === "") {',
     '    finalDec = "";',
     '  } else if (sel === "カスタム入力") {',
-    '    // ★未入力時は「要検討」ではなく「カスタム入力(医師未選択)」として保持し、プルダウンのリセットを防ぐ',
     '    const cusText = cusInput ? cusInput.value.trim() : "";',
     '    finalDec = cusText || (row.customComment ? "カスタム対応" : "カスタム入力(医師未選択)");',
     '  } else if (sel === "特別時給＋ステイ") {',
@@ -217,7 +211,6 @@ function getHenshukun64ScriptPart3a_() {
     '',
     '  const isStayLike = isStayLikeDecision64(finalDec);',
     '',
-    '  // ★個別交渉時の「💰特別時給で交渉する」チェック状態を反映',
     '  if (finalDec && finalDec !== "要検討" && !finalDec.includes("医師未選択") && !isStayLike) {',
     '    const negChk = document.getElementById("negsp_chk_" + slotKey);',
     '    const negAmt = document.getElementById("negsp_amt_" + slotKey);',
@@ -252,15 +245,15 @@ function getHenshukun64ScriptPart3a_() {
     '  row.curDecision = finalDec;',
     '  row.curAssignee = finalStaff;',
     '',
-    '  const isEdited = (row.curDecision !== row.origDecision) || (row.curAssignee !== row.origAssignee) || ((row.customComment || "") !== (row.origComment || ""));',
-    '  if (isEdited) {',
+    '  if (isRowModifiedFromSaved64(row)) {',
     '    state.changedSlots[slotKey] = {',
     '      decision: finalDec,',
     '      assignee: finalStaff,',
     '      customComment: row.customComment || "",',
     '      customDocs: Array.isArray(row.customDocs) ? row.customDocs : [],',
     '      dateLabel: row.dateLabel,',
-    '      clinicTitle: row.clinicTitle',
+    '      clinicTitle: row.clinicTitle,',
+    '      timeAndWage: row.timeAndWage',
     '    };',
     '  } else {',
     '    delete state.changedSlots[slotKey];',
@@ -303,8 +296,7 @@ function getHenshukun64ScriptPart3a_() {
     '      rTrEl.setAttribute("style", rVs.rowInlineBg);',
     '    }',
     '    if (rRstEl) {',
-    '      const rEd = (r.curDecision !== r.origDecision) || (r.curAssignee !== r.origAssignee) || ((r.customComment || "") !== (r.origComment || ""));',
-    '      rRstEl.style.display = rEd ? "block" : "none";',
+    '      rRstEl.style.display = isRowDiffersFromOrig64(r) ? "block" : "none";',
     '    }',
     '    if (rPlansTd) {',
     '      rPlansTd.innerHTML = formatPlansHtml64(r.col2Plans, r);',

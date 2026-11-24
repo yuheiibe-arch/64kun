@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * AI会議_4_1_ドキュメント提出_メインと集計.gs
- * （50,000文字制限完全回避・常勤判定・「AまたはB選択的打診」と「複数枠おまとめ打診」自動判別・mnys送信メイン）
+ * （『提出済みプラン台帳』自動記録＆差分のみ送信・候補自動抽出対応・50,000文字制限回避版）
  * ============================================================================
  */
 
@@ -74,9 +74,6 @@ function buildFullTimeDoctorChecker_(ss) {
   };
 }
 
-/**
- * 時間帯文字列（例: "15:00-18:00"）から開始分・終了分を返すヘルパー
- */
 function parseTimeMinutesForBundle4_(timeStr) {
   const m = String(timeStr || '').match(/(\d{1,2}):(\d{2})\s*[\-〜～~]\s*(\d{1,2}):(\d{2})/);
   if (!m) return { startMin: 540, endMin: 780 };
@@ -86,17 +83,16 @@ function parseTimeMinutesForBundle4_(timeStr) {
   };
 }
 
-/**
- * ★同一医師に複数枠を打診する際、
- * 1) 同時間帯（または別拠点直結）のロックを解除して両方選んだ場合 ➔ 「🔀【AまたはBの選択的打診】」
- * 2) 時間が被っておらず両方勤務可能な場合 ➔ 「🔗【複数枠おまとめ打診】」
- * を自動判別して mnys 提出データに付与する関数
- */
 function annotateBundledDoctorItemsForMnys_(items) {
   const byDoctor = new Map();
   items.forEach(function(it) {
     const dKey = String(it.license_no || it.target_doctor || '').trim();
-    if (!dKey) return;
+    if (!dKey) {
+      it.is_bundled = false;
+      it.bundle_mode = 'SINGLE';
+      it.bundle_slots_summary = '';
+      return;
+    }
     if (!byDoctor.has(dKey)) byDoctor.set(dKey, []);
     byDoctor.get(dKey).push(it);
   });
@@ -166,6 +162,10 @@ function submitEditedDocToMnys() {
     : {};
   const backupUsedIdxByDateBand = {};
 
+  const submittedLedgerMap = (typeof loadSubmittedLedgerMap4_3_ === 'function')
+    ? loadSubmittedLedgerMap4_3_(ss)
+    : new Map();
+
   const draftMap = (typeof loadLatestDraft64_ === 'function')
     ? loadLatestDraft64_(ss, docId)
     : { slots: {}, bundles: {} };
@@ -179,6 +179,9 @@ function submitEditedDocToMnys() {
   let defaultYear = new Date().getFullYear();
   const extractedItems = [];
   const seenKeys = new Set();
+  const activeDocSlotKeys = new Set();
+  const newLedgerRecords = [];
+  let skippedUnchangedCount = 0;
 
   const addUniqueItem = function(item) {
     const key = [item.date, item.clinic_name, item.department, item.target_time, item.approach_type, item.target_doctor, item.memo || ''].join('|');
@@ -210,31 +213,51 @@ function submitEditedDocToMnys() {
           if (row.getNumCells() < 4) continue;
 
           const rawC0 = row.getCell(0).getText().trim();
+          const c0Lines = rawC0.split(/\r?\n/).map(function(s) { return s.trim(); }).filter(Boolean);
+          const rawClinicHeader = c0Lines[0] || '';
+          const rowTimeText = c0Lines.slice(1).join(' ');
+          const rowTimeRange = (typeof extractSlotTimeRange64_ === 'function')
+            ? extractSlotTimeRange64_(rowTimeText)
+            : rowTimeText;
+
           const rowClinicTitle = (typeof formatClinicTitle64_ === 'function')
-            ? formatClinicTitle64_(rawC0.split(/\r?\n/)[0] || '')
-            : (rawC0.split(/\r?\n/)[0] || '').trim();
+            ? formatClinicTitle64_(rawClinicHeader)
+            : rawClinicHeader;
+
+          const carryKey = (typeof getSlotCarryOverKey3_ === 'function')
+            ? getSlotCarryOverKey3_(currentDate, rawClinicHeader, rowTimeText)
+            : '';
+          if (carryKey) activeDocSlotKeys.add(carryKey);
 
           const slotKey = i + '_' + r;
           let slotDraft = (draftMap.slots && draftMap.slots[slotKey]) ? draftMap.slots[slotKey] : null;
-          if (slotDraft && slotDraft.clinicTitle && slotDraft.clinicTitle !== rowClinicTitle) {
-            slotDraft = null;
+          if (slotDraft) {
+            const cMismatch = slotDraft.clinicTitle && slotDraft.clinicTitle !== rowClinicTitle;
+            const tMismatch = slotDraft.timeAndWage && rowTimeRange && typeof extractSlotTimeRange64_ === 'function' && extractSlotTimeRange64_(slotDraft.timeAndWage) !== rowTimeRange;
+            if (cMismatch || tMismatch) slotDraft = null;
           }
           if (!slotDraft && allDraftSlotEntries.length > 0 && typeof toSortDateKey64_ === 'function') {
             const matchedDrafts = allDraftSlotEntries.filter(function(d) {
-              return toSortDateKey64_(d.dateLabel) === currentDate && d.clinicTitle === rowClinicTitle;
+              if (toSortDateKey64_(d.dateLabel) !== currentDate || d.clinicTitle !== rowClinicTitle) return false;
+              if (d.timeAndWage && rowTimeRange && typeof extractSlotTimeRange64_ === 'function') {
+                return extractSlotTimeRange64_(d.timeAndWage) === rowTimeRange;
+              }
+              return true;
             });
             if (matchedDrafts.length === 1) slotDraft = matchedDrafts[0];
           }
 
           const customDocs = (slotDraft && Array.isArray(slotDraft.customDocs)) ? slotDraft.customDocs : [];
           const customComment = (slotDraft && slotDraft.customComment) ? String(slotDraft.customComment).trim() : '';
+          const rawCell2Text = row.getCell(2).getText().trim();
+          const rawCell3Text = row.getCell(3).getText().trim();
 
           const items = parseEditedDocTableRow_(
             currentDate,
             rawC0,
             row.getCell(1).getText().trim(),
-            row.getCell(2).getText().trim(),
-            row.getCell(3).getText().trim(),
+            rawCell2Text,
+            rawCell3Text,
             resolver,
             customDocs,
             customComment,
@@ -242,7 +265,35 @@ function submitEditedDocToMnys() {
             backupDocsByDate,
             backupUsedIdxByDateBand
           );
+
+          if (items.length === 0) continue;
+
+          // 前回すでに提出済みで内容・担当者ともに変更がない枠は再送から除外
+          const separated = extractDecisionHeaderAndArrows4_2_(rawCell2Text);
+          const cleanAsg = cleanAssigneeText4_2_(rawCell3Text, resolver);
+          const ledgerEntry = carryKey ? submittedLedgerMap.get(carryKey) : null;
+
+          if (ledgerEntry && typeof isSameAsSubmittedLedger4_3_ === 'function' &&
+              isSameAsSubmittedLedger4_3_(ledgerEntry, separated.header, cleanAsg, items, separated.arrowLines)) {
+            skippedUnchangedCount++;
+            continue;
+          }
+
           items.forEach(addUniqueItem);
+
+          if (carryKey) {
+            newLedgerRecords.push({
+              carryKey: carryKey,
+              date: currentDate,
+              clinicName: items[0].clinic_name,
+              dept: items[0].department,
+              targetTime: items[0].target_time,
+              decisionHeader: separated.header,
+              assignee: cleanAsg,
+              comment: customComment,
+              items: items
+            });
+          }
         }
       }
 
@@ -264,8 +315,18 @@ function submitEditedDocToMnys() {
     }
   }
 
+  // 台帳のクリーンアップ＆今回新規・変更分の保存
+  if (typeof upsertSubmittedLedgerRecords4_3_ === 'function') {
+    upsertSubmittedLedgerRecords4_3_(ss, newLedgerRecords, activeDocSlotKeys);
+  }
+
   if (extractedItems.length === 0) {
-    SpreadsheetApp.getUi().alert('提出対象の行が見つかりませんでした（※1診・併行募集やステイ、特別時給＋ステイの行は自動的に除外されます）。');
+    try {
+      const msg = skippedUnchangedCount > 0
+        ? ('新規・変更された提出対象枠はありませんでした（前回提出済みの進行中 ' + skippedUnchangedCount + ' 枠はそのまま保護されています）。')
+        : '提出対象の行が見つかりませんでした（※ステイ、特別時給＋ステイの行は自動的に除外されます）。';
+      SpreadsheetApp.getUi().alert(msg);
+    } catch (e) {}
     return;
   }
 
@@ -278,9 +339,9 @@ function submitEditedDocToMnys() {
     '日付', '拠点名', '診療科', '不在時間', 'アプローチ種別', '対象医師(正式名補正済)', '医籍番号', '移動元拠点', '特別時給・交渉加算', '担当者', 'コメント・おまとめ/選択打診メモ', '根拠・採用案', 'JSON出力(1行単位)'
   ]]);
 
-  // ★1セル50,000文字制限を確実に回避するため、M列には各行ごとのJSONを出力
   const rowsForSheet = extractedItems.map(function(it) {
-    let docTag = it.target_doctor + (it.is_full_time ? '(常勤)' : '');
+    const baseDocDisp = it.target_doctor || '候補自動抽出';
+    let docTag = baseDocDisp + (it.is_full_time ? '(常勤)' : '');
     if (it.is_bundled) {
       docTag += (it.bundle_mode === 'EITHER_OR') ? '[★AまたはB選択打診]' : '[★おまとめ]';
     }
@@ -322,10 +383,16 @@ function submitEditedDocToMnys() {
         JSON.stringify(slice, null, 2)
       );
     }
-    SpreadsheetApp.getUi().alert('✅ 全 ' + extractedItems.length + ' 件（AまたはB選択打診・特別時給交渉・要延長セット・おまとめ統合済）を ' + targetEmail + ' へ送信しました！');
+    try {
+      SpreadsheetApp.getUi().alert(
+        '✅ 新規・変更分 ' + extractedItems.length + ' 件を ' + targetEmail + ' へ送信しました！（前回指示済スキップ: ' + skippedUnchangedCount + ' 枠）'
+      );
+    } catch (e) {}
   } else {
-    SpreadsheetApp.getUi().alert(
-      '✅ 全 ' + extractedItems.length + ' 件を『ドキュメント確定出力JSON』シートに出力しました！\n（※スクリプトプロパティに MNYS_RECEIVER_EMAIL を設定すると mnys.jp へ自動メール送信されます）'
-    );
+    try {
+      SpreadsheetApp.getUi().alert(
+        '✅ 新規・変更分 ' + extractedItems.length + ' 件を『ドキュメント確定出力JSON』シートに出力しました！'
+      );
+    } catch (e) {}
   }
 }

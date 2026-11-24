@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * 7b_編集くん64_レイアウト.gs
- * （「🎯今回要対応のみ」フィルタボタン標準搭載 ＆ 一括操作バー最適化版）
+ * （初期＝全枠表示・3択表示フィルタ［📋全枠 / 🎯要対応のみ / 📨前回指示済］＋ ⇅並び順ソート搭載版）
  * ============================================================================
  */
 
@@ -33,8 +33,11 @@ function getHenshukun64BodyLayout_() {
     '      <button id="mode_ALL" class="btn-64 active-mode" onclick="setMacroMode(\'ALL\')">全エリア</button>',
     '      <button id="mode_関東" class="btn-64" onclick="setMacroMode(\'関東\')">🗼 関東</button>',
     '      <button id="mode_関西" class="btn-64" onclick="setMacroMode(\'関西\')">🐙 関西</button>',
-    '      <span style="margin-left:8px;border-left:1.5px solid #546e7a;padding-left:8px;display:inline-flex;align-items:center;gap:5px;">',
-    '        <button id="btnToggleSubmitted64" class="btn-64 active-mode" onclick="toggleShowSubmitted64()">🎯 今回要対応のみ表示中</button>',
+    '      <span style="margin-left:8px;border-left:1.5px solid #546e7a;padding-left:8px;display:inline-flex;align-items:center;gap:4px;">',
+    '        <span class="deck-label" style="color:#ffd54f;">👁️ 表示:</span>',
+    '        <button id="vf_ALL" class="btn-64 active-mode" onclick="setViewFilterMode64(\'ALL\')">📋 全枠</button>',
+    '        <button id="vf_NEED_ACTION" class="btn-64" onclick="setViewFilterMode64(\'NEED_ACTION\')">🎯 要対応のみ</button>',
+    '        <button id="vf_SUBMITTED" class="btn-64" onclick="setViewFilterMode64(\'SUBMITTED\')">📨 前回指示済</button>',
     '      </span>',
     '    </div>',
     '    <div class="mode-group">',
@@ -51,15 +54,21 @@ function getHenshukun64BodyLayout_() {
     '        <option value="VISIBLE_DATE">表示中の「日付×地域」のみ</option>',
     '        <option value="ALL_DATES_REGION">全日程の「選択地域」すべて</option>',
     '      </select>',
-    '      <select id="bulkStaffSelect" class="n64-select" style="min-width:110px;"></select>',
+    '      <select id="bulkStaffSelect" class="n64-select" style="min-width:105px;"></select>',
     '      <button class="btn-64 btn-blue" onclick="applyBulkStaff64(false)">空欄に担当セット</button>',
     '      <button class="btn-64 btn-yellow" onclick="applyBulkStaff64(true)">上書き担当セット</button>',
     '      <button class="btn-64" style="background:#546e7a;" onclick="applyBulkStayToUndecided64()">⏸️ 未定をすべてステイ</button>',
     '    </div>',
     '',
-    '    <div class="progress-board">',
-    '      <div class="prog-main" id="progressMainText">📊 決定済み: <span>0</span> / 0 枠</div>',
-    '      <div class="prog-remain" id="progressRemainBadge">残り未定: 0枠</div>',
+    '    <div style="display:flex;align-items:center;gap:8px;">',
+    '      <select id="sortOrderSelect64" class="n64-select" style="background:#fefce8;border-color:#f59e0b;font-size:11.5px;" onchange="onSortOrderChange64(this.value)">',
+    '        <option value="CLINIC_ORDER">⇅ 並び順: 地域・拠点順（連続枠を並べる）</option>',
+    '        <option value="UNDECIDED_FIRST">🔥 並び順: 未定・要対応を上段に集める</option>',
+    '      </select>',
+    '      <div class="progress-board">',
+    '        <div class="prog-main" id="progressMainText">📊 決定済み: <span>0</span> / 0 枠</div>',
+    '        <div class="prog-remain" id="progressRemainBadge">残り未定: 0枠</div>',
+    '      </div>',
     '    </div>',
     '  </div>',
     '</div>',
